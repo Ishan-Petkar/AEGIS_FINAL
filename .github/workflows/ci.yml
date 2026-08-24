@@ -30,6 +30,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          # Phase 5 backend deps (FastAPI/SQLAlchemy/psycopg/pydantic-settings).
+          # Required because tests/ now includes backend test modules that import
+          # `backend.*`; without these, pytest fails at COLLECTION, not as a
+          # normal test failure. Live-database tests remain skipped in CI (they
+          # are gated behind AEGIS_TEST_LIVE_DB=1), so no Postgres service is
+          # needed here.
+          pip install -r requirements-backend.txt
 
       # -----------------------------------------------------------------------
       # Lint: catch duplicate function definitions and obvious style issues.
@@ -40,7 +47,7 @@ jobs:
 
       - name: Run ruff linter
         run: |
-          ruff check src/ --select E,F,W --ignore E501
+          ruff check src/ backend/ --select E,F,W --ignore E501
 
       # Enforcement: no function/class should be defined more than once
       # across the src/ directory (the core Phase 0 correctness invariant).

@@ -11,6 +11,11 @@ ENV/
 .venv
 datasets/
 datasets.zip
+
+# Phase 5 backend
+artifacts/
+.pytest_cache/
+*.joblib
 # Editor / System
 .vscode/
 .idea/

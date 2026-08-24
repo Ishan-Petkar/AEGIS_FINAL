@@ -1,0 +1,23 @@
+# AEGIS backend — Phase 5 Python dependencies
+# Separate from requirements.txt so the existing engine's pinned dependency
+# set is never modified by backend work (CLAUDE.md: do not touch src/).
+# Install into the existing venv: pip install -r requirements-backend.txt
+# Pin major versions; allow minor/patch upgrades via >=x.y,<x+1.0.
+
+# --- Web framework / server ---
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.34,<1.0
+
+# --- Database ---
+sqlalchemy>=2.0,<3.0
+psycopg[binary]>=3.2,<4.0
+
+# --- Settings / Config ---
+pydantic-settings>=2.6,<3.0
+
+# --- Model persistence ---
+joblib>=1.4,<2.0
+
+# --- Testing ---
+httpx>=0.27,<1.0
+pytest-asyncio>=1.0,<2.0
