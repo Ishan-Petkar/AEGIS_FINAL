@@ -150,3 +150,72 @@ export interface ReplayStatusResponse {
   consumer_error_count: number;
   consumer_failed_flow_count: number;
 }
+
+// ---------------------------------------------------------------------------
+// WS /ws/stream envelopes (Ticket #4/#9) — field names copied verbatim from
+// `backend/ingest.py`'s `_broadcast_batch` (event) and `_handle_anomalies`
+// (alert, cii). `ENVELOPE_EVENT`/`ENVELOPE_ALERT`/`ENVELOPE_CII` there are
+// the literal strings "event" | "alert" | "cii" used as the `type`
+// discriminant below. Do not rename or reshape these fields — Ticket #12
+// swaps the mock for the real endpoint and depends on exact parity.
+// ---------------------------------------------------------------------------
+
+export interface EventEnvelopeData {
+  id: number;
+  ts: string;
+  observed_at: string;
+  source_ip: string;
+  destination_ip: string;
+  source_asset: string;
+  destination_asset: string;
+  protocol: string;
+  bytes: number;
+  packets: number;
+  duration_sec: number;
+  raw_score: number;
+  calibrated_score: number;
+  is_anomaly: boolean;
+  tripwire_fired: boolean;
+  confidence: number;
+  replay_session_id: string;
+  batch_index: number;
+}
+
+export interface AlertEnvelopeData {
+  id: number;
+  ts: string;
+  severity: string;
+  asset: string;
+  title: string;
+  detail: string | null;
+  explanation: Record<string, unknown> | null;
+  cii_snapshot_id: number | null;
+  acknowledged: boolean;
+}
+
+export interface CiiEnvelopeData {
+  snapshot_id: number | null;
+  origin_asset: string;
+  cii_median: number;
+  cii_p5: number;
+  cii_p95: number;
+  impacted: unknown;
+  trigger_event_id: number | null;
+}
+
+export interface EventEnvelope {
+  type: "event";
+  data: EventEnvelopeData;
+}
+
+export interface AlertEnvelope {
+  type: "alert";
+  data: AlertEnvelopeData;
+}
+
+export interface CiiEnvelope {
+  type: "cii";
+  data: CiiEnvelopeData;
+}
+
+export type StreamEnvelope = EventEnvelope | AlertEnvelope | CiiEnvelope;
