@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Inter, JetBrains_Mono } from "next/font/google";
 import { ConnectionProvider } from "@/lib/connection-context";
+import { StreamProvider } from "@/lib/stream-context";
 import "./globals.css";
 
 // DESIGN_CONSOLE.md §3: Inter for UI/body, JetBrains Mono for numerics,
@@ -33,7 +34,9 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       className={`${inter.variable} ${jetbrainsMono.variable} h-full`}
     >
       <body className="min-h-full flex flex-col antialiased">
-        <ConnectionProvider>{children}</ConnectionProvider>
+        <ConnectionProvider>
+          <StreamProvider>{children}</StreamProvider>
+        </ConnectionProvider>
       </body>
     </html>
   );

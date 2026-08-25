@@ -14,8 +14,13 @@ reconnection, and buffering — **do not reimplement any of it.** It exposes
 **In scope:** row rendering, ordering, readability under load, freeze-on-
 interaction, empty/connecting/disconnected states, render throttling.
 
-**OUT of scope:** the graph (#11), ack wiring (#15), real WS endpoint (#9),
-mock→real swap (#12), `/api/stats` (#16). Leave `AlertsRail` alone.
+**Data source: the real stream only.** Ticket #9 made
+`WS :8000/ws/stream` the default and it carries real replayed
+CIC-IDS2017 traffic. The Ticket #4 mock is a reconnect-test fixture and
+must never be the source of rendered data.
+
+**OUT of scope:** the graph (#11), ack wiring (#15), `/api/stats` (#16).
+Leave `AlertsRail` alone. #9 and #12 are already done.
 
 ---
 
@@ -24,9 +29,9 @@ mock→real swap (#12), `/api/stats` (#16). Leave `AlertsRail` alone.
 `PHASE5_BUILD_PLAN.md` §8 says "autoscroll". Implement that as **newest
 row at the top of a top-pinned list**, not as a scroll-to-bottom animation.
 
-Reasoning: at the mock's 8 events/sec — and far worse once #12 connects a
-real replay at 20×+ — a scroll-to-bottom feed is unreadable and fights the
-user the moment they try to look at anything. Newest-at-top gives the same
+Reasoning: at a real 20× replay's event rate — and far worse at the higher
+speeds the operator can dial in — a scroll-to-bottom feed is unreadable and
+fights the user the moment they try to look at anything. Newest-at-top gives the same
 "latest is immediately visible" property with no scroll mechanics, no
 jank, and no "did the user scroll up?" state machine. `useEventStream`
 already returns newest-first, so this is also the natural order.
@@ -55,18 +60,22 @@ rows/sec a human cannot read a row before it moves. So:
 
 ## 4. Decision: throttle rendering, not receiving (D10-3)
 
-The mock emits ~8/sec, which any implementation survives. **Ticket #12
-will point this at the real stream**, where a 20×+ replay can push
-hundreds of events per second, and a re-render per message will lock the
-tab.
+A gentle rate is survivable by any implementation. **The real stream is
+already the default** (Ticket #9), and a 20×+ replay can push hundreds of
+events per second — a re-render per message will lock the tab.
 
 Therefore: batch view updates on a fixed cadence (~100ms, or one
 animation frame), rendering the latest snapshot rather than every message.
 The hook keeps ingesting at full rate; only the DOM update is throttled.
 
-Verify this deliberately: run the mock at a high rate (`--rate 300` or
-similar) and confirm the UI stays responsive. A feed that only works at
-8/sec is not done — it is a feed that has not met its actual load yet.
+Verify this deliberately, and **against the real stream, not the mock**
+(no synthetic data anywhere): start a real replay at high speed, e.g.
+`POST /api/replay/start {"dataset":"friday-morning","speed":500}`, and
+confirm the UI stays responsive and the 200-row cap holds. A feed that
+only works at 8/sec is not done — it is a feed that has not met its
+actual load yet. Ticket #9 measured the real path sustaining a live
+replay at `consumer_error_count: 0` and 0.012s lag, so any jank observed
+here is the renderer's fault, not the transport's.
 
 ---
 
@@ -112,20 +121,23 @@ HH:MM:SS.mmm   <source> → <destination>            <glyph>
 cd frontend && npx tsc --noEmit && npm run lint && npm run build
 ```
 
-In a browser, with the mock running:
+In a browser, against the **real** backend stream (`WS :8000/ws/stream`,
+Ticket #9) with a real replay running — the mock must not be used as a
+data source:
 1. Rows appear, newest at top, timestamps advancing.
 2. Anomalous rows show the correct glyph and left border.
 3. Hover the feed → freezes, indicator shows a real pending count;
    mouse-leave → resumes and catches up.
-4. **High-rate test:** restart the mock at a much higher rate and confirm
-   the page stays responsive and the row cap holds at 200.
-5. Kill the mock → feed shows disconnected, header API stays connected.
+4. **High-rate test:** run a real replay at `speed=500` (or higher) and
+   confirm the page stays responsive and the row cap holds at 200.
+5. Stop the backend → feed shows disconnected, and recovers when it
+   returns (Ticket #9's reconnect path).
 6. Zero console errors (check in a fresh tab — the message buffer
    accumulates across navigations).
 7. Screenshot.
 
 Backend untouched: `git status --short src/ backend/` empty;
-`PYTHONPATH=src ./venv/bin/python -m pytest tests/ -q` still 483 passed.
+`PYTHONPATH=src ./venv/bin/python -m pytest tests/ -q` still 494 passed.
 
 ---
 

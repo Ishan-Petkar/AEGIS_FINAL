@@ -3,20 +3,22 @@
 import { ConnectionState } from "./ConnectionState";
 import { StreamState } from "./StreamState";
 import { StatChip } from "./StatChip";
-import { useEventStream } from "@/lib/useEventStream";
+import { useStream } from "@/lib/stream-context";
 
 /**
  * AppHeader (DESIGN_CONSOLE.md §5, §6) — brand, live pulse dot, stat
  * chips, speed control, inject button. The connection indicator
  * (GET /api/health) and, as of Ticket #4, the events/s and alerts stat
  * chips plus the stream indicator are wired to live data via
- * `useEventStream` (WS /ws/stream, mocked by `npm run mock` until
- * Ticket #9/#12). The Risk stat chip stays a placeholder — no single
- * "risk" figure exists yet. Speed control and inject stay disabled per
- * PHASE5_TICKET3_PLAN §1 (out of scope: Ticket #13).
+ * `useStream` (the shared `StreamProvider` instance of `useEventStream`,
+ * WS /ws/stream — see Ticket #10 fix round HIGH-1: every consumer reads
+ * the same socket/buffer so the header and the feed can never disagree).
+ * The Risk stat chip stays a placeholder — no single "risk" figure exists
+ * yet. Speed control and inject stay disabled per PHASE5_TICKET3_PLAN §1
+ * (out of scope: Ticket #13).
  */
 export function AppHeader() {
-  const { status: streamStatus, eventsPerSecond, alertCount } = useEventStream();
+  const { status: streamStatus, eventsPerSecond, alertCount } = useStream();
 
   return (
     <header className="glass-panel flex h-14 shrink-0 items-center gap-6 rounded-none border-x-0 border-t-0 px-4">
