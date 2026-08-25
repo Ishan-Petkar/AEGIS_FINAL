@@ -2,47 +2,6 @@
 
 Guidance for Claude Code when working in this repository.
 
-## 0. Mandatory: use the knowledge graph for navigation
-
-This repo has a graphify knowledge graph at `graphify-out/graph.json`
-(1106 nodes, 2010 edges across 50 labeled communities — code, docs, and
-the `rationale`/`concept` nodes that capture *why* decisions were made,
-not just *what* the code does). **Before grepping or exploring blind to
-find where something lives or how pieces connect, query the graph
-first:**
-
-```bash
-graphify query "<question>"              # broad context, BFS traversal
-graphify query "<question>" --dfs        # trace one specific path
-graphify path "AuthModule" "Database"    # shortest path between two concepts
-graphify explain "SwinTransformer"       # plain-language explanation of a node
-```
-
-This is faster and more accurate than re-deriving architecture from
-scratch on every task — the graph already encodes cross-file
-relationships (e.g. `StreamingScorer` -> `ReplayFlowReader` ->
-`ReplayEngine`) and the rationale nodes behind every Phase 1-5 decision
-(the C1-C4 contracts, the Invariants, K1-K7 known issues, P5-1..P5-14
-decisions) that would otherwise take several tool calls to reconstruct.
-
-**Fall back to `grep`/`find`/`Read` when:** the graph doesn't answer the
-question, the file is newer than the graph (see below), or you need
-exact line-level content the graph doesn't carry (it stores summaries
-and relationships, not full file bodies — always `Read` the actual file
-before editing it, never edit from the graph's summary alone).
-
-**Keep the graph current.** After a session with material code or doc
-changes, run `/graphify --update` (incremental — only re-extracts
-changed files) so the next session's queries reflect reality. A stale
-graph that confidently describes deleted code is worse than no graph;
-if a query result looks inconsistent with the live tree, verify against
-the actual files and prefer the files.
-
-Full outputs: `graphify-out/graph.html` (interactive, open in browser),
-`graphify-out/GRAPH_REPORT.md` (audit report: god nodes, communities,
-surprising connections), `graphify-out/obsidian/` (vault — open as an
-Obsidian vault for canvas-based visual navigation).
-
 ## 1. What this project is
 
 **AEGIS (Anomalous Event Graph Intelligence System)** is a cyber-physical risk
@@ -313,3 +272,13 @@ dashboard CSS implements), `docs/DATASETS.md` (sources and licences), and
 `docs/SETUP.md` / `docs/DEVELOPMENT.md` cover the rest. Treat the code as
 authoritative where docs disagree — several docs were rewritten across the phase
 migrations and describe the superseded BFS-with-decay CII model.
+
+## graphify
+
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+
+Rules:
+- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
