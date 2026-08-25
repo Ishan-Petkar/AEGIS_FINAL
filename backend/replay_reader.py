@@ -88,6 +88,30 @@ arbitrary window of file-order rows.
 Encoding — `TrafficLabelling ` CSVs are `latin-1`, not UTF-8 (Web Attack
 labels contain mojibake under UTF-8 decoding; UTF-8 raises outright on
 some byte sequences in this capture).
+
+Ticket #5 (Part B) additive extension — supervised-detector features
+----------------------------------------------------------------------
+`docs/DETECTION_STUDY.md` measured that a supervised RandomForest over a
+7-column feature set (the existing 3 volumetric columns plus 4 more) gets
+AUC 0.9994 / F1 0.9872 on the same data where the unsupervised
+IsolationForest gets precision ~0.02. `ReplayFlow` gained four more fields
+to carry those 4 additional columns: `bwd_packet_length_mean`,
+`init_win_bytes_forward`, `init_win_bytes_backward`, `average_packet_size`
+(source columns "Bwd Packet Length Mean", "Init_Win_bytes_forward",
+"Init_Win_bytes_backward", "Average Packet Size").
+
+This is deliberately NOT added to `_REQUIRED_COLUMNS`: several existing
+tests (`tests/test_replay_reader.py`) build minimal synthetic fixture CSVs
+carrying only the original 10 required columns, and making the new columns
+hard-required would raise `DatasetNotAvailable` against every one of those
+fixtures — a regression this ticket must not cause. Instead the four
+columns are read via `_OPTIONAL_SUPERVISED_COLUMNS`: present -> parsed as a
+float (unparseable value -> row skipped, same as any other malformed
+numeric field); absent entirely (e.g. a pre-Ticket-5 synthetic fixture) ->
+the dataclass default (0.0) is used and the row is not penalised. All eight
+real `datasets/TrafficLabelling ` files carry the full 85-column
+CICFlowMeter schema, so real replay/warmup traffic always gets real values;
+only synthetic test fixtures ever see the fallback.
 """
 from __future__ import annotations
 
@@ -137,6 +161,18 @@ _REQUIRED_COLUMNS = (
     "Total Fwd Packets",
     "Total Length of Fwd Packets",
     "Label",
+)
+
+#: Additive (Ticket #5 Part B) — supervised-detector feature columns.
+#: NOT in `_REQUIRED_COLUMNS`: absent entirely (e.g. a pre-Ticket-5
+#: synthetic test fixture) is tolerated, defaulting to 0.0/0 on the
+#: `ReplayFlow`; present-but-unparseable is treated like any other
+#: malformed numeric field (row skipped). See the module docstring.
+_OPTIONAL_SUPERVISED_COLUMNS = (
+    "Bwd Packet Length Mean",
+    "Init_Win_bytes_forward",
+    "Init_Win_bytes_backward",
+    "Average Packet Size",
 )
 
 #: day key -> filename under `datasets/TrafficLabelling `. Verified against
@@ -194,6 +230,16 @@ class ReplayFlow:
     source_row_id: str
     source_dataset: str
 
+    # ---- Ticket #5 Part B: additive supervised-detector features -------
+    # Defaults (0.0 / 0) apply only when the source column is absent
+    # entirely (pre-Ticket-5 synthetic fixtures); every real
+    # `datasets/TrafficLabelling ` file carries real values for all four.
+    # See the module docstring, "Ticket #5 (Part B) additive extension".
+    bwd_packet_length_mean: float = 0.0
+    init_win_bytes_forward: int = 0
+    init_win_bytes_backward: int = 0
+    average_packet_size: float = 0.0
+
 
 @dataclass(frozen=True)
 class ReadStats:
@@ -224,6 +270,27 @@ def _normalise_header(raw_header: list[str]) -> list[str]:
 
 def _protocol_name(proto_num: int) -> str:
     return _PROTOCOL_NAMES.get(proto_num, f"PROTO_{proto_num}")
+
+
+def _parse_optional_float(row: list[str], idx: dict[str, int], name: str) -> Optional[float]:
+    """Parse an `_OPTIONAL_SUPERVISED_COLUMNS` field.
+
+    Returns `0.0` if the column is absent from this file's header at all
+    (a pre-Ticket-5 synthetic fixture — tolerated, see module docstring).
+    Returns `None` (caller must skip the row) if the column IS present but
+    the value in this row is missing/NaN/unparseable — treated exactly
+    like any other malformed numeric field, not silently defaulted.
+    """
+    col_idx = idx.get(name)
+    if col_idx is None:
+        return 0.0
+    try:
+        value = float(row[col_idx])
+    except (ValueError, IndexError):
+        return None
+    if math.isnan(value) or math.isinf(value):
+        return None
+    return value
 
 
 def _parse_timestamp(raw: str) -> Optional[tuple[datetime, str]]:
@@ -328,6 +395,20 @@ def _parse_row(
         return None
     ts, provenance = parsed_ts
 
+    # Additive (Ticket #5 Part B) — supervised-detector features. Any
+    # present-but-unparseable value skips the row (module docstring); an
+    # entirely-absent column (pre-Ticket-5 synthetic fixture) defaults to
+    # 0.0 rather than being treated as malformed.
+    bwd_pkt_len_mean = _parse_optional_float(row, idx, "Bwd Packet Length Mean")
+    init_win_fwd = _parse_optional_float(row, idx, "Init_Win_bytes_forward")
+    init_win_bwd = _parse_optional_float(row, idx, "Init_Win_bytes_backward")
+    avg_pkt_size = _parse_optional_float(row, idx, "Average Packet Size")
+    if any(
+        v is None
+        for v in (bwd_pkt_len_mean, init_win_fwd, init_win_bwd, avg_pkt_size)
+    ):
+        return None
+
     return ReplayFlow(
         ts=ts,
         source_ip=src_ip,
@@ -345,6 +426,10 @@ def _parse_row(
         timing_provenance=provenance,
         source_row_id=f"{filename}:{line_no}",
         source_dataset=SOURCE_DATASET,
+        bwd_packet_length_mean=bwd_pkt_len_mean,
+        init_win_bytes_forward=int(init_win_fwd),
+        init_win_bytes_backward=int(init_win_bwd),
+        average_packet_size=avg_pkt_size,
     )
 
 

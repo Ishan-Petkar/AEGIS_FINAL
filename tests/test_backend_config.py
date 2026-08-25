@@ -32,6 +32,10 @@ _AEGIS_ENV_VARS = [
     "AEGIS_REPLAY_DEFAULT_DATASET_DAY",
     "AEGIS_WARMUP_DATASET_DAY",
     "AEGIS_MODEL_ARTIFACT_PATH",
+    "AEGIS_STREAMING_CONTAMINATION",
+    "AEGIS_STREAMING_N_ESTIMATORS",
+    "AEGIS_WARMUP_ROW_LIMIT",
+    "AEGIS_WARMUP_MIN_ROWS",
 ]
 
 
@@ -285,3 +289,94 @@ def test_model_artifact_path_resolved_absolute_override_unchanged(monkeypatch, t
     s = BackendSettings(model_artifact_path=absolute)
 
     assert s.model_artifact_path_resolved == absolute
+
+
+# ---------------------------------------------------------------------------
+# Ticket #5 — StreamingScorer settings (streaming_contamination,
+# streaming_n_estimators, warmup_row_limit, warmup_min_rows)
+# ---------------------------------------------------------------------------
+
+
+def test_streaming_contamination_default():
+    from backend.config import BackendSettings
+
+    s = BackendSettings()
+    assert s.streaming_contamination == pytest.approx(0.005)
+
+
+def test_streaming_contamination_bounds_reject_zero_and_out_of_range():
+    from backend.config import BackendSettings
+
+    with pytest.raises(pydantic.ValidationError):
+        BackendSettings(streaming_contamination=0.0)
+    with pytest.raises(pydantic.ValidationError):
+        BackendSettings(streaming_contamination=0.5)
+    with pytest.raises(pydantic.ValidationError):
+        BackendSettings(streaming_contamination=-0.01)
+
+
+def test_streaming_contamination_overridable_via_env(monkeypatch):
+    from backend.config import BackendSettings
+
+    monkeypatch.setenv("AEGIS_STREAMING_CONTAMINATION", "0.02")
+    s = BackendSettings()
+    assert s.streaming_contamination == pytest.approx(0.02)
+
+
+def test_streaming_n_estimators_defaults_to_none():
+    from backend.config import BackendSettings
+
+    s = BackendSettings()
+    assert s.streaming_n_estimators is None
+
+
+def test_streaming_n_estimators_overridable_via_env(monkeypatch):
+    from backend.config import BackendSettings
+
+    monkeypatch.setenv("AEGIS_STREAMING_N_ESTIMATORS", "50")
+    s = BackendSettings()
+    assert s.streaming_n_estimators == 50
+
+
+def test_streaming_n_estimators_bounds():
+    from backend.config import BackendSettings
+
+    with pytest.raises(pydantic.ValidationError):
+        BackendSettings(streaming_n_estimators=5)  # below ge=10
+
+
+def test_warmup_row_limit_defaults_to_none():
+    from backend.config import BackendSettings
+
+    s = BackendSettings()
+    assert s.warmup_row_limit is None
+
+
+def test_warmup_row_limit_overridable_via_env(monkeypatch):
+    from backend.config import BackendSettings
+
+    monkeypatch.setenv("AEGIS_WARMUP_ROW_LIMIT", "50000")
+    s = BackendSettings()
+    assert s.warmup_row_limit == 50000
+
+
+def test_warmup_row_limit_rejects_non_positive():
+    from backend.config import BackendSettings
+
+    with pytest.raises(pydantic.ValidationError):
+        BackendSettings(warmup_row_limit=0)
+
+
+def test_warmup_min_rows_default():
+    from backend.config import BackendSettings
+
+    s = BackendSettings()
+    assert s.warmup_min_rows == 1000
+
+
+def test_warmup_min_rows_overridable_via_env(monkeypatch):
+    from backend.config import BackendSettings
+
+    monkeypatch.setenv("AEGIS_WARMUP_MIN_ROWS", "2000")
+    s = BackendSettings()
+    assert s.warmup_min_rows == 2000

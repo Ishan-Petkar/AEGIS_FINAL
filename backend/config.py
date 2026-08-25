@@ -201,6 +201,70 @@ class BackendSettings(BaseSettings):
         ),
     )
 
+    # ---- StreamingScorer (Ticket #5) ------------------------------------
+    streaming_contamination: float = Field(
+        default=0.005,
+        gt=0.0,
+        lt=0.5,
+        description=(
+            "IsolationForest contamination for StreamingScorer's warmup "
+            "fit. Deliberately NOT SETTINGS.ml.isolation_forest_contamination "
+            "(0.08, used by the frozen Phase 3 batch benchmark) — the "
+            "warmup slice is 100% benign by construction (see "
+            "warmup_dataset_day), so contamination here is a stated "
+            "FALSE-POSITIVE budget, not an anomaly-rate estimate. Measured "
+            "on friday-morning against the full-Monday warmup model "
+            "(docs/PHASE5_TICKET5_PLAN.md Q5): 0.08 flags 23.1 flows/sec "
+            "of a 20x demo (a wall of red); 0.005 flags 1.73/sec (a "
+            "visible, steady trickle that doesn't drown the tripwire's "
+            "confidence-0.99 alert). Bounded strictly > 0: "
+            "ml_engine.train_isolation_forest does "
+            "`contamination or SETTINGS...`, which silently treats 0.0 as "
+            "\"use the 0.08 default\" (the falsy-`or` trap, verified) — "
+            "this field must never be passed as 0.0/0/None expecting "
+            "'no flagging'."
+        ),
+    )
+    streaming_n_estimators: int | None = Field(
+        default=None,
+        ge=10,
+        le=1000,
+        description=(
+            "IsolationForest tree count for StreamingScorer's warmup fit. "
+            "None (default) defers to SETTINGS.ml.isolation_forest_n_estimators "
+            "(100) via ml_engine.train_isolation_forest's own optional-"
+            "override fallback, so the tree count stays a single source of "
+            "truth unless a deployment explicitly wants to diverge from "
+            "the Phase 3 benchmark's setting."
+        ),
+    )
+    warmup_row_limit: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Optional cap on how many (chronologically-first) warmup rows "
+            "StreamingScorer.fit_from_warmup() reads. None (default) uses "
+            "the full day (~529,918 Monday rows) — measured cost 4.72s "
+            "end-to-end (docs/PHASE5_TICKET5_PLAN.md Q1 Measurement B), "
+            "and subsampling was measured to corrupt explain()'s baseline "
+            "sigma by up to 3.1x (Measurement C) for a saving of at most "
+            "14% of an already-cheap build step. Exists for tests/CI that "
+            "want a smaller, faster fixture, not for production use."
+        ),
+    )
+    warmup_min_rows: int = Field(
+        default=1000,
+        ge=1,
+        description=(
+            "Hard floor on warmup row count. StreamingScorer.fit_from_warmup() "
+            "raises below this. Guards against a degenerate zero-variance "
+            "baseline (docs/PHASE5_TICKET5_PLAN.md Q3): measured head(1) "
+            "yields 3 zero-variance feature columns, head(2) yields 2; by "
+            "head(1000) all three columns already have non-zero variance "
+            "of the right order of magnitude relative to the full day."
+        ),
+    )
+
     # ---- Replay engine (Ticket #6) ---------------------------------------
     replay_tick_interval_sec: float = Field(
         default=0.1,
