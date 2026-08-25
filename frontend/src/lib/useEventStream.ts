@@ -13,6 +13,12 @@ import type { AlertEnvelopeData, CiiEnvelopeData, EventEnvelopeData, StreamEnvel
  * while /api/health is fine, and vice versa), and collapsing them into
  * one boolean is exactly the bug Ticket #3's review caught.
  *
+ * Ticket #9 (absorbing Ticket #12): the default target is now the REAL
+ * backend's `WS /ws/stream` (real replayed CIC-IDS2017 traffic), not the
+ * Ticket #4 mock -- no synthetic data may appear anywhere in the product.
+ * The mock stays in the repo as an opt-in reconnect-test fixture, reached
+ * only via `NEXT_PUBLIC_WS_URL=ws://127.0.0.1:8001/ws/stream`.
+ *
  * Reconnects with exponential backoff (1s -> 2s -> 4s -> 8s, capped at
  * 15s) and never spins a tight loop. `status` only ever reports
  * "reconnecting" while a reconnect timer is actually scheduled.
@@ -34,7 +40,7 @@ const MAX_EVENTS_BUFFER = 200;
 const MAX_ALERTS_BUFFER = 50;
 const RATE_WINDOW_MS = 1_000;
 
-const DEFAULT_WS_URL = "ws://127.0.0.1:8001/ws/stream";
+const DEFAULT_WS_URL = "ws://127.0.0.1:8000/ws/stream";
 
 function resolveWsUrl(): string {
   return process.env.NEXT_PUBLIC_WS_URL ?? DEFAULT_WS_URL;

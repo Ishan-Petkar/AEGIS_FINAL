@@ -15,6 +15,7 @@ model artifact or Postgres either. `tests/test_api.py` pins this directly.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
@@ -34,14 +35,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Builds the process-wide `AppRuntime` exactly once at startup (D8-1)
     and stops the replay engine (idempotent, bounded-wait) on shutdown so a
     reload/redeploy never leaves an orphaned background replay thread.
+
+    Also captures the running event loop exactly once
+    (`asyncio.get_running_loop()`, only valid here -- inside a coroutine
+    the ASGI server is actually running) and hands it to the runtime's
+    `WebSocketBroadcaster` (Ticket #9, decision D9-1). `IngestPipeline`
+    calls `broadcaster.publish()` synchronously from the `ReplayEngine`'s
+    background thread; the broadcaster needs this loop reference to hop
+    back onto it via `call_soon_threadsafe` rather than ever touching a
+    WebSocket from the wrong thread. Without this call the broadcaster
+    stays in its safe no-op mode (see `WebSocketBroadcaster.publish`).
     """
     runtime: AppRuntime = build_runtime()
+    runtime.broadcaster.set_loop(asyncio.get_running_loop())
     app.state.runtime = runtime
     try:
         yield
     finally:
         if runtime.engine is not None:
             runtime.engine.stop()
+        # Close every live WS /ws/stream connection cleanly on shutdown so
+        # a reload/redeploy never leaves an orphaned writer task or socket
+        # behind (docs/PHASE5_TICKET9_PLAN.md section 4).
+        await runtime.broadcaster.close_all()
 
 
 def create_app() -> FastAPI:

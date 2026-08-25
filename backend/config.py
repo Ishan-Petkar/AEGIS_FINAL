@@ -445,6 +445,40 @@ class BackendSettings(BaseSettings):
         ),
     )
 
+    # ---- WebSocket transport (Ticket #9) ----------------------------------
+    ws_client_queue_max: int = Field(
+        default=1000,
+        ge=1,
+        le=1_000_000,
+        description=(
+            "Per-client bounded asyncio.Queue size for WS /ws/stream "
+            "(decision D9-2). Ticket #7 publishes one envelope PER EVENT, "
+            "and P5-12 measured speed=2000x producing 500-flow batches, "
+            "so a slow browser tab must never become the replay engine's "
+            "rate limiter: on overflow the OLDEST queued envelope for that "
+            "client is dropped (never the newest, and never blocking the "
+            "publisher) and a per-connection dropped-counter is "
+            "incremented. 1000 gives a live view several seconds of "
+            "buffer at the 20x demo default before anything is dropped."
+        ),
+    )
+    ws_send_timeout_sec: float = Field(
+        default=5.0,
+        gt=0.0,
+        le=120.0,
+        description=(
+            "Bound on how long a WS /ws/stream per-client writer task may "
+            "block on WebSocket.send_json() for one envelope before that "
+            "send is treated as failed and the connection is torn down. "
+            "Without a bound, a stuck TCP write (e.g. a client whose OS "
+            "receive buffer is full and never drained) would pin the "
+            "writer task -- and therefore that client's queue -- forever; "
+            "other clients are unaffected either way (each has its own "
+            "writer task), but an unbounded wait here would also delay "
+            "that client's own disconnect from ever being noticed."
+        ),
+    )
+
     # ---- API (Ticket #8) --------------------------------------------------
     api_cors_origins: list[str] = Field(
         default=["http://localhost:3000", "http://127.0.0.1:3000"],

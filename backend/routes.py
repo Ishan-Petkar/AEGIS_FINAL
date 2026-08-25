@@ -10,10 +10,11 @@ backend/routes.py — Phase 5 Ticket #8: the nine REST routes.
     POST /api/replay/start
     POST /api/replay/stop
     POST /api/replay/speed
+    WS   /ws/stream           (Ticket #9)
 
 Explicitly OUT of scope (docs/PHASE5_TICKET8_PLAN.md section 1): `POST
-/api/inject` (Ticket #13), `WS /ws/stream` (Ticket #9), `GET /api/stats`
-(Ticket #16). Do not add them here.
+/api/inject` (Ticket #13), `GET /api/stats` (Ticket #16). Do not add
+them here.
 
 Two overridable dependencies carry every route's external state, so the
 default test suite needs neither Postgres nor a real `AppRuntime`
@@ -49,10 +50,20 @@ not re-derived, per the ticket brief's explicit instruction.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Callable, ContextManager
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
@@ -79,6 +90,8 @@ from backend.schemas import (
 from backend.seed import compute_seed_rows
 from cii_calculator import compute_cascading_impact_full
 from graph_manager import build_graph
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -520,3 +533,59 @@ def set_replay_speed(
         raise HTTPException(status_code=409, detail="replay is not running")
     engine.set_speed(body.multiplier)
     return ReplayStatusResponse.from_status(engine.status())
+
+
+# ---------------------------------------------------------------------------
+# WS /ws/stream (Ticket #9)
+# ---------------------------------------------------------------------------
+
+
+def get_runtime_ws(websocket: WebSocket) -> AppRuntime:
+    """Websocket-scope twin of `get_runtime` (above). Kept separate rather
+    than reused because FastAPI resolves a `Request`-typed dependency
+    parameter against the HTTP connection scope; `WS /ws/stream` runs in
+    the websocket scope, so its dependency must be annotated `WebSocket`
+    instead. Tests override THIS callable (mirroring how test_api.py
+    overrides `get_runtime`) to hand the route a fake `AppRuntime` without
+    exercising the real lifespan.
+    """
+    return websocket.app.state.runtime
+
+
+@router.websocket("/ws/stream")
+async def ws_stream(
+    websocket: WebSocket,
+    runtime: AppRuntime = Depends(get_runtime_ws),
+) -> None:
+    """The real live feed. Transport only -- see `backend/ws_broadcaster.py`
+    for the D9-1 (cross-thread publish) and D9-2 (per-client backpressure)
+    machinery this route merely drives.
+
+    On connect: register with `runtime.broadcaster`, which accepts the
+    socket, starts this connection's writer task, and sends an immediate
+    `{"type": "hello", "data": <ReplayStatusResponse>}` frame from
+    `runtime.engine.status()` (or an all-idle status if the scorer never
+    loaded and there is no engine at all -- `WS /ws/stream` still accepts
+    connections in that case, same "still starts, still readable" posture
+    as the read-only REST routes).
+
+    This route does not read anything the client sends -- `WS /ws/stream`
+    is one-directional (server -> client) by design (docs/
+    PHASE5_TICKET9_PLAN.md). `receive_text()` is used purely to block until
+    `WebSocketDisconnect`, which is how Starlette signals the client went
+    away; any other exception during that wait is treated the same way, so
+    a single misbehaving client is always cleanly unregistered and never
+    propagates to another connection or kills the endpoint.
+    """
+    status = runtime.engine.status() if runtime.engine is not None else _NO_ENGINE_STATUS
+    hello_data = ReplayStatusResponse.from_status(status).model_dump(mode="json")
+    client = await runtime.broadcaster.register(websocket, hello_data)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        logger.warning("ws_stream: client %d ended abnormally", client.client_id, exc_info=True)
+    finally:
+        await runtime.broadcaster.unregister(client)

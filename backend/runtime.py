@@ -32,13 +32,14 @@ D8-1) for the full rationale; the short version:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
 from backend.ingest import IngestPipeline
 from backend.replay_engine import ReplayEngine
 from backend.streaming import StreamingScorer, StreamingScorerError
+from backend.ws_broadcaster import WebSocketBroadcaster
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,14 @@ class AppRuntime:
     engine: Optional[ReplayEngine]
     scorer_load_error: Optional[str]
     started_at: datetime
+    # Defaulted (Ticket #9): pre-Ticket-#9 call sites across tests/test_api.py
+    # construct AppRuntime without a broadcaster, and that must keep working
+    # -- an unset broadcaster is never a crash risk (WebSocketBroadcaster.
+    # publish() degrades to a counted no-op with no loop set, same as if
+    # WS /ws/stream itself never got connected to), so defaulting it here is
+    # exactly the "still starts, still readable" posture the rest of this
+    # module already documents for a missing scorer.
+    broadcaster: WebSocketBroadcaster = field(default_factory=WebSocketBroadcaster)
 
 
 def build_runtime() -> AppRuntime:
@@ -72,6 +81,12 @@ def build_runtime() -> AppRuntime:
     scorer".
     """
     started_at = datetime.now(timezone.utc)
+    # Constructed regardless of whether the scorer loads: WS /ws/stream
+    # (Ticket #9) must still accept connections and serve a hello frame
+    # (via runtime.engine.status()) when the scorer failed to load and
+    # there is no replay to broadcast yet -- same "still starts, still
+    # readable" posture as the read-only REST routes above.
+    broadcaster = WebSocketBroadcaster()
     try:
         scorer = StreamingScorer.load()
     except StreamingScorerError as exc:
@@ -88,9 +103,10 @@ def build_runtime() -> AppRuntime:
             engine=None,
             scorer_load_error=str(exc),
             started_at=started_at,
+            broadcaster=broadcaster,
         )
 
-    pipeline = IngestPipeline(scorer=scorer)
+    pipeline = IngestPipeline(scorer=scorer, broadcaster=broadcaster)
     engine = ReplayEngine(consumer=pipeline)
     return AppRuntime(
         scorer=scorer,
@@ -98,4 +114,5 @@ def build_runtime() -> AppRuntime:
         engine=engine,
         scorer_load_error=None,
         started_at=started_at,
+        broadcaster=broadcaster,
     )
