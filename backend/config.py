@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import ClassVar
 from urllib.parse import quote_plus
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Repo root — the parent of this file's directory (backend/), derived the
@@ -353,6 +353,175 @@ class BackendSettings(BaseSettings):
             "itself are provided in Ticket #2."
         ),
     )
+
+    # ---- Ingest pipeline (Ticket #7) ------------------------------------
+    cii_debounce_sec: float = Field(
+        default=30.0,
+        ge=0.0,
+        le=3600.0,
+        description=(
+            "Minimum wall-clock seconds between two CII recomputations for "
+            "the SAME origin asset. compute_cascading_impact_full() runs "
+            "SETTINGS.cii.mc_iterations Monte Carlo BFS passes per call — "
+            "far too expensive to run per anomalous event when a single "
+            "friday-morning replay produces ~800 volumetric anomalies "
+            "(docs/DETECTION_STUDY.md). Within the window the cached "
+            "CIIResult is reused and re-linked rather than recomputed, so "
+            "an alert always carries a blast radius; only the recomputation "
+            "is skipped, never the linkage."
+        ),
+    )
+
+    cii_cache_max_entries: int = Field(
+        default=256,
+        ge=1,
+        le=100_000,
+        description=(
+            "Upper bound on distinct origin assets held in the ingest CII "
+            "debounce cache. Bounded because AssetRegistry auto-registers "
+            "one Unresolved_<ip> asset per unique unresolved IP (risk T5) — "
+            "real CIC-IDS2017 has thousands, so an unbounded cache is an "
+            "unbounded memory leak over a long replay. Evicted "
+            "least-recently-used."
+        ),
+    )
+
+    alert_on_volumetric: bool = Field(
+        default=False,
+        description=(
+            "Whether a volumetric-only anomaly (IsolationForest fired, "
+            "tripwire did not) may raise an operator alert. Default False "
+            "on measured evidence, not caution: docs/DETECTION_STUDY.md "
+            "records 5 true positives against 811 false positives on real "
+            "replayed friday-morning traffic (precision ~0.02). Alerting on "
+            "that channel fills the alerts panel with ~800 junk rows per "
+            "replay day and buries the tripwire alert that the demo's "
+            "headline moment depends on. The volumetric channel is still "
+            "fully scored, persisted to event_scores, and broadcast — it is "
+            "visible in the live feed; it just does not page an operator. "
+            "Set True only with alert_volumetric_min_calibrated_score tuned."
+        ),
+    )
+
+    alert_volumetric_min_calibrated_score: float = Field(
+        default=0.9,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Calibrated-score floor a volumetric-only anomaly must clear to "
+            "raise an alert when alert_on_volumetric is True. "
+            "ml_engine.compute_anomaly_scores emits calibrated_score in "
+            "[0, 1] (sigmoid of raw_score), so this is a probability-scale "
+            "threshold. Ignored entirely when alert_on_volumetric is False."
+        ),
+    )
+
+    alert_asset_debounce_sec: float = Field(
+        default=60.0,
+        ge=0.0,
+        le=3600.0,
+        description=(
+            "Minimum wall-clock seconds between two alerts naming the same "
+            "asset. Prevents one sustained anomalous flow burst from "
+            "producing hundreds of near-identical rows in the alerts panel. "
+            "Applies to every alert channel including tripwire: a "
+            "honeytoken touch repeated 400 times is one incident, not 400 "
+            "alerts. Set 0.0 to disable de-duplication."
+        ),
+    )
+
+    ingest_retention_check_every_n_batches: int = Field(
+        default=200,
+        ge=1,
+        le=1_000_000,
+        description=(
+            "How often (in ingested batches) backend.retention.prune_events "
+            "is called to enforce db_event_retention_max_rows. Ticket #2 "
+            "provided prune_events() and explicitly deferred wiring it to a "
+            "periodic call to this ticket. Not every batch: the prune issues "
+            "a COUNT plus a DELETE over the events table, which is wasted "
+            "work when a batch adds at most replay_max_batch_size (500) rows "
+            "against a 500,000-row cap."
+        ),
+    )
+
+    # ---- API (Ticket #8) --------------------------------------------------
+    api_cors_origins: list[str] = Field(
+        default=["http://localhost:3000", "http://127.0.0.1:3000"],
+        description=(
+            "Allowed CORS origins for the FastAPI app (Ticket #8, decision "
+            "D8-4). The Next.js console (Ticket #3) runs on localhost:3000; "
+            "this API runs on api_port (8000 by default) — different "
+            "origin, so every browser call fails without CORS. Deliberately "
+            "NOT ['*']: these routes include unauthenticated state-changing "
+            "controls (POST /api/replay/start|stop|speed), and a wildcard "
+            "origin alongside a wide api_host bind would hand the LAN "
+            "unauthenticated control of the demo — exactly the risk "
+            "api_host's own docstring already guards against."
+        ),
+    )
+    api_events_default_limit: int = Field(
+        default=100,
+        ge=1,
+        le=10_000,
+        description=(
+            "Page size for GET /api/events when the caller omits `limit`. "
+            "Must be <= api_events_max_limit (enforced by "
+            "_check_api_default_limits_within_cap below)."
+        ),
+    )
+    api_events_max_limit: int = Field(
+        default=1000,
+        ge=1,
+        le=100_000,
+        description=(
+            "Hard cap on GET /api/events' `limit` query parameter. A "
+            "request above this is rejected with 422 via the route's "
+            "Pydantic Query bounds, never silently clamped — a silent "
+            "clamp would lie to the caller about how many rows it is "
+            "actually getting. Without a cap, `limit` is unbounded against "
+            "a table db_event_retention_max_rows (500,000 by default) "
+            "deliberately lets grow large, so one request could otherwise "
+            "pull the whole retention window in one response. Also reused "
+            "as the hard cap for GET /api/alerts' `limit` — the plan "
+            "(docs/PHASE5_TICKET8_PLAN.md section 7) defines only one "
+            "'max' field, and the same unbounded-pull risk applies equally "
+            "to the alerts table."
+        ),
+    )
+    api_alerts_default_limit: int = Field(
+        default=100,
+        ge=1,
+        le=10_000,
+        description=(
+            "Page size for GET /api/alerts when the caller omits `limit`. "
+            "Bounded by api_events_max_limit — see that field's docstring "
+            "for why alerts has no separate max-limit field of its own."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_api_default_limits_within_cap(self) -> "BackendSettings":
+        """Both default-limit fields must not exceed api_events_max_limit
+        (the shared hard cap — see its docstring). A misconfigured .env
+        that set a default above the cap would otherwise silently serve
+        fewer rows than the operator asked for on every un-paginated
+        request; failing fast at settings-construction time surfaces that
+        immediately instead of as a confusing runtime discrepancy."""
+        if self.api_events_default_limit > self.api_events_max_limit:
+            raise ValueError(
+                "api_events_default_limit "
+                f"({self.api_events_default_limit}) must be <= "
+                f"api_events_max_limit ({self.api_events_max_limit})"
+            )
+        if self.api_alerts_default_limit > self.api_events_max_limit:
+            raise ValueError(
+                "api_alerts_default_limit "
+                f"({self.api_alerts_default_limit}) must be <= "
+                f"api_events_max_limit ({self.api_events_max_limit}) — "
+                "alerts reuses the events hard cap, see its docstring."
+            )
+        return self
 
     # Singleton access pattern, matching src/settings.py's AEGISSettings.
     _instance: ClassVar["BackendSettings | None"] = None
