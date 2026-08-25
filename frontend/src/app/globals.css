@@ -1,0 +1,169 @@
+@import "tailwindcss";
+
+/* ---------------------------------------------------------------------
+ * AEGIS Operations Console — design tokens
+ * Source of truth: docs/DESIGN_CONSOLE.md §2-4 ("Warm Industrial Glass").
+ * This file is the ONLY place raw hex / rgba() literals may appear.
+ * Every component consumes these through the Tailwind theme names mapped
+ * below in @theme — never hardcode a color in a .tsx file.
+ * ------------------------------------------------------------------- */
+
+:root {
+  /* Ground and material (§2) */
+  --ground: #14120e;
+  --ground-raised: #1c1917;
+  --glow-warm: rgba(232, 163, 61, 0.07);
+  --glass: rgba(255, 247, 235, 0.045);
+  --glass-raised: rgba(255, 247, 235, 0.075);
+  --glass-border: rgba(255, 240, 220, 0.1);
+  --glass-border-strong: rgba(255, 240, 220, 0.18);
+
+  /* Text (§2) */
+  --text: #f2ede4;
+  --text-dim: #a89f90;
+  --text-mute: #6f665a;
+
+  /* Brand vs. severity — kept as separate scales (§2) */
+  --accent: #e8a33d;
+  --accent-hi: #f2b658;
+  --sev-critical: #e5484d;
+  --sev-warning: #f5c542;
+  --sev-normal: #7cb342;
+  --sev-info: #7d9cc0;
+  --financial: #d4a843;
+
+  /* Geometry (§4) */
+  --radius-panel: 4px;
+  --radius-dense: 2px;
+  --motion-duration: 150ms;
+}
+
+/* Tailwind v4 theme mapping: CSS custom properties -> utility classes.
+ * e.g. --color-ground generates bg-ground / text-ground / border-ground,
+ * --color-glass-border generates border-glass-border, etc. This is the
+ * "named tokens driven by CSS custom properties" wiring PHASE5_TICKET3_PLAN
+ * §3 calls for; Tailwind v4 (scaffolded by create-next-app) expresses it
+ * via @theme rather than tailwind.config.ts — see docs note in the ticket
+ * report for why that deviation is intentional, not an oversight. */
+@theme inline {
+  --color-ground: var(--ground);
+  --color-ground-raised: var(--ground-raised);
+  --color-glow-warm: var(--glow-warm);
+  --color-glass: var(--glass);
+  --color-glass-raised: var(--glass-raised);
+  --color-glass-border: var(--glass-border);
+  --color-glass-border-strong: var(--glass-border-strong);
+
+  --color-text: var(--text);
+  --color-text-dim: var(--text-dim);
+  --color-text-mute: var(--text-mute);
+
+  --color-accent: var(--accent);
+  --color-accent-hi: var(--accent-hi);
+
+  --color-sev-critical: var(--sev-critical);
+  --color-sev-warning: var(--sev-warning);
+  --color-sev-normal: var(--sev-normal);
+  --color-sev-info: var(--sev-info);
+  --color-financial: var(--financial);
+
+  /* Variables populated by next/font/google on <html> in layout.tsx;
+   * fallback stacks per DESIGN_CONSOLE.md §3 in case fonts haven't
+   * loaded yet or the Google Fonts request fails. */
+  --font-sans: var(--font-inter, Inter, system-ui, -apple-system, sans-serif);
+  --font-mono: var(
+    --font-jetbrains-mono,
+    "JetBrains Mono",
+    ui-monospace,
+    "SF Mono",
+    monospace
+  );
+
+  --radius-panel: var(--radius-panel);
+  --radius-dense: var(--radius-dense);
+}
+
+/* Dark-only by deliberate choice (DESIGN_CONSOLE.md §1) — this is a
+ * committed single look, not theme-following. Paint background/color
+ * explicitly rather than relying on prefers-color-scheme. */
+html {
+  height: 100%;
+  color-scheme: dark;
+}
+
+body {
+  min-height: 100%;
+  background: var(--ground);
+  background-image: radial-gradient(
+    ellipse 1200px 800px at 50% -10%,
+    var(--glow-warm),
+    transparent 60%
+  );
+  background-attachment: fixed;
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-feature-settings: "tnum" 1;
+}
+
+/* Numerics, IPs, timestamps, IDs always use tabular figures (§3). */
+.font-mono,
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Panels use a translucent + blurred fill. Blur is a progressive
+ * enhancement, never a legibility dependency — browsers without
+ * backdrop-filter support fall back to an opaque raised surface
+ * (DESIGN_CONSOLE.md §2). */
+.glass-panel {
+  background: var(--glass);
+  backdrop-filter: blur(14px) saturate(120%);
+  -webkit-backdrop-filter: blur(14px) saturate(120%);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-panel);
+}
+
+@supports not (backdrop-filter: blur(1px)) {
+  .glass-panel {
+    background: var(--ground-raised);
+  }
+}
+
+/* Focus ring — every interactive element gets a visible 2px accent ring
+ * (§4, non-negotiable). */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* The only looping animation permitted: a ~2s opacity pulse on
+ * live/critical indicators (§4, §6). */
+@keyframes aegis-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.animate-aegis-pulse {
+  animation: aegis-pulse 2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .animate-aegis-pulse {
+    animation: none !important;
+    opacity: 1 !important;
+  }
+}

@@ -26,3 +26,8 @@ artifacts/
 *.sln
 *.sw?
 graphify-out/
+
+# Phase 5 frontend (Ticket #3)
+frontend/node_modules/
+frontend/.next/
+frontend/out/
