@@ -19,6 +19,7 @@ from typing import Optional
 
 import pandas as pd
 
+from datasets.asset_registry import AssetRegistry
 from datasets.schema import (
     ACTION_ALERT,
     ACTION_CASH_IN,
@@ -39,7 +40,6 @@ from datasets.schema import (
 # PaySim transactions are Purdue Level 4 (business logistics / enterprise
 # financial systems) — see PLAN_MASTER.md Phase 1, contract C4.
 _PURDUE_LEVEL = 4
-from datasets.asset_registry import AssetRegistry
 
 # ---------------------------------------------------------------------------
 # Transaction type mappings

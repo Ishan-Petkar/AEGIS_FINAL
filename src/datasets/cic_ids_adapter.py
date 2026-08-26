@@ -20,6 +20,7 @@ from typing import List, Optional
 
 import pandas as pd
 
+from datasets.asset_registry import AssetRegistry
 from datasets.schema import (
     ACTION_ALERT,
     ACTION_PASS,
@@ -37,7 +38,6 @@ from datasets.schema import (
 # CIC-IDS2017 flows are Purdue Level 3 (site operations / network-layer
 # monitoring) — see PLAN_MASTER.md Phase 1, contract C4.
 _PURDUE_LEVEL = 3
-from datasets.asset_registry import AssetRegistry
 
 # ---------------------------------------------------------------------------
 # Attack label → (attck_evidence, calibrated_alert_level) mapping
