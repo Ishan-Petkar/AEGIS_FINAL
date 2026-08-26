@@ -1,7 +1,13 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { AlertEnvelopeData, CiiEnvelopeData, EventEnvelopeData, StreamEnvelope } from "./types";
+import type {
+  AlertEnvelopeData,
+  CiiEnvelopeData,
+  EventEnvelopeData,
+  HelloEnvelopeData,
+  StreamEnvelope,
+} from "./types";
 
 /**
  * useEventStream — the WS /ws/stream client hook (Ticket #4).
@@ -58,6 +64,37 @@ export interface UseEventStreamResult {
   eventsPerSecond: number;
   /** Cumulative alert count this session. */
   alertCount: number;
+  /**
+   * The one-time `{"type":"hello"}` snapshot the backend sends immediately
+   * on connect (`ReplayStatusResponse`). `null` until the socket has
+   * connected at least once. There is no periodic re-broadcast of this —
+   * `day` / `total_for_day` / `speed` / `replay_session_id` stay frozen at
+   * whatever they were at connect time until the next reconnect (see
+   * `AppHeader`'s replay-progress display for how the live count below
+   * fills the gap in between).
+   */
+  hello: HelloEnvelopeData | null;
+  /**
+   * Real "event" envelopes received on this connection since the last
+   * `hello` — each one is exactly one flow the replay engine actually
+   * emitted (backend/ingest.py broadcasts one "event" envelope per emitted
+   * flow), so `hello.emitted_count + liveEmittedSinceHello` is a real,
+   * non-fabricated running total even though the backend never re-sends
+   * `emitted_count` itself. Resets to 0 on every fresh `hello` (i.e. every
+   * reconnect), which is also when the `hello.emitted_count` baseline it's
+   * added to gets refreshed.
+   */
+  liveEmittedSinceHello: number;
+  /**
+   * The most recently observed flow's own dataset timestamp (`ts`, not
+   * `observed_at` — see `backend/replay_engine.py ReplayStatus.status()`,
+   * which derives `current_virtual_position` from the same per-flow
+   * virtual-time array), falling back to the `hello` snapshot's own
+   * `current_virtual_position` until the first event of this connection
+   * arrives. This is real data read straight off the wire, not an
+   * extrapolation.
+   */
+  lastVirtualPosition: string | null;
 }
 
 export function useEventStream(): UseEventStreamResult {
@@ -67,6 +104,9 @@ export function useEventStream(): UseEventStreamResult {
   const [latestCii, setLatestCii] = useState<CiiEnvelopeData | null>(null);
   const [eventsPerSecond, setEventsPerSecond] = useState(0);
   const [alertCount, setAlertCount] = useState(0);
+  const [hello, setHello] = useState<HelloEnvelopeData | null>(null);
+  const [liveEmittedSinceHello, setLiveEmittedSinceHello] = useState(0);
+  const [lastVirtualPosition, setLastVirtualPosition] = useState<string | null>(null);
 
   // Counts events since the last rate tick; read/reset from the interval
   // below. A ref (not state) because it's a write-often, read-rarely
@@ -126,6 +166,8 @@ export function useEventStream(): UseEventStreamResult {
                 ? next.slice(0, MAX_EVENTS_BUFFER)
                 : next;
             });
+            setLiveEmittedSinceHello((n) => n + 1);
+            setLastVirtualPosition(envelope.data.ts);
             break;
           case "alert":
             setAlerts((prev) => {
@@ -138,6 +180,11 @@ export function useEventStream(): UseEventStreamResult {
             break;
           case "cii":
             setLatestCii(envelope.data);
+            break;
+          case "hello":
+            setHello(envelope.data);
+            setLiveEmittedSinceHello(0);
+            setLastVirtualPosition(envelope.data.current_virtual_position);
             break;
         }
       };
@@ -188,5 +235,15 @@ export function useEventStream(): UseEventStreamResult {
     };
   }, []);
 
-  return { status, events, alerts, latestCii, eventsPerSecond, alertCount };
+  return {
+    status,
+    events,
+    alerts,
+    latestCii,
+    eventsPerSecond,
+    alertCount,
+    hello,
+    liveEmittedSinceHello,
+    lastVirtualPosition,
+  };
 }

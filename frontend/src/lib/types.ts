@@ -36,6 +36,14 @@ export interface TopologyNode {
   type: string | null;
   purdue_level: number | null;
   is_gateway: boolean;
+  /**
+   * Console redesign (docs/PHASE5_CONSOLE_REDESIGN_PLAN.md §3): sector
+   * membership, sourced from `config.SMART_CITY_ASSETS` on the backend —
+   * never re-derived or guessed on the frontend. `null` for gateway and
+   * synthesized nodes (they aren't curated assets and aren't owned by one
+   * sector).
+   */
+  sector: string | null;
 }
 
 export interface TopologyEdge {
@@ -226,4 +234,34 @@ export interface CiiEnvelope {
   data: CiiEnvelopeData;
 }
 
-export type StreamEnvelope = EventEnvelope | AlertEnvelope | CiiEnvelope;
+// ---------------------------------------------------------------------------
+// WS /ws/stream "hello" frame — sent once, immediately on connect
+// (backend/ws_broadcaster.py `register()`), carrying a `ReplayStatusResponse`
+// snapshot (`backend/schemas.py`). There is no periodic re-broadcast and no
+// REST GET status route (console redesign plan, §"one backend touch" —
+// adding one was out of scope), so this is the only server-confirmed
+// snapshot the client ever receives; `useEventStream` extrapolates forward
+// from it using real "event" envelopes (never fabricated) — see that file's
+// docstring on `hello`/`liveEmittedSinceHello`/`lastVirtualPosition`.
+// ---------------------------------------------------------------------------
+
+export interface HelloEnvelopeData {
+  running: boolean;
+  day: string | null;
+  speed: number | null;
+  replay_session_id: string | null;
+  emitted_count: number;
+  total_for_day: number;
+  current_virtual_position: string | null;
+  lag_seconds: number;
+  batches_emitted: number;
+  consumer_error_count: number;
+  consumer_failed_flow_count: number;
+}
+
+export interface HelloEnvelope {
+  type: "hello";
+  data: HelloEnvelopeData;
+}
+
+export type StreamEnvelope = EventEnvelope | AlertEnvelope | CiiEnvelope | HelloEnvelope;

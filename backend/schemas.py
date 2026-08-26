@@ -70,6 +70,13 @@ class TopologyNode(BaseModel):
     type: Optional[str]
     purdue_level: Optional[int]
     is_gateway: bool
+    #: Console redesign (docs/PHASE5_CONSOLE_REDESIGN_PLAN.md §3, the one
+    #: permitted backend touch): passthrough of config.SMART_CITY_ASSETS'
+    #: `sector` field so the frontend derives sector-view aggregation from
+    #: real data instead of a hardcoded name list. `None` for gateway and
+    #: synthesized nodes (City_Grid), which are not curated assets and are
+    #: not owned by any one sector.
+    sector: Optional[str] = None
 
 
 class TopologyEdge(BaseModel):

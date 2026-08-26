@@ -97,6 +97,7 @@ from backend.schemas import (
 )
 from backend.seed import compute_seed_rows
 from cii_calculator import compute_cascading_impact_full
+from config import SMART_CITY_ASSETS
 from graph_manager import build_graph
 
 logger = logging.getLogger(__name__)
@@ -232,6 +233,14 @@ def get_topology() -> TopologyResponse:
     """
     graph = build_graph(directed=True)
     meta_by_name = {row["name"]: row for row in compute_seed_rows()}
+    # Sector passthrough (docs/PHASE5_CONSOLE_REDESIGN_PLAN.md §3): read
+    # directly off config.SMART_CITY_ASSETS rather than threading a new key
+    # through compute_seed_rows()/Asset — that function's dicts are also
+    # passed straight into the SQLAlchemy `Asset(**row)` constructor
+    # (backend.seed.seed_assets), which has no `sector` column, so adding
+    # it there would break asset seeding. This keeps the one permitted
+    # backend touch confined to this route.
+    sector_by_name = {a["asset_name"]: a.get("sector") for a in SMART_CITY_ASSETS}
 
     nodes = [
         TopologyNode(
@@ -240,6 +249,7 @@ def get_topology() -> TopologyResponse:
             type=meta_by_name[name]["type"],
             purdue_level=meta_by_name[name]["purdue_level"],
             is_gateway=bool(meta_by_name[name]["is_gateway"]),
+            sector=sector_by_name.get(name),
         )
         for name in graph.nodes()
     ]

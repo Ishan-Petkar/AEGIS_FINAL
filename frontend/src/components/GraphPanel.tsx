@@ -1,11 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
 import dynamic from "next/dynamic";
 import { Panel } from "./Panel";
-import { ApiError, ApiNetworkError, getTopology } from "@/lib/api";
 import { useConnection } from "@/lib/connection-context";
-import type { TopologyResponse } from "@/lib/types";
+import { useGraphFocus } from "@/lib/graph-focus-context";
+import { useTopology } from "@/lib/topology-context";
 
 // react-force-graph-2d touches `window`/canvas at import time, so the
 // force-directed graph (Ticket #11) is loaded client-only. This is the
@@ -25,81 +24,79 @@ const CityGraph = dynamic(() => import("./CityGraph").then((m) => m.CityGraph), 
   ),
 });
 
-type LoadState =
-  | { kind: "loading" }
-  | { kind: "error"; message: string }
-  | { kind: "loaded"; data: TopologyResponse };
-
 /**
- * GraphPanel — hero region (DESIGN_CONSOLE.md §5). The force-directed
- * graph itself is Ticket #11's scope; this ticket wires the real
- * GET /api/topology call and renders a correct empty state with the live
- * node/edge counts, per PHASE5_TICKET3_PLAN §5.
+ * GraphPanel — hero region (DESIGN_CONSOLE.md §5). Topology is now fetched
+ * once by the shared `TopologyProvider` (console redesign — the sector
+ * health strip needs the same node/edge set), so this panel is a plain
+ * consumer of `useTopology()`; the loading/error/empty branches below are
+ * unchanged from the original per-panel fetch, per PHASE5_TICKET3_PLAN §5.
  *
  * Connection state is NOT decided locally. `ConnectionProvider`
  * (`@/lib/connection-context`) is the single source of truth, polled via
  * GET /api/health, and this panel is a consumer of it — the same status
  * the header reads. When the shared status is "unreachable" this panel
  * shows the same disconnected state as the header, full stop, regardless
- * of whatever its own last topology fetch returned; when the shared
- * status transitions back to reachable (`reconnectEpoch` increments) the
- * panel automatically refetches topology. This is what makes "retrying"
- * an honest claim: the panel really does retry, driven by the health poll,
- * rather than fetching once on mount and getting stuck (see MEDIUM-1/
- * MEDIUM-2 in the Ticket #3 fix round).
+ * of whatever the last topology fetch returned.
+ *
+ * The maximise control (`⤢`, D-R2) toggles `GraphFocusProvider`'s shared
+ * `expanded` flag: `false` renders the panel in its normal 3-column slot
+ * showing the sector-aggregated default view; `true` renders it as a
+ * `position: fixed` full-viewport overlay (independent of its flex
+ * ancestors — `fixed` breaks out of the layout regardless of parent rules)
+ * showing every curated asset, per §1's "Expanded" geometry target. Escape
+ * also collapses it back (wired in `CityGraph`, which owns the keydown
+ * listener since it already tracks focus/hover state).
  */
 export function GraphPanel() {
-  const { status, reconnectEpoch } = useConnection();
-  const [state, setState] = useState<LoadState>({ kind: "loading" });
-  // Bumped by the manual "Retry" button; combined with reconnectEpoch as
-  // the effect's refetch trigger so a click doesn't need to call a
-  // setState-invoking function directly from render.
-  const [retryToken, setRetryToken] = useState(0);
-
-  // Refetch on mount, again every time the shared connection state
-  // transitions from unreachable back to reachable (reconnectEpoch), and
-  // again on a manual retry click (retryToken).
-  useEffect(() => {
-    let cancelled = false;
-
-    async function load() {
-      setState({ kind: "loading" });
-      try {
-        const data = await getTopology();
-        if (cancelled) return;
-        setState({ kind: "loaded", data });
-      } catch (err) {
-        if (cancelled) return;
-        const message =
-          err instanceof ApiNetworkError
-            ? "Could not reach the backend for this request."
-            : err instanceof ApiError
-              ? `Topology request failed (HTTP ${err.status}): ${err.message}`
-              : "Unknown error loading topology";
-        setState({ kind: "error", message });
-      }
-    }
-
-    load();
-    return () => {
-      cancelled = true;
-    };
-  }, [reconnectEpoch, retryToken]);
+  const { status } = useConnection();
+  const { state, retry } = useTopology();
+  const { expanded, setExpanded } = useGraphFocus();
 
   const isUnreachable = status === "unreachable";
   const isLoaded = !isUnreachable && state.kind === "loaded";
 
   return (
-    <Panel
+    <>
+      {/* Console redesign: a full-viewport takeover needs an opaque
+          backing, not `.glass-panel`'s deliberately near-transparent
+          fill (`--glass`, ~4.5% alpha — right for a small panel floating
+          over the page's own ambient glow, wrong for a "maximised"
+          view that's meant to fully replace what's on screen). Without
+          this, the other panels sitting underneath in normal document
+          flow visibly show through, which reads as a rendering bug, not
+          the intended "the graph now owns the whole window." A separate
+          element (not just an opaque className on the Panel itself)
+          because the Panel keeps its normal glass styling — this is
+          purely the backdrop it sits on. `z-40`, one below the Panel's
+          own `z-50`. */}
+      {expanded && <div className="fixed inset-0 z-40 bg-ground" aria-hidden="true" />}
+      <Panel
       label="City Infrastructure"
+      action={
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          aria-label={expanded ? "Collapse graph to normal size" : "Maximise graph to full window"}
+          aria-pressed={expanded}
+          title={expanded ? "Collapse (Esc)" : "Maximise — all 50 curated assets"}
+          className="rounded-[var(--radius-dense)] border border-glass-border px-2 py-1 text-xs text-text-dim transition-colors duration-150 ease-out hover:bg-glass-raised hover:text-text focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+        >
+          {expanded ? "⤡" : "⤢"}
+        </button>
+      }
       // Below `xl` the page no longer clamps to a fixed viewport height
       // (see page.tsx), so this panel needs its own definite height for
       // the ResizeObserver-driven canvas in CityGraph to size against —
       // a fixed `h-[420px]` does that without needing document-level
       // clamping. At `xl` it reverts to flexing to fill the 3-column
       // grid row, matching the fixed-viewport behaviour that broke the
-      // runaway canvas-growth loop.
-      className="h-[420px] shrink-0 xl:h-auto xl:min-h-0 xl:flex-1 xl:shrink"
+      // runaway canvas-growth loop. When `expanded`, none of that applies
+      // — `fixed inset-0` takes the panel out of flow entirely.
+      className={
+        expanded
+          ? "fixed inset-0 z-50 h-dvh w-dvw rounded-none"
+          : "h-[420px] shrink-0 xl:h-auto xl:min-h-0 xl:flex-1 xl:shrink"
+      }
       bodyClassName={isLoaded ? "flex min-h-0" : "flex items-center justify-center"}
     >
       {isUnreachable && (
@@ -133,7 +130,7 @@ export function GraphPanel() {
           <p className="font-mono text-xs text-text-mute">{state.message}</p>
           <button
             type="button"
-            onClick={() => setRetryToken((n) => n + 1)}
+            onClick={retry}
             className="mt-1 rounded-[var(--radius-dense)] border border-glass-border px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-text-dim transition-colors duration-150 ease-out hover:bg-glass-raised hover:text-text"
           >
             Retry
@@ -153,7 +150,8 @@ export function GraphPanel() {
           </p>
         </div>
       )}
-    </Panel>
+      </Panel>
+    </>
   );
 }
 

@@ -1,7 +1,9 @@
 import type { Metadata } from "next";
 import { Inter, JetBrains_Mono } from "next/font/google";
 import { ConnectionProvider } from "@/lib/connection-context";
+import { GraphFocusProvider } from "@/lib/graph-focus-context";
 import { StreamProvider } from "@/lib/stream-context";
+import { TopologyProvider } from "@/lib/topology-context";
 import "./globals.css";
 
 // DESIGN_CONSOLE.md §3: Inter for UI/body, JetBrains Mono for numerics,
@@ -45,7 +47,11 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
           its own definite height instead (see page.tsx / GraphPanel.tsx). */}
       <body className="flex flex-col antialiased xl:h-full xl:overflow-hidden">
         <ConnectionProvider>
-          <StreamProvider>{children}</StreamProvider>
+          <StreamProvider>
+            <TopologyProvider>
+              <GraphFocusProvider>{children}</GraphFocusProvider>
+            </TopologyProvider>
+          </StreamProvider>
         </ConnectionProvider>
       </body>
     </html>

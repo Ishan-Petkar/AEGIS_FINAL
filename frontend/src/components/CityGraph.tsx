@@ -11,6 +11,14 @@ import {
   type ClusterSnapshotNode,
 } from "@/lib/cluster-graph";
 import { AssetActivityTracker } from "@/lib/asset-activity";
+import { useGraphFocus } from "@/lib/graph-focus-context";
+import {
+  HUB_ASSET_NAME,
+  SECTOR_ORDER,
+  groupNodesBySector,
+  sectorLabel,
+  sectorNodeId,
+} from "@/lib/sectors";
 import type { TopologyResponse } from "@/lib/types";
 
 // Ticket #11 — the real force-directed graph. Two invariants drive every
@@ -39,6 +47,18 @@ const PULSE_WINDOW_MS = 3000;
 // computes the CII distribution; this file only paces how it is revealed).
 const CASCADE_STAGGER_MS = 260;
 
+// Ticket #16 FIX round (HIGH-1): the observed `/24` cluster layer is
+// confined to a narrow vertical band hugging the right edge of the
+// container — a "peripheral band", not the roughly-half-canvas region
+// the first pass gave it. `CLUSTER_ZONE_LEFT_FRAC` is the left edge of
+// that band (as a fraction of container width); everything left of it,
+// out to the container edges, belongs to the curated city. `seedPosition`,
+// `computeCuratedLayout`, and `makeClusterConfineForce` all target this
+// same boundary so a newly-arriving cluster node seeds inside the band
+// and the curated ellipse's radius never crosses into it.
+const CLUSTER_ZONE_LEFT_FRAC = 0.84;
+const CLUSTER_ZONE_GAP_FRAC = 0.03;
+
 interface CuratedNodeDatum {
   id: string;
   layer: "curated";
@@ -47,6 +67,12 @@ interface CuratedNodeDatum {
   criticality: number;
   isGateway: boolean;
   isFinancial: boolean;
+  // Console redesign (D-R2): true for a sector-aggregate node (id
+  // `sector:<key>`) representing >=1 real curated assets collapsed into
+  // one point in the default view. `memberCount` is always 1 for a real
+  // (non-aggregate) node.
+  isAggregate: boolean;
+  memberCount: number;
   pulseSeverity: "normal" | "warning" | "critical";
   x?: number;
   y?: number;
@@ -57,14 +83,18 @@ interface CuratedNodeDatum {
   // fixed regardless of any force (charge from arriving clusters included).
   fx?: number;
   fy?: number;
-  // Ticket #14 FIX round (HIGH-1): the label's vertical offset from the
-  // node's own y, in the same units as x/y — negative draws the label
-  // above the node, positive below. Assigned once by
-  // `computeCuratedLayout`'s greedy label placer, which checks each
-  // node's candidate box against every already-placed label to
-  // guarantee no two curated labels overlap (see that function's
-  // docstring for why a static above/below-by-column rule wasn't
-  // enough).
+  // Ticket #16 FIX round (HIGH-1): the label anchor's offset from the
+  // node's own (x, y), in the same units. `labelDy`'s sign still decides
+  // the text baseline (negative draws above the node, positive below);
+  // `labelDx` is new — at city scale, labels are placed *radially*
+  // (pushed outward along the hub->node direction) rather than purely
+  // vertically, so they extend into the empty space between sector
+  // wedges instead of colliding with same-ring neighbours. Both are
+  // assigned once by `computeCuratedLayout`'s greedy label placer, which
+  // checks each node's candidate box against every already-placed label
+  // to guarantee no two curated labels overlap (see that function's
+  // docstring).
+  labelDx?: number;
   labelDy?: number;
 }
 
@@ -90,6 +120,12 @@ interface CuratedLinkDatum {
   layer: "curated";
   edgeType: string;
   isGatewayEdge: boolean;
+  // Console redesign (D-R2): true when this link was produced by
+  // collapsing >=1 real curated edge onto a sector aggregate node — never
+  // an invented sector-pair connection (D11-1's honesty rule). `count` is
+  // how many real edges it represents (always 1 when not aggregate).
+  isAggregate: boolean;
+  count: number;
 }
 
 interface ClusterLinkDatum {
@@ -189,14 +225,24 @@ function useContainerSize<T extends HTMLElement>() {
   return { ref, size };
 }
 
-/** Deterministic-ish seed so re-mounts don't jump nodes around wildly; layer bias keeps the two layers visually apart from the start. Used for the cluster (observed) layer only — see `computeCuratedLayout` for the curated layer, which is pinned rather than seeded. */
+/**
+ * Deterministic-ish seed so re-mounts don't jump nodes around wildly;
+ * layer bias keeps the two layers visually apart from the start. Used
+ * for the cluster (observed) layer only — see `computeCuratedLayout` for
+ * the curated layer, which is pinned rather than seeded. Ticket #16 FIX
+ * round: the "right" side now seeds inside the narrow peripheral cluster
+ * band (`CLUSTER_ZONE_LEFT_FRAC`, defined below) rather than the whole
+ * right half of the canvas, so newly-arriving clusters don't have to
+ * drift far to reach `makeClusterConfineForce`'s containment region.
+ */
 function seedPosition(width: number, height: number, side: "left" | "right") {
   const w = width || 600;
   const h = height || 400;
-  const xBase = side === "left" ? w * 0.28 : w * 0.72;
+  const xBase = side === "left" ? w * 0.28 : w * (CLUSTER_ZONE_LEFT_FRAC + (1 - CLUSTER_ZONE_LEFT_FRAC) * 0.55);
+  const spread = side === "left" ? w * 0.3 : w * (1 - CLUSTER_ZONE_LEFT_FRAC) * 0.7;
   return {
-    x: xBase + (Math.random() - 0.5) * w * 0.3,
-    y: h / 2 + (Math.random() - 0.5) * h * 0.6,
+    x: xBase + (Math.random() - 0.5) * spread,
+    y: h / 2 + (Math.random() - 0.5) * h * 0.82,
   };
 }
 
@@ -209,166 +255,353 @@ function curatedNodeRadius(criticality: number): number {
   return 3 + criticality * 7;
 }
 
-/**
- * Ticket #14 FIX round (HIGH-1): average y-rank (0..1) of `name`'s
- * neighbours that have already been placed (i.e. sit in an earlier,
- * already-processed column). Returns `null` when none have — the first
- * column, and any node whose only neighbours are further right. Used by
- * `computeCuratedLayout`'s single left-to-right barycenter sweep so
- * dependency edges pull toward similar y instead of a naive
- * criticality-only ordering, which is what produced the long,
- * near-vertical edges HIGH-1 also flagged.
- */
-function barycenterOf(
-  name: string,
-  neighborsOf: Map<string, string[]>,
-  yRankOf: Map<string, number>
-): number | null {
-  const neighbors = neighborsOf.get(name);
-  if (!neighbors || neighbors.length === 0) return null;
-  let sum = 0;
-  let count = 0;
-  for (const nb of neighbors) {
-    const r = yRankOf.get(nb);
-    if (r !== undefined) {
-      sum += r;
-      count += 1;
-    }
-  }
-  return count > 0 ? sum / count : null;
+// ---------------------------------------------------------------------------
+// Console redesign (docs/PHASE5_CONSOLE_REDESIGN_PLAN.md §3, D-R2):
+// sector-aggregated default view. `HUB_ASSET_NAME`/`SECTOR_ORDER`/
+// `sectorLabel`/`sectorNodeId`/`groupNodesBySector` live in `@/lib/sectors`
+// (shared with `SectorHealthStrip`, which needs the identical grouping so
+// the strip's chips and the graph's aggregate nodes can never disagree
+// about sector membership). `GET /api/topology` carries a real `sector`
+// field per node (sourced from `config.SMART_CITY_ASSETS`, the one
+// permitted backend touch this plan allows) — this replaces the Ticket #16
+// frontend-only `SECTOR_OF` lookup table entirely; sector membership is
+// derived from real data, never guessed here. A `null` sector (gateways,
+// the synthesized `City_Grid` node) falls back to "core": those nodes are
+// not owned by any one sector, so — unlike Ticket #16's expanded-only
+// layout, where they ringed the hub — the aggregated (default) view omits
+// them entirely (see `buildDisplayTopology`) to hit the ~11-node target in
+// docs/PHASE5_CONSOLE_REDESIGN_PLAN.md §1; they still appear, ungrouped, in
+// the expanded (all-50-assets) view exactly as before.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// D-R2: the actual node/edge set handed to the layout + rendering pipeline
+// depends on view mode. `expanded` (the maximise control) always draws the
+// real, unmodified topology — identical to the pre-redesign behavior.
+// Otherwise the default sector-aggregated view draws the hub, one
+// aggregate node per non-empty sector (sized by member count, D-R2), and —
+// if `focusedSector` names one — that sector's real members in place of
+// its single aggregate node ("clicking a sector expands that sector
+// inline", D-R2).
+// ---------------------------------------------------------------------------
+interface DisplayNode {
+  name: string;
+  label: string;
+  type: string | null;
+  criticality: number;
+  purdue_level: number | null;
+  sector: string | null;
+  is_gateway: boolean;
+  isFinancial: boolean;
+  isAggregate: boolean;
+  memberCount: number;
+}
+
+interface DisplayEdge {
+  source: string;
+  target: string;
+  edge_type: string;
+  is_gateway_edge: boolean;
+  /** True when this link was produced by collapsing >=1 real edge onto a sector aggregate node (either endpoint, or both). */
+  isAggregate: boolean;
+  /** How many real curated edges this one link represents — always 1 for a non-aggregate edge. */
+  count: number;
+}
+
+function realNodeToDisplay(n: TopologyResponse["nodes"][number]): DisplayNode {
+  return {
+    name: n.name,
+    label: n.name,
+    type: n.type,
+    criticality: n.criticality,
+    purdue_level: n.purdue_level,
+    sector: n.sector,
+    is_gateway: n.is_gateway,
+    isFinancial: (n.type ?? "").includes("Financial"),
+    isAggregate: false,
+    memberCount: 1,
+  };
 }
 
 /**
- * Ticket #14 (D14-1), reworked in the FIX round for HIGH-1: a stable,
- * deterministic layout for the 16 curated nodes, computed by Purdue
- * level (columns, left-to-right by ascending level; the one node with
- * `purdue_level: null` — `City_Grid`, a synthesized node — gets its own
- * trailing column). This replaces physics-derived seeding for the
- * curated layer entirely: the topology is a fixed, known structure, so
- * there is nothing for a force simulation to discover, and re-deriving
- * it every frame is exactly what let 24 arriving clusters shove the
- * curated layer into a knot (see the ticket plan). Callers pin the
- * returned positions via `fx`/`fy`.
+ * Builds the node/edge set actually laid out and rendered for the current
+ * view. Edge aggregation (the sector<->sector / hub<->sector links in the
+ * default view) is derived strictly by remapping each REAL curated edge's
+ * endpoints onto their display id and collapsing duplicates — never
+ * inventing a sector-pair connection no real edge crosses (D11-1's
+ * honesty rule, restated for this layer in the plan's §3). An edge is
+ * dropped entirely if either endpoint has no display representation
+ * (gateways/City_Grid in the aggregated view) or if remapping collapses it
+ * to a self-loop (both ends land on the same node, e.g. two members of the
+ * same still-aggregated sector).
+ */
+function buildDisplayTopology(
+  topology: TopologyResponse,
+  expanded: boolean,
+  focusedSector: string | null,
+  sectorMembers: Map<string, TopologyResponse["nodes"]>
+): { nodes: DisplayNode[]; edges: DisplayEdge[] } {
+  if (expanded) {
+    return {
+      nodes: topology.nodes.map(realNodeToDisplay),
+      edges: topology.edges.map((e) => ({
+        source: e.source,
+        target: e.target,
+        edge_type: e.edge_type,
+        is_gateway_edge: e.is_gateway_edge,
+        isAggregate: false,
+        count: 1,
+      })),
+    };
+  }
+
+  const expandedNames = new Set<string>([HUB_ASSET_NAME]);
+  if (focusedSector) {
+    for (const m of sectorMembers.get(focusedSector) ?? []) expandedNames.add(m.name);
+  }
+
+  const nodes: DisplayNode[] = [];
+  for (const n of topology.nodes) {
+    if (expandedNames.has(n.name)) nodes.push(realNodeToDisplay(n));
+  }
+  const maxMembers = Math.max(1, ...[...sectorMembers.values()].map((v) => v.length));
+  for (const sector of SECTOR_ORDER) {
+    if (sector === focusedSector) continue;
+    const members = sectorMembers.get(sector);
+    if (!members || members.length === 0) continue;
+    nodes.push({
+      name: sectorNodeId(sector),
+      label: `${sectorLabel(sector)} · ${members.length}`,
+      type: null,
+      // Sized by member count (D-R2), not criticality — reuses
+      // `curatedNodeRadius`'s criticality->radius formula by mapping
+      // count onto the same [0,1]-ish domain, so aggregate nodes need no
+      // separate sizing code path in `nodeCanvasObject`.
+      criticality: clamp(members.length / maxMembers, 0.2, 1),
+      purdue_level: null,
+      sector,
+      is_gateway: false,
+      isFinancial: false,
+      isAggregate: true,
+      memberCount: members.length,
+    });
+  }
+
+  const sectorByName = new Map<string, string | null>(topology.nodes.map((n) => [n.name, n.sector]));
+  const remap = (name: string): string | null => {
+    if (expandedNames.has(name)) return name;
+    const sector = sectorByName.get(name);
+    return sector ? sectorNodeId(sector) : null;
+  };
+
+  const edgeMap = new Map<string, DisplayEdge>();
+  for (const e of topology.edges) {
+    const s = remap(e.source);
+    const t = remap(e.target);
+    if (!s || !t || s === t) continue;
+    const isAgg = s !== e.source || t !== e.target;
+    const key = `${s}->${t}`;
+    const existing = edgeMap.get(key);
+    if (existing) {
+      existing.count += 1;
+    } else {
+      edgeMap.set(key, {
+        source: s,
+        target: t,
+        edge_type: isAgg ? "aggregated" : e.edge_type,
+        is_gateway_edge: isAgg ? false : e.is_gateway_edge,
+        isAggregate: isAgg,
+        count: 1,
+      });
+    }
+  }
+
+  return { nodes, edges: [...edgeMap.values()] };
+}
+
+/**
+ * Labels that must stay permanently on regardless of collision pressure
+ * (D-C5: "the hub, ALL financial assets, and any cascade-involved node
+ * must stay permanently labelled"). Cascade involvement is dynamic (it
+ * depends on the live `cascade` state), so it is *not* decided here —
+ * `nodeCanvasObject` below checks it at paint time. This only covers the
+ * two static cases plus a criticality floor so the low-value periphery
+ * (sensors, advisory feeds) is the part that goes hover-only, not
+ * anything actually consequential.
+ */
+const ALWAYS_LABEL_CRITICALITY = 0.5;
+
+/**
+ * Ticket #16 (D-C5), re-tuned in the FIX round: hub-centred
+ * concentric/radial layout, replacing the Ticket #14 Purdue-columns
+ * layout. At ~44 curated assets the column layout became a wall of text
+ * and had no way to express "one node is the centre of the city" — this
+ * does, literally: `City_Operations_Center` is pinned at the curated
+ * region's centre, every other sector gets its own angular wedge around
+ * it, and Purdue level becomes distance from centre *within* a wedge
+ * (field/OT devices ring the outside, enterprise/external systems sit
+ * closer in) — so the Purdue story that the column layout told
+ * left-to-right is now told centre-to-edge. Gateways and the synthesized
+ * `City_Grid` node aren't owned by one sector, so they ring the hub at a
+ * small fixed "core" radius instead of a wedge (see `sectorOf`).
  *
- * HIGH-1 (FIX round): the original version ordered each column
- * independently by criticality and spread it evenly over the *same*
- * `[0,1]` fraction of `rowSpan` used by every other column. With
- * columns only ~35-45px apart and labels routinely 100-150px wide, that
- * made most columns share a handful of identical y-heights (row 0, the
- * middle, the last row), so at default zoom whole horizontal bands of
- * unrelated labels from different columns landed on top of each other
- * — exactly the jumbled overlap in the ticket's screenshot. Two changes
- * fix it without touching which nodes exist, which column they sit in,
- * or the two-layer separation:
+ * FIX round change: the first pass used a single scalar radius bounded
+ * by whichever of width/height was tighter, which on a wide 4:3-ish
+ * container is *always* height — so the curated city never grew past
+ * ~half the available width no matter how much horizontal room existed,
+ * producing the "cramped left-centre 30%" defect. This version computes
+ * independent `radiusX`/`radiusY` (an ellipse, not a circle): `radiusX`
+ * is bounded only by the container's left edge and the cluster band's
+ * left edge (`CLUSTER_ZONE_LEFT_FRAC`); `radiusY` only by top/bottom
+ * margins. Because `radiusX` no longer has to fit inside `radiusY`'s
+ * budget, sector wedges actually separate horizontally on a wide canvas
+ * instead of collapsing into the old circle's tight radius. Every radius
+ * used below (core ring, per-Purdue-level bands) is expressed as a
+ * *fraction* of (radiusX, radiusY) and only converted to a pixel
+ * position at the point a node's (x, y) is actually set — see
+ * `ellipsePoint`.
  *
- * 1. A single left-to-right barycenter sweep (`barycenterOf`) orders
- *    each column by the average y-rank of its already-placed neighbours
- *    instead of criticality alone, which shortens the long near-vertical
- *    dependency edges and, as a side effect, decorrelates which node
- *    ends up in which row per column versus a fixed rule.
- * 2. A deterministic per-column phase offset (`colIdx % 4`) shifts each
- *    column's row band within `rowSpan`, so columns of equal node count
- *    no longer land on the exact same fractional y positions.
- * 3. A greedy sequential label placer (below, processing nodes
- *    left-to-right) picks each label's vertical offset — above or below
- *    the node, at increasing distance rings — by checking it against
- *    *every* already-placed label's box, not just its column neighbours.
- *    This is the part that actually guarantees no overlap: (1) and (2)
- *    reduce how often two labels land close together, but an
- *    alternate-by-column-parity rule (tried first, dropped) still failed
- *    whenever the "below" node happened to sit *above* the "above" node
- *    for the same pair — both labels then aim at each other into a gap
- *    too narrow for either. Checking real computed boxes instead of a
- *    static parity rule closes that hole regardless of relative y.
- *
- * Still confined to the left ~5%-48% of the container width so it never
- * overlaps the cluster layer's seed region (`seedPosition`'s "right"
- * side starts at 0.72w with a 0.15w spread, i.e. never below ~0.57w) or
- * the `clusterConfineForce` containment boundary below (0.52w).
+ * Positions are still handed back for `fx`/`fy` pinning (Ticket #14,
+ * D14-1: a stationary curated layer is what keeps labels and the cascade
+ * readable — more true, not less, at 44+ labels), and the label placer
+ * below still checks each node's candidate label box against *every*
+ * already-placed box (not just wedge neighbours) to guarantee no two
+ * curated labels overlap — it now searches radially outward from each
+ * node (see the placer's own comment) rather than only above/below,
+ * since labels pushed straight up/down stop reading as "belonging to"
+ * their wedge once wedges are angularly separated instead of stacked in
+ * columns.
  */
 function computeCuratedLayout(
-  nodes: TopologyResponse["nodes"],
-  edges: TopologyResponse["edges"],
+  nodes: DisplayNode[],
+  edges: DisplayEdge[],
   width: number,
   height: number
-): { positions: Map<string, { x: number; y: number; labelDy: number }>; labelMaxWidth: number } {
+): { positions: Map<string, { x: number; y: number; labelDx: number; labelDy: number }>; labelMaxWidth: number } {
   const w = width || 600;
   const h = height || 400;
-  const NULL_LEVEL = 6; // sorts after real Purdue levels 0-5
-  const levelOf = (lvl: number | null) => (lvl === null ? NULL_LEVEL : lvl);
+  void edges; // no longer used for layout (no barycenter sweep) — kept in the signature so callers don't change
 
-  const byLevel = new Map<number, TopologyResponse["nodes"]>();
+  const cx = w * 0.42;
+  const cy = h * 0.5;
+  const clusterZoneLeft = w * CLUSTER_ZONE_LEFT_FRAC;
+  const radiusX = Math.max(50, Math.min(cx - w * 0.03, clusterZoneLeft - w * CLUSTER_ZONE_GAP_FRAC - cx));
+  const radiusY = Math.max(50, Math.min(cy - h * 0.06, h * 0.94 - cy));
+  const ellipsePoint = (angle: number, frac: number) => ({
+    x: cx + Math.cos(angle) * frac * radiusX,
+    y: cy + Math.sin(angle) * frac * radiusY,
+  });
+
+  const coreFrac = 0.15;
+  const minSectorFrac = coreFrac * 1.8;
+
+  const hub = nodes.find((n) => n.name === HUB_ASSET_NAME);
+  const core: DisplayNode[] = [];
+  const bySector = new Map<string, DisplayNode[]>();
   for (const n of nodes) {
-    const lvl = levelOf(n.purdue_level);
-    const list = byLevel.get(lvl);
+    if (n.name === HUB_ASSET_NAME) continue;
+    // Console redesign: `n.sector` is now real data (either the backend's
+    // `TopologyNode.sector` passthrough for a real asset, or the sector a
+    // synthetic aggregate node itself represents — see
+    // `buildDisplayTopology`), replacing the old name-lookup `sectorOf()`.
+    const sector = n.sector ?? "core";
+    if (sector === "core") {
+      core.push(n);
+      continue;
+    }
+    const list = bySector.get(sector);
     if (list) list.push(n);
-    else byLevel.set(lvl, [n]);
+    else bySector.set(sector, [n]);
   }
-  const levels = [...byLevel.keys()].sort((a, b) => a - b);
-
-  const leftMargin = w * 0.05;
-  const columnSpan = w * 0.43;
-  const topMargin = h * 0.1;
-  const rowSpan = h * 0.8;
-
-  const neighborsOf = new Map<string, string[]>();
-  for (const e of edges) {
-    if (!neighborsOf.has(e.source)) neighborsOf.set(e.source, []);
-    if (!neighborsOf.has(e.target)) neighborsOf.set(e.target, []);
-    neighborsOf.get(e.source)!.push(e.target);
-    neighborsOf.get(e.target)!.push(e.source);
-  }
-  const yRankOf = new Map<string, number>();
 
   const basePositions = new Map<string, { x: number; y: number }>();
-  levels.forEach((lvl, colIdx) => {
-    const x =
-      levels.length > 1
-        ? leftMargin + (colIdx / (levels.length - 1)) * columnSpan
-        : leftMargin + columnSpan / 2;
-    const colNodes = [...(byLevel.get(lvl) ?? [])].sort((a, b) => {
-      const aBary = barycenterOf(a.name, neighborsOf, yRankOf);
-      const bBary = barycenterOf(b.name, neighborsOf, yRankOf);
-      if (aBary !== null && bBary !== null && aBary !== bBary) return aBary - bBary;
-      if (aBary !== null && bBary === null) return -1;
-      if (bBary !== null && aBary === null) return 1;
+  if (hub) basePositions.set(hub.name, { x: cx, y: cy });
+
+  // Core ring (gateways, City_Grid): evenly spaced immediately around the
+  // hub, sorted by name for a stable arrangement across re-renders.
+  const sortedCore = [...core].sort((a, b) => a.name.localeCompare(b.name));
+  sortedCore.forEach((n, i) => {
+    const angle = -Math.PI / 2 + (i / Math.max(1, sortedCore.length)) * 2 * Math.PI;
+    basePositions.set(n.name, ellipsePoint(angle, coreFrac));
+  });
+
+  // Radius fraction by Purdue level: level 0 (field/OT) sits at frac 1.0
+  // (the outer rim), level 5 (external-facing) sits at `minSectorFrac` —
+  // the D-C5 "Purdue story survives as radius instead of column"
+  // requirement. A null level (shouldn't occur among sector members
+  // today — City_Grid, the only null-level node, lives in the core ring
+  // above) falls to a mid-band.
+  const NULL_LEVEL = 2.5;
+  const fracForLevel = (lvl: number | null) => {
+    const clamped = lvl === null ? NULL_LEVEL : Math.max(0, Math.min(5, lvl));
+    const frac = 1 - clamped / 5;
+    return minSectorFrac + frac * (1 - minSectorFrac);
+  };
+
+  const activeSectors = SECTOR_ORDER.filter((s) => bySector.has(s));
+  const wedgeAngle = activeSectors.length > 0 ? (2 * Math.PI) / activeSectors.length : 2 * Math.PI;
+
+  activeSectors.forEach((sector, sIdx) => {
+    const wedgeCenter = -Math.PI / 2 + sIdx * wedgeAngle;
+    const members = [...(bySector.get(sector) ?? [])].sort((a, b) => {
       if (b.criticality !== a.criticality) return b.criticality - a.criticality;
       return a.name.localeCompare(b.name);
     });
-
-    const phase = (colIdx % 4) / 4; // 0, .25, .5, .75, repeating
-    const usableSpan = rowSpan * 0.8;
-    const phaseOffset = phase * rowSpan * 0.2;
-
-    colNodes.forEach((n, rowIdx) => {
-      const frac = colNodes.length > 1 ? rowIdx / (colNodes.length - 1) : 0.5;
-      const y = topMargin + phaseOffset + frac * usableSpan;
-      yRankOf.set(n.name, frac);
-      basePositions.set(n.name, { x, y });
-    });
+    const byLevel = new Map<number, DisplayNode[]>();
+    for (const m of members) {
+      const lvl = m.purdue_level ?? NULL_LEVEL;
+      const list = byLevel.get(lvl);
+      if (list) list.push(m);
+      else byLevel.set(lvl, [m]);
+    }
+    for (const [lvl, group] of byLevel) {
+      const frac = fracForLevel(lvl);
+      // Fan out within ~86% of the wedge so adjacent sectors never touch,
+      // even when one radius band is crowded.
+      const spread = wedgeAngle * 0.86;
+      group.forEach((n, i) => {
+        const spreadFrac = group.length > 1 ? i / (group.length - 1) - 0.5 : 0;
+        const angle = wedgeCenter + spreadFrac * spread;
+        basePositions.set(n.name, ellipsePoint(angle, frac));
+      });
+    }
   });
 
-  // Per-node label budget in screen px: labels are drawn at a constant
-  // screen-space size regardless of zoom (`fontSize = C / globalScale`
-  // below), and `zoomToFit` scales the whole two-layer graph to roughly
-  // fill the container, so container-space px here is a good proxy for
-  // eventual screen px. Sized off the actual column spacing rather than
-  // a fixed constant so it adapts to container width; clamped so very
-  // narrow or very wide containers still get a sane budget.
-  const columnSpacing = levels.length > 1 ? columnSpan / (levels.length - 1) : columnSpan;
-  const labelMaxWidth = clamp(columnSpacing * 2.3, 70, 150);
+  // Defensive fallback: every display node is the hub, a core node, or a
+  // sector member above, but a future asset added to config.py without a
+  // `sector` value still falls into "core" via the `n.sector ?? "core"`
+  // check above, so this should never actually trigger — kept so a
+  // missing lookup degrades to "drawn at the hub" rather than crashing
+  // the layout pass.
+  for (const n of nodes) {
+    if (!basePositions.has(n.name)) basePositions.set(n.name, { x: cx, y: cy });
+  }
 
-  // Greedy sequential label placement (HIGH-1): process nodes
-  // left-to-right (then top-to-bottom), and for each pick the nearest
-  // above/below ring whose label box doesn't intersect any box already
-  // placed for an earlier node. `CHAR_WIDTH_PX` is a monospace estimate
-  // at the ~10px render font — it doesn't need to be exact, only
-  // consistent enough that boxes computed here are a reasonable proxy
-  // for what `fitLabel` + `ctx.measureText` actually draw later.
-  const LABEL_HEIGHT_PX = 15;
+  // Per-node label budget in screen px, sized off the tighter of the two
+  // radial spacings (a proxy for eventual on-screen px so `fitLabel`
+  // truncates consistently) — raised from the first pass's 60-140 clamp
+  // now that the ellipse gives real room to place a label in.
+  const labelMaxWidth = clamp(Math.min(radiusX, radiusY) * 0.6, 80, 190);
+
+  // Greedy sequential label placement (HIGH-1, re-tuned in the FIX
+  // round): process nodes by distance from the hub (closest first, so
+  // the core ring — which has the least room — claims its slots before
+  // the open outer rim does), and for each pick the nearest still-free
+  // slot along a *radially outward* search from the node's own position
+  // (straight up for the hub itself, where no radial direction exists).
+  // Candidates are tried nearest-ring-first, and within a ring across a
+  // handful of small angular jitters off the pure radial line, so a
+  // label collision with a same-wedge neighbour at an adjacent Purdue
+  // level gets resolved by swinging sideways before falling back to a
+  // farther ring. `CHAR_WIDTH_PX` is a monospace estimate at the ~10px
+  // render font — it doesn't need to be exact, only consistent enough
+  // that boxes computed here are a reasonable proxy for what `fitLabel`
+  // + `ctx.measureText` actually draw later.
+  const LABEL_HEIGHT_PX = 14;
   const CHAR_WIDTH_PX = 6;
   const MIN_GAP_PX = 5;
-  const RING_COUNT = 5;
+  const RING_COUNT = 6;
+  const ANGLE_JITTERS = [0, 0.32, -0.32, 0.64, -0.64, 1.0, -1.0];
   interface Box {
     left: number;
     right: number;
@@ -380,30 +613,46 @@ function computeCuratedLayout(
   const order = [...nodes].sort((a, b) => {
     const pa = basePositions.get(a.name)!;
     const pb = basePositions.get(b.name)!;
-    return pa.x !== pb.x ? pa.x - pb.x : pa.y - pb.y;
+    const da = (pa.x - cx) ** 2 + (pa.y - cy) ** 2;
+    const db = (pb.x - cx) ** 2 + (pb.y - cy) ** 2;
+    return da - db;
   });
   const placedBoxes: Box[] = [];
-  const positions = new Map<string, { x: number; y: number; labelDy: number }>();
+  const positions = new Map<string, { x: number; y: number; labelDx: number; labelDy: number }>();
   for (const n of order) {
     const pos = basePositions.get(n.name)!;
     const r = curatedNodeRadius(n.criticality);
-    const halfWidth = Math.min(n.name.length * CHAR_WIDTH_PX, labelMaxWidth) / 2 + 3;
-    let chosenDy = r + MIN_GAP_PX;
-    let chosenBox: Box = {
-      left: pos.x - halfWidth,
-      right: pos.x + halfWidth,
-      top: pos.y + chosenDy,
-      bottom: pos.y + chosenDy + LABEL_HEIGHT_PX,
+    // `n.label`, not `n.name`: for a sector aggregate node these differ
+    // (id `sector:energy` vs. rendered label `"Energy · 5"`) and this
+    // estimate must track whatever `fitLabel`/`ctx.measureText` actually
+    // paint later.
+    const halfWidth = Math.min(shortenLabel(n.label).length * CHAR_WIDTH_PX, labelMaxWidth) / 2 + 3;
+
+    const distFromHub = Math.hypot(pos.x - cx, pos.y - cy);
+    const baseAngle = distFromHub < 1 ? -Math.PI / 2 : Math.atan2(pos.y - cy, pos.x - cx);
+
+    let chosenDx = Math.cos(baseAngle) * (r + MIN_GAP_PX);
+    let chosenDy = Math.sin(baseAngle) * (r + MIN_GAP_PX);
+    const boxFor = (dx: number, dy: number): Box => {
+      const above = dy < 0;
+      return {
+        left: pos.x + dx - halfWidth,
+        right: pos.x + dx + halfWidth,
+        top: above ? pos.y + dy - LABEL_HEIGHT_PX : pos.y + dy,
+        bottom: above ? pos.y + dy : pos.y + dy + LABEL_HEIGHT_PX,
+      };
     };
+    let chosenBox: Box = boxFor(chosenDx, chosenDy);
     let placed = false;
     for (let ring = 0; ring < RING_COUNT && !placed; ring++) {
       const dist = r + MIN_GAP_PX + ring * (LABEL_HEIGHT_PX + 4);
-      for (const dy of [dist, -dist]) {
-        const box: Box =
-          dy >= 0
-            ? { left: pos.x - halfWidth, right: pos.x + halfWidth, top: pos.y + dy, bottom: pos.y + dy + LABEL_HEIGHT_PX }
-            : { left: pos.x - halfWidth, right: pos.x + halfWidth, top: pos.y + dy - LABEL_HEIGHT_PX, bottom: pos.y + dy };
+      for (const jitter of ANGLE_JITTERS) {
+        const angle = baseAngle + jitter;
+        const dx = Math.cos(angle) * dist;
+        const dy = Math.sin(angle) * dist;
+        const box = boxFor(dx, dy);
         if (!placedBoxes.some((b) => boxesOverlap(box, b))) {
+          chosenDx = dx;
           chosenDy = dy;
           chosenBox = box;
           placed = true;
@@ -412,10 +661,34 @@ function computeCuratedLayout(
       }
     }
     placedBoxes.push(chosenBox);
-    positions.set(n.name, { x: pos.x, y: pos.y, labelDy: chosenDy });
+    positions.set(n.name, { x: pos.x, y: pos.y, labelDx: chosenDx, labelDy: chosenDy });
   }
 
   return { positions, labelMaxWidth };
+}
+
+// Ticket #16 FIX round (HIGH-1c): a small set of generic suffixes that
+// carry no disambiguating information once a node is already drawn with
+// its own marker shape/position (`_System`, `_Network`, `_Sensors`, plus
+// a few equally generic siblings actually present in
+// `config.SMART_CITY_ASSETS` — `_Facility`, `_Infrastructure`,
+// `_Platform`, `_Feed`). Dropping one of these *before* `fitLabel` runs
+// means the always-on label set (hub, financial, gateway, high-criticality,
+// cascade-involved) reads as a shortened real word — `Metro_Signalling`,
+// `Water_Quality` — instead of `fitLabel` falling back to mid-word
+// character truncation (`Powe…`) to hit the same width budget. Order
+// matters (checked longest-first) so `_Infrastructure` doesn't get
+// shadowed by a shorter false match. Strips at most one trailing suffix;
+// the full, unshortened name is still what's stored on the node and
+// shown in the hover tooltip (`nodeLabel`) and cascade caption.
+const DROPPABLE_SUFFIXES = ["_Infrastructure", "_System", "_Network", "_Sensors", "_Facility", "_Platform", "_Feed"];
+function shortenLabel(name: string): string {
+  for (const suffix of DROPPABLE_SUFFIXES) {
+    if (name.length - suffix.length >= 4 && name.endsWith(suffix)) {
+      return name.slice(0, -suffix.length);
+    }
+  }
+  return name;
 }
 
 /**
@@ -427,7 +700,9 @@ function computeCuratedLayout(
  * half. This is a deterministic width-based rule, not a per-node lookup
  * table: it applies identically to every curated label and only kicks
  * in when the label actually doesn't fit at the current zoom. The full
- * name remains available via `nodeLabel` (hover tooltip).
+ * name remains available via `nodeLabel` (hover tooltip). Callers pass
+ * `shortenLabel(name)` first (see `nodeCanvasObject`) so this only has
+ * to fall back to `…`-truncation on the already-shortened text.
  */
 function fitLabel(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string {
   if (ctx.measureText(text).width <= maxWidth) return text;
@@ -452,8 +727,14 @@ function fitLabel(ctx: CanvasRenderingContext2D, text: string, maxWidth: number)
  * This does NOT touch curated nodes at all — they are immune by
  * construction (`fx`/`fy` override any force's effect on position every
  * tick), so the guard here is purely about keeping clusters from
- * drifting past the curated layer's right edge (~0.43w), not about
- * protecting the curated nodes a second time.
+ * drifting out of their peripheral band, not about protecting the
+ * curated nodes a second time.
+ *
+ * Ticket #16 FIX round: `minX` now matches `CLUSTER_ZONE_LEFT_FRAC` (the
+ * curated layer's own boundary in `computeCuratedLayout`) instead of the
+ * old 0.52w — the two constants defining "where the curated city ends
+ * and the cluster band begins" must agree, or one layer would visually
+ * bleed into the other's space.
  */
 function makeClusterConfineForce(
   nodesMapRef: { current: Map<string, CityNodeDatum> },
@@ -462,10 +743,10 @@ function makeClusterConfineForce(
   return function clusterConfineForce(alpha: number) {
     const { width, height } = sizeRef.current;
     if (width <= 0 || height <= 0) return;
-    const targetX = width * 0.72;
-    const minX = width * 0.52;
-    const topY = height * 0.06;
-    const bottomY = height * 0.94;
+    const targetX = width * (CLUSTER_ZONE_LEFT_FRAC + (1 - CLUSTER_ZONE_LEFT_FRAC) * 0.55);
+    const minX = width * CLUSTER_ZONE_LEFT_FRAC;
+    const topY = height * 0.04;
+    const bottomY = height * 0.96;
     for (const node of nodesMapRef.current.values()) {
       if (node.layer !== "observed") continue;
       const x = node.x ?? targetX;
@@ -569,11 +850,51 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
   const monoFont = useMonoFontFamily();
   const reducedMotion = usePrefersReducedMotion();
   const { ref: containerRef, size } = useContainerSize<HTMLDivElement>();
+  // Console redesign (D-R2): shared with `GraphPanel` (the maximise
+  // control) and `SectorHealthStrip` (sector chips) via context — see
+  // `@/lib/graph-focus-context` for why this can't be local state.
+  const { expanded, setExpanded, focusedSector, setFocusedSector } = useGraphFocus();
 
   const knownAssets = useMemo(
     () => new Set(topology.nodes.map((n) => n.name)),
     [topology]
   );
+
+  // Real (non-hub) curated nodes grouped by sector — the input to both the
+  // default aggregated view and the per-sector "worst severity"/"live
+  // count" rollups below. `sectorByName` is the inverse lookup (asset name
+  // -> sector), used to auto-focus a cascade's own sector (see the
+  // `latestCii` effect further down) and by `SectorHealthStrip` indirectly
+  // through the same `topology` it reads from `useTopology()`.
+  const sectorMembers = useMemo(() => groupNodesBySector(topology.nodes), [topology]);
+  const sectorByName = useMemo(
+    () => new Map(topology.nodes.map((n) => [n.name, n.sector] as const)),
+    [topology]
+  );
+
+  // The node/edge set this render actually lays out and draws — see
+  // `buildDisplayTopology`'s docstring for expanded vs. sector-aggregated
+  // vs. one-sector-focused semantics.
+  const displayTopology = useMemo(
+    () => buildDisplayTopology(topology, expanded, focusedSector, sectorMembers),
+    [topology, expanded, focusedSector, sectorMembers]
+  );
+
+  // Escape collapses the maximised view and clears any sector focus —
+  // "Escape or the same control returns" (D-R2). Only attached while there
+  // is something to collapse, so it never intercepts Escape elsewhere on
+  // the page (a stray listener firing on every keypress regardless of
+  // state would be its own kind of bug).
+  useEffect(() => {
+    if (!expanded && !focusedSector) return;
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key !== "Escape") return;
+      setExpanded(false);
+      setFocusedSector(null);
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [expanded, focusedSector, setExpanded, setFocusedSector]);
 
   // Persistent, mutated-in-place stores — see module docstring on why
   // object identity must survive across ticks.
@@ -623,6 +944,9 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
   useEffect(() => {
     sizeRef.current = size;
   }, [size]);
+  // Console redesign: previous-size bookkeeping for the reheat-on-resize
+  // fix in the curated-layout effect below — see that effect's comment.
+  const prevSizeRef = useRef<{ width: number; height: number } | null>(null);
   // Ticket #14 FIX round (HIGH-1): per-node label width budget (screen
   // px), recomputed alongside the curated layout below. Read every paint
   // frame by `nodeCanvasObject` via `fitLabel` — a ref, not state, since
@@ -670,7 +994,7 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
   // topology fetch failure, or the initial 0->real size measurement).
   // Ticket #14 (D14-1): unlike the cluster tick below, this deliberately
   // recomputes and overwrites x/y/fx/fy every time it runs, not just on
-  // create — the curated layer's whole point is that its 16 nodes sit at
+  // create — the curated layer's whole point is that its nodes sit at
   // a stable, known position rather than wherever physics leaves them.
   // Re-running on a real size change (which happens once or twice right
   // after mount, then never again barring a window resize) rescales the
@@ -679,52 +1003,118 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
   useEffect(() => {
     const nodesMap = nodesMapRef.current;
     const linksMap = linksMapRef.current;
+    const { nodes: displayNodes, edges: displayEdges } = displayTopology;
     const { positions, labelMaxWidth } = computeCuratedLayout(
-      topology.nodes,
-      topology.edges,
+      displayNodes,
+      displayEdges,
       size.width,
       size.height
     );
     curatedLabelMaxWidthRef.current = labelMaxWidth;
-    for (const n of topology.nodes) {
+
+    // Console redesign: the maximise control (D-R2) can change the
+    // container's measured size drastically (e.g. ~738px sector view <->
+    // ~1400px expanded), and `makeClusterConfineForce`'s target band
+    // shifts with it every tick via `sizeRef`. Reheating alone
+    // (`d3ReheatSimulation()`, resetting alpha to 1) turned out not to be
+    // enough: the confine force's per-tick pull toward the band is
+    // deliberately gentle (`(targetX - x) * 0.01 * alpha`, tuned for
+    // nudging nodes that are already close), and `cooldownTicks={200}`
+    // caps how many ticks the simulation ever runs — not nearly enough
+    // budget for that gentle a pull to drag an already-settled cluster
+    // node across a large distance (measured: reheating alone left the
+    // whole `/24` layer stuck roughly where it was, visibly outside the
+    // new band, after a single maximise -> collapse cycle). Directly
+    // reseeding each observed node's (x, y) via the same `seedPosition()`
+    // new cluster nodes already use — then reheating so the confine force
+    // finishes the precise settling — fixes it unconditionally, the same
+    // way a brand-new cluster node already avoids this problem by never
+    // having a stale position to begin with. Curated nodes are untouched
+    // either way (`fx`/`fy` pins override every force regardless).
+    // Guarded to real, non-trivial size changes only — not on every
+    // `displayTopology` change (sector focus/unfocus doesn't resize the
+    // canvas and shouldn't needlessly disturb cluster physics).
+    const prevSize = prevSizeRef.current;
+    const sizeChanged =
+      prevSize !== null &&
+      (Math.abs(prevSize.width - size.width) > 4 || Math.abs(prevSize.height - size.height) > 4);
+    prevSizeRef.current = { width: size.width, height: size.height };
+    if (sizeChanged && size.width > 0 && size.height > 0) {
+      for (const node of nodesMap.values()) {
+        if (node.layer !== "observed") continue;
+        const pos = seedPosition(size.width, size.height, "right");
+        node.x = pos.x;
+        node.y = pos.y;
+      }
+      fgRef.current?.d3ReheatSimulation();
+    }
+
+    // Console redesign: unlike the original (always-50-assets) topology,
+    // the display node/edge SET now changes with view mode (expand/
+    // collapse, focus/unfocus a sector) — a real asset or a sector
+    // aggregate can disappear from one render to the next. Reconcile by
+    // removing any curated node/link no longer present, mirroring the
+    // add/remove pattern the ~100ms cluster tick below already uses for
+    // the observed `/24` layer.
+    const desiredNodeIds = new Set(displayNodes.map((n) => n.name));
+    for (const [id, node] of nodesMap) {
+      if (node.layer === "curated" && !desiredNodeIds.has(id)) nodesMap.delete(id);
+    }
+    const desiredLinkIds = new Set(displayEdges.map((e) => `curated:${e.source}->${e.target}`));
+    for (const [id, link] of linksMap) {
+      if (link.layer === "curated" && !desiredLinkIds.has(id)) linksMap.delete(id);
+    }
+
+    for (const n of displayNodes) {
       const pos = positions.get(n.name) ?? {
         x: (size.width || 600) / 2,
         y: (size.height || 400) / 2,
+        labelDx: 0,
         labelDy: 12,
       };
       const existing = nodesMap.get(n.name) as CuratedNodeDatum | undefined;
-      const isFinancial = (n.type ?? "").includes("Financial");
       if (existing && existing.layer === "curated") {
+        existing.label = n.label;
         existing.nodeType = n.type;
         existing.criticality = n.criticality;
         existing.isGateway = n.is_gateway;
-        existing.isFinancial = isFinancial;
+        existing.isFinancial = n.isFinancial;
+        existing.isAggregate = n.isAggregate;
+        existing.memberCount = n.memberCount;
         existing.x = pos.x;
         existing.y = pos.y;
         existing.fx = pos.x;
         existing.fy = pos.y;
+        existing.labelDx = pos.labelDx;
         existing.labelDy = pos.labelDy;
       } else {
         nodesMap.set(n.name, {
           id: n.name,
           layer: "curated",
-          label: n.name,
+          label: n.label,
           nodeType: n.type,
           criticality: n.criticality,
           isGateway: n.is_gateway,
-          isFinancial,
+          isFinancial: n.isFinancial,
+          isAggregate: n.isAggregate,
+          memberCount: n.memberCount,
           pulseSeverity: "normal",
           x: pos.x,
           y: pos.y,
           fx: pos.x,
           fy: pos.y,
+          labelDx: pos.labelDx,
           labelDy: pos.labelDy,
         });
       }
     }
-    for (const e of topology.edges) {
+    for (const e of displayEdges) {
       const id = `curated:${e.source}->${e.target}`;
-      if (!linksMap.has(id)) {
+      const existing = linksMap.get(id) as CuratedLinkDatum | undefined;
+      if (existing && existing.layer === "curated") {
+        existing.isAggregate = e.isAggregate;
+        existing.count = e.count;
+      } else {
         linksMap.set(id, {
           id,
           source: e.source,
@@ -732,6 +1122,8 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
           layer: "curated",
           edgeType: e.edge_type,
           isGatewayEdge: e.is_gateway_edge,
+          isAggregate: e.isAggregate,
+          count: e.count,
         });
       }
     }
@@ -751,7 +1143,7 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
       const timer = setTimeout(() => reframe(duration), 60);
       return () => clearTimeout(timer);
     }
-  }, [topology, size.width, size.height, reducedMotion, reframe]);
+  }, [displayTopology, size.width, size.height, reducedMotion, reframe]);
 
   // Ticket #14 (D14-1): register the cluster-confinement force once a
   // real size is known (and the `ForceGraph2D` below has actually
@@ -853,9 +1245,25 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
 
       // Curated-node pulse severity — a field mutation, not a structural
       // change; the canvas picks it up next frame regardless of whether
-      // `setGraphData` runs below.
+      // `setGraphData` runs below. A sector aggregate node (D-R2 "badged
+      // by worst current severity") has no real events of its own — its
+      // severity is the worst pulse among the REAL members it currently
+      // stands in for, read from the same `AssetActivityTracker` that
+      // already tracks every real curated asset regardless of whether
+      // that asset is individually displayed right now.
+      const SEVERITY_RANK = { normal: 0, warning: 1, critical: 2 } as const;
       for (const node of nodesMap.values()) {
-        if (node.layer === "curated") {
+        if (node.layer !== "curated") continue;
+        if (node.isAggregate) {
+          const sector = node.id.startsWith("sector:") ? node.id.slice("sector:".length) : null;
+          const members = sector ? sectorMembers.get(sector) : undefined;
+          let worst: "normal" | "warning" | "critical" = "normal";
+          for (const m of members ?? []) {
+            const s = activity.severityOf(m.name, PULSE_WINDOW_MS);
+            if (SEVERITY_RANK[s] > SEVERITY_RANK[worst]) worst = s;
+          }
+          node.pulseSeverity = worst;
+        } else {
           node.pulseSeverity = activity.severityOf(node.id, PULSE_WINDOW_MS);
         }
       }
@@ -878,7 +1286,7 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
       }
     }, RENDER_INTERVAL_MS);
     return () => clearInterval(interval);
-  }, [knownAssets]);
+  }, [knownAssets, sectorMembers]);
 
   // Ticket #14 (D14-1): curated labels always show; cluster labels only
   // on hover, to keep up to 24 arriving cluster nodes from illegibly
@@ -921,7 +1329,23 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
       fallbackHop,
       startedAt: performance.now(),
     });
-  }, [latestCii, topology.edges]);
+
+    // D-R2/D-R3 "cascade animation still animates on the real impacted
+    // payload" must hold in the default sector-aggregated view too, not
+    // only when already expanded — otherwise the origin asset itself can
+    // be invisible (collapsed into its sector's single aggregate node)
+    // the moment an attack fires. Auto-focus the origin's own sector so
+    // the real origin node comes into view; other sectors still show
+    // impacted membership via their aggregate node's severity/ring (see
+    // the pulse-severity and cascade-ring logic elsewhere in this file).
+    // No-op if already expanded (everything is already visible) or the
+    // origin has no real sector (the hub, or a gateway/City_Grid — none
+    // of which are ever collapsed).
+    if (!expanded) {
+      const originSector = sectorByName.get(latestCii.origin_asset);
+      if (originSector) setFocusedSector(originSector);
+    }
+  }, [latestCii, topology.edges, expanded, sectorByName, setFocusedSector]);
 
   const nodeCanvasObject = useCallback(
     (node: CityNodeDatum, ctx: CanvasRenderingContext2D, globalScale: number) => {
@@ -933,7 +1357,9 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
       // which throws inside the canvas paint loop and — since
       // `autoPauseRedraw={false}` keeps requestAnimationFrame calling
       // this every frame — would otherwise repeat every frame.
-      if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+      if (!Number.isFinite(x) || !Number.isFinite(y)) {
+        return;
+      }
       const t = reducedMotion ? 0 : performance.now();
       const pulseT = (Math.sin(t / 420) + 1) / 2; // 0..1
 
@@ -946,7 +1372,39 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
 
       if (node.layer === "curated") {
         const baseR = curatedNodeRadius(node.criticality);
-        if (node.isGateway) {
+        // Ticket #16 FIX round (HIGH-1d): the hub must be unmistakably
+        // the visual centre, not just another dot with a bigger radius —
+        // a distinct double-ring "sun" marker (soft outer halo, solid
+        // filled ring, dark core) drawn before the gateway/financial
+        // branches so it takes priority regardless of those flags.
+        // `markerR` (not `baseR`) is what the pulse/cascade rings below
+        // are sized off of, so those overlays scale with what's actually
+        // drawn rather than the pre-enlargement criticality radius.
+        const isHub = node.id === HUB_ASSET_NAME;
+        const markerR = isHub ? Math.max(baseR, 16) : baseR;
+        if (isHub) {
+          const haloR = markerR + 8 + (reducedMotion ? 3 : pulseT * 5);
+          ctx.beginPath();
+          ctx.arc(x, y, haloR, 0, 2 * Math.PI);
+          ctx.lineWidth = 1.5;
+          ctx.strokeStyle = colors.accentHi;
+          ctx.globalAlpha = 0.4;
+          ctx.stroke();
+          ctx.globalAlpha = 1;
+
+          ctx.beginPath();
+          ctx.arc(x, y, markerR, 0, 2 * Math.PI);
+          ctx.fillStyle = colors.accentHi;
+          ctx.fill();
+          ctx.lineWidth = 2;
+          ctx.strokeStyle = colors.text;
+          ctx.stroke();
+
+          ctx.beginPath();
+          ctx.arc(x, y, markerR * 0.42, 0, 2 * Math.PI);
+          ctx.fillStyle = colors.ground;
+          ctx.fill();
+        } else if (node.isGateway) {
           const r = Math.max(baseR, 9);
           ctx.beginPath();
           ctx.arc(x, y, r, 0, 2 * Math.PI);
@@ -969,6 +1427,23 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
           ctx.closePath();
           ctx.fillStyle = colors.financial;
           ctx.fill();
+        } else if (node.isAggregate) {
+          // Console redesign (D-R2): a sector aggregate node — visually
+          // distinct from a single real asset (a hairline outer ring, like
+          // the gateway marker but filled solid) so an operator can tell
+          // at a glance "this is a rolled-up sector" without reading the
+          // label first.
+          ctx.beginPath();
+          ctx.arc(x, y, baseR, 0, 2 * Math.PI);
+          ctx.fillStyle = colors.accent;
+          ctx.fill();
+          ctx.beginPath();
+          ctx.arc(x, y, baseR + 3, 0, 2 * Math.PI);
+          ctx.lineWidth = 1.4;
+          ctx.strokeStyle = colors.accentHi;
+          ctx.globalAlpha = 0.6;
+          ctx.stroke();
+          ctx.globalAlpha = 1;
         } else {
           ctx.beginPath();
           ctx.arc(x, y, baseR, 0, 2 * Math.PI);
@@ -977,7 +1452,7 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
         }
 
         if (pulseColor) {
-          const ringR = baseR + 4 + (reducedMotion ? 3 : pulseT * 6);
+          const ringR = markerR + 4 + (reducedMotion ? 3 : pulseT * 6);
           ctx.beginPath();
           ctx.arc(x, y, ringR, 0, 2 * Math.PI);
           ctx.lineWidth = 2;
@@ -997,7 +1472,7 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
         // shows the fully-revealed end state with no motion.
         if (cascade) {
           if (node.id === cascade.originAsset) {
-            const ringR = baseR + 7 + (reducedMotion ? 4 : pulseT * 8);
+            const ringR = markerR + 7 + (reducedMotion ? 4 : pulseT * 8);
             ctx.beginPath();
             ctx.arc(x, y, ringR, 0, 2 * Math.PI);
             ctx.lineWidth = 2.4;
@@ -1005,11 +1480,21 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
             ctx.globalAlpha = reducedMotion ? 0.95 : 0.45 + (1 - pulseT) * 0.5;
             ctx.stroke();
             ctx.globalAlpha = 1;
-          } else if (cascade.impactedSet.has(node.id)) {
+          } else if (
+            node.isAggregate
+              ? // A still-aggregated sector can hold a real impacted asset
+                // the default view isn't showing individually right now —
+                // the aggregate node itself lights up so the cascade stays
+                // visible without forcing every sector open (D-R2/D-R3).
+                (sectorMembers.get(node.id.slice("sector:".length)) ?? []).some((m) =>
+                  cascade.impactedSet.has(m.name)
+                )
+              : cascade.impactedSet.has(node.id)
+          ) {
             const hop = cascade.hopOf.get(node.id) ?? cascade.fallbackHop;
             const elapsed = reducedMotion ? Infinity : performance.now() - cascade.startedAt;
             if (elapsed >= hop * CASCADE_STAGGER_MS) {
-              const ringR = baseR + 5;
+              const ringR = markerR + 5;
               ctx.beginPath();
               ctx.arc(x, y, ringR, 0, 2 * Math.PI);
               ctx.lineWidth = 2;
@@ -1021,38 +1506,75 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
           }
         }
 
-        // Ticket #14 FIX round (HIGH-1): smaller font, a deterministic
-        // width-based truncation (`fitLabel`), a token-colored backing
-        // plate for legibility against edges/other nodes, and drawing
-        // above vs. below the node per `labelDy` — the signed offset
-        // `computeCuratedLayout`'s greedy placer picked by checking each
-        // label's box against every other curated label, which is what
-        // actually guarantees no two curated labels overlap (a static
-        // above/below-by-column rule was tried and dropped — see that
-        // function's docstring).
-        const fontSize = Math.max(10 / globalScale, 3);
-        ctx.font = `${fontSize}px ${monoFont}`;
-        const label = fitLabel(ctx, node.label, curatedLabelMaxWidthRef.current);
-        const textWidth = ctx.measureText(label).width;
-        const labelDy = node.labelDy ?? baseR + 3;
-        const above = labelDy < 0;
-        const anchorY = y + labelDy;
-        const platePadX = 3;
-        const plateHeight = fontSize + 4;
-        const plateTop = above ? anchorY - plateHeight : anchorY;
+        // Ticket #14 FIX round (HIGH-1), re-tuned Ticket #16 FIX round:
+        // a deterministic width-based truncation (`fitLabel`, applied to
+        // `shortenLabel`'s output so a generic suffix drops before any
+        // mid-word character truncation is needed), a token-colored
+        // backing plate for legibility against edges/other nodes, and an
+        // anchor placed *radially* outward from the node per
+        // `labelDx`/`labelDy` — the offset pair `computeCuratedLayout`'s
+        // greedy placer picked by checking each label's box against
+        // every other curated label, which is what actually guarantees
+        // no two curated labels overlap (see that function's docstring
+        // for why a static above/below rule reads wrong once wedges are
+        // angularly separated instead of stacked in columns).
+        //
+        // Ticket #16 (D-C5): at ~44 curated nodes, always-on labels for
+        // everything reads as a wall of text — but the plan is explicit
+        // that the hub, every financial asset, and any cascade-involved
+        // node must stay permanently labelled regardless. Everything
+        // else (low-criticality periphery — sensors, advisory feeds) is
+        // hover-only, same mechanism the observed `/24` layer already
+        // uses below. `labelDx`/`labelDy`/the collision-free box are
+        // still computed for every node above (whether or not it ends up
+        // drawn), so a node that only shows on hover still lands in its
+        // pre-reserved, non-overlapping slot rather than fighting for
+        // space live.
+        const cascadeInvolved =
+          !!cascade && (node.id === cascade.originAsset || cascade.impactedSet.has(node.id));
+        const alwaysLabel =
+          isHub ||
+          node.isFinancial ||
+          node.isGateway ||
+          // Sector aggregate nodes: always-on regardless of criticality —
+          // there are only ever ~11 of them in the default view, nowhere
+          // near the density that made hover-only necessary at 44+ real
+          // assets (D-R2's whole premise).
+          node.isAggregate ||
+          node.criticality >= ALWAYS_LABEL_CRITICALITY ||
+          cascadeInvolved;
+        if (alwaysLabel || hoveredNodeIdRef.current === node.id) {
+          // The hub's label runs a size larger and in the brighter
+          // `text` token (everything else uses `textDim`) — HIGH-1d
+          // requires it stay "always-labelled with its full name," and a
+          // visually louder label is part of what makes the centre read
+          // as the hub rather than just another always-on label.
+          const fontSize = isHub ? Math.max(13 / globalScale, 4) : Math.max(10 / globalScale, 3);
+          ctx.font = `${fontSize}px ${monoFont}`;
+          const label = fitLabel(ctx, shortenLabel(node.label), curatedLabelMaxWidthRef.current);
+          const textWidth = ctx.measureText(label).width;
+          const labelDx = node.labelDx ?? 0;
+          const labelDy = node.labelDy ?? baseR + 3;
+          const above = labelDy < 0;
+          const anchorX = x + labelDx;
+          const anchorY = y + labelDy;
+          const platePadX = 3;
+          const plateHeight = fontSize + 4;
+          const plateTop = above ? anchorY - plateHeight : anchorY;
 
-        ctx.fillStyle = colors.groundRaised;
-        ctx.globalAlpha = 0.85;
-        ctx.fillRect(x - textWidth / 2 - platePadX, plateTop, textWidth + platePadX * 2, plateHeight);
-        ctx.globalAlpha = 1;
-        ctx.lineWidth = 1;
-        ctx.strokeStyle = colors.glassBorder;
-        ctx.strokeRect(x - textWidth / 2 - platePadX, plateTop, textWidth + platePadX * 2, plateHeight);
+          ctx.fillStyle = colors.groundRaised;
+          ctx.globalAlpha = 0.85;
+          ctx.fillRect(anchorX - textWidth / 2 - platePadX, plateTop, textWidth + platePadX * 2, plateHeight);
+          ctx.globalAlpha = 1;
+          ctx.lineWidth = 1;
+          ctx.strokeStyle = isHub ? colors.accentHi : colors.glassBorder;
+          ctx.strokeRect(anchorX - textWidth / 2 - platePadX, plateTop, textWidth + platePadX * 2, plateHeight);
 
-        ctx.textAlign = "center";
-        ctx.textBaseline = above ? "bottom" : "top";
-        ctx.fillStyle = colors.textDim;
-        ctx.fillText(label, x, anchorY);
+          ctx.textAlign = "center";
+          ctx.textBaseline = above ? "bottom" : "top";
+          ctx.fillStyle = isHub ? colors.text : colors.textDim;
+          ctx.fillText(label, anchorX, anchorY);
+        }
       } else {
         // Observed `/24` cluster — hollow, dashed, muted. Must never
         // read as a curated asset (D11-1 / DESIGN_CONSOLE.md §6).
@@ -1080,8 +1602,10 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
 
         // Ticket #14 (D14-1): cluster labels only on hover — always-on
         // labels for up to 24 arriving `/24`s is exactly what made the
-        // graph illegible. Curated labels (above) always show; they're
-        // a fixed, sparse 16 nodes at deterministic positions.
+        // graph illegible. Curated labels use the same hover fallback now
+        // (Ticket #16, D-C5) for the low-criticality periphery only — the
+        // hub, financial assets, gateways and cascade-involved nodes stay
+        // permanently labelled above regardless of hover state.
         if (hoveredNodeIdRef.current === node.id) {
           const fontSize = Math.max(10 / globalScale, 3);
           ctx.font = `${fontSize}px ${monoFont}`;
@@ -1092,7 +1616,7 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
         }
       }
     },
-    [colors, monoFont, reducedMotion, cascade]
+    [colors, monoFont, reducedMotion, cascade, sectorMembers]
   );
 
   const linkColor = useCallback(
@@ -1120,12 +1644,16 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
   );
 
   const linkLineDash = useCallback(
-    (link: CityLinkDatum) => (link.layer === "observed" ? [2, 2] : null),
+    (link: CityLinkDatum) =>
+      link.layer === "observed" || (link.layer === "curated" && link.isAggregate) ? [2, 2] : null,
     []
   );
 
   const nodeLabel = useCallback((node: CityNodeDatum) => {
     if (node.layer === "curated") {
+      if (node.isAggregate) {
+        return `${node.label} — sector · ${node.memberCount} asset${node.memberCount === 1 ? "" : "s"} · click to expand`;
+      }
       const kind = node.isGateway ? "Gateway / chokepoint" : node.nodeType ?? "Asset";
       return `${node.label} — ${kind} · criticality ${node.criticality.toFixed(2)}`;
     }
@@ -1137,13 +1665,25 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
   const clusterNodeCount = graphData.nodes.filter(
     (n) => n.layer === "observed" && !n.isOther
   ).length;
+  const activeSectorCount = [...sectorMembers.keys()].filter(
+    (s) => (sectorMembers.get(s)?.length ?? 0) > 0
+  ).length;
+  // D-R3: legend/status line extended with sector count + aggregated vs.
+  // expanded state, so the view mode is always legible without having to
+  // infer it from node count alone.
+  const viewModeLabel = expanded
+    ? "expanded · all assets"
+    : focusedSector
+      ? `sector view · ${sectorLabel(focusedSector)} focused`
+      : "sector view";
 
   return (
     <div className="flex h-full min-h-0 w-full flex-col gap-2 overflow-hidden">
       <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-[10px] uppercase tracking-[0.08em] text-text-mute">
         <Legend colors={colors} />
         <span className="font-mono normal-case tracking-normal text-text-dim">
-          {topology.nodes.length} curated &middot; {clusterNodeCount} /24 clusters
+          {topology.nodes.length} curated &middot; {activeSectorCount} sectors &middot;{" "}
+          {clusterNodeCount} /24 clusters &middot; {viewModeLabel}
           {status !== "connected" ? ` · stream ${status}` : ""}
         </span>
       </div>
@@ -1192,7 +1732,11 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
               linkWidth={linkWidth}
               linkLineDash={linkLineDash}
               linkLabel={(l: CityLinkDatum) =>
-                l.layer === "curated" ? `${l.source} → ${l.target} (${l.edgeType})` : `${l.source} → ${l.target} · ${l.count} flows`
+                l.layer === "curated"
+                  ? l.isAggregate
+                    ? `${l.source} → ${l.target} · ${l.count} real edge${l.count === 1 ? "" : "s"} collapsed`
+                    : `${l.source} → ${l.target} (${l.edgeType})`
+                  : `${l.source} → ${l.target} · ${l.count} flows`
               }
               cooldownTicks={200}
               // 0, not a synchronous burst: D11-2 says "mutate node/link
@@ -1214,6 +1758,23 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
               }}
               onZoomEnd={() => {
                 if (programmaticZoomCountRef.current === 0) userFramedRef.current = true;
+              }}
+              // D-R2 "clicking a sector expands that sector inline":
+              // clicking a sector aggregate node focuses it (or unfocuses
+              // if it's already focused — a toggle); clicking the hub
+              // while a sector is focused returns to the fully aggregated
+              // view. Only meaningful in the default (non-expanded) view —
+              // in the expanded view every real asset is already shown, so
+              // there is no aggregate node to click.
+              onNodeClick={(node) => {
+                if (expanded || node.layer !== "curated") return;
+                const id = String(node.id);
+                if (node.isAggregate) {
+                  const key = id.startsWith("sector:") ? id.slice("sector:".length) : null;
+                  if (key) setFocusedSector((prev) => (prev === key ? null : key));
+                } else if (id === HUB_ASSET_NAME && focusedSector) {
+                  setFocusedSector(null);
+                }
               }}
             />
           </div>
@@ -1239,6 +1800,14 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
 function Legend({ colors }: { colors: ReturnType<typeof useThemeColors> }) {
   return (
     <div className="flex flex-wrap items-center gap-3">
+      <LegendItem
+        swatch={
+          <span className="relative inline-flex h-3.5 w-3.5 items-center justify-center rounded-full" style={{ background: colors.accentHi, boxShadow: `0 0 0 1.5px ${colors.text}` }}>
+            <span className="h-1.5 w-1.5 rounded-full" style={{ background: colors.ground }} />
+          </span>
+        }
+        label="Hub"
+      />
       <LegendItem swatch={<span className="inline-block h-2.5 w-2.5 rounded-full" style={{ background: colors.accent }} />} label="Infra" />
       <LegendItem
         swatch={
@@ -1252,6 +1821,15 @@ function Legend({ colors }: { colors: ReturnType<typeof useThemeColors> }) {
       <LegendItem
         swatch={<span className="inline-block h-3 w-3 rounded-full border-[1.5px]" style={{ borderColor: colors.accentHi }} />}
         label="Gateway"
+      />
+      <LegendItem
+        swatch={
+          <span
+            className="inline-block h-3 w-3 rounded-full"
+            style={{ background: colors.accent, boxShadow: `0 0 0 1.5px ${colors.accentHi}` }}
+          />
+        }
+        label="Sector (click to expand)"
       />
       <LegendItem
         swatch={<span className="inline-block h-2.5 w-2.5 rounded-full border border-dashed" style={{ borderColor: colors.sevInfo }} />}

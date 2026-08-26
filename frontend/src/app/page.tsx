@@ -2,12 +2,17 @@ import { AppHeader } from "@/components/AppHeader";
 import { TelemetryRail } from "@/components/TelemetryRail";
 import { GraphPanel } from "@/components/GraphPanel";
 import { AlertsRail } from "@/components/AlertsRail";
+import { SectorHealthStrip } from "@/components/SectorHealthStrip";
 
-// Three-region body per DESIGN_CONSOLE.md §5: telemetry rail (fixed
-// width) | city infrastructure graph (hero, flex) | alerts rail (fixed
-// width). Below 1280px the alerts rail drops beneath the graph; below
-// 900px all three stack — the console targets desktop but must not break
-// on narrower viewports.
+// Console redesign (docs/PHASE5_CONSOLE_REDESIGN_PLAN.md §2, D-R1):
+// rebalanced from DESIGN_CONSOLE.md §5's original telemetry-340/graph-672/
+// alerts-380 split — the graph (the product's actual differentiator, per
+// that doc's own §5 rationale) got under half the width. Telemetry narrows
+// to ~280px (rows are `time · src→dst · glyph`; they still fit), alerts to
+// ~340px, and the graph takes the remainder as the hero region. A new
+// full-width sector health strip sits below all three. Below 1280px the
+// alerts rail drops beneath the graph; below 900px everything stacks — the
+// console targets desktop but must not break on narrower viewports.
 export default function Home() {
   // `xl:h-full` (not a bare `h-full`), matching `body`'s `xl:h-full` in
   // layout.tsx: only at the `xl` breakpoint (the 3-column grid, see
@@ -29,6 +34,9 @@ export default function Home() {
         <GraphPanel />
         <AlertsRail />
       </main>
+      <div className="px-3 pb-3">
+        <SectorHealthStrip />
+      </div>
     </div>
   );
 }

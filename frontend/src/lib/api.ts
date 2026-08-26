@@ -12,7 +12,13 @@
  * asset on `/api/cii/{asset}`.
  */
 
-import type { HealthResponse, TopologyResponse } from "./types";
+import type {
+  AlertOut,
+  AlertsResponse,
+  CiiResponse,
+  HealthResponse,
+  TopologyResponse,
+} from "./types";
 
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
@@ -89,6 +95,49 @@ export function getHealth(): Promise<HealthResponse> {
 /** GET /api/topology */
 export function getTopology(): Promise<TopologyResponse> {
   return apiFetch<TopologyResponse>("/api/topology");
+}
+
+/**
+ * GET /api/alerts?acknowledged=&limit= (Ticket #15, D15-1).
+ *
+ * `limit` must always be passed explicitly and bounded by the caller —
+ * the backend's own default (`BACKEND_SETTINGS.api_alerts_default_limit`)
+ * is generous but this wrapper does not assume it; a console showing
+ * "recent alerts" should say what "recent" means.
+ */
+export function getAlerts(params?: {
+  acknowledged?: boolean;
+  limit?: number;
+}): Promise<AlertsResponse> {
+  const search = new URLSearchParams();
+  if (params?.acknowledged !== undefined) {
+    search.set("acknowledged", String(params.acknowledged));
+  }
+  if (params?.limit !== undefined) {
+    search.set("limit", String(params.limit));
+  }
+  const qs = search.toString();
+  return apiFetch<AlertsResponse>(`/api/alerts${qs ? `?${qs}` : ""}`);
+}
+
+/**
+ * POST /api/alerts/{id}/ack (Ticket #15, D15-3). Idempotent on the
+ * backend — acking an already-acked alert returns it unchanged
+ * (`acknowledged_at` preserved from the first ack).
+ */
+export function ackAlert(id: number): Promise<AlertOut> {
+  return apiFetch<AlertOut>(`/api/alerts/${id}/ack`, { method: "POST" });
+}
+
+/**
+ * GET /api/cii/{asset} — on-demand blast radius for the card's expandable
+ * section (Ticket #15). 404s (asset not a node in the dependency graph)
+ * surface as `ApiError` with `status === 404`; callers must render that
+ * as "not in the dependency graph", never as an empty impacted list.
+ */
+export function getCii(asset: string, anomalyScore?: number): Promise<CiiResponse> {
+  const qs = anomalyScore !== undefined ? `?anomaly_score=${anomalyScore}` : "";
+  return apiFetch<CiiResponse>(`/api/cii/${encodeURIComponent(asset)}${qs}`);
 }
 
 export { API_BASE_URL };

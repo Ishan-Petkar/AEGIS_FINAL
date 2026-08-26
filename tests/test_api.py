@@ -380,7 +380,8 @@ def test_topology_returns_nodes_and_edges():
     names = {n["name"] for n in body["nodes"]}
     assert "City_Payment_Gateway" in names
     node = next(n for n in body["nodes"] if n["name"] == "City_Payment_Gateway")
-    assert set(node.keys()) == {"name", "criticality", "type", "purdue_level", "is_gateway"}
+    assert set(node.keys()) == {"name", "criticality", "type", "purdue_level", "is_gateway", "sector"}
+    assert node["sector"] == "finance"
     edge = body["edges"][0]
     assert set(edge.keys()) == {"source", "target", "edge_type", "prob", "is_gateway_edge"}
 

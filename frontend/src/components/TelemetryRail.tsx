@@ -143,7 +143,10 @@ export function TelemetryRail() {
   return (
     <Panel
       label="Telemetry"
-      className="w-full lg:w-[340px] lg:shrink-0"
+      // Console redesign (D-R1): narrowed from 340px so the graph — the
+      // hero region — gets the width back. Rows are `time · src→dst ·
+      // glyph`; they still fit at 280px.
+      className="w-full lg:w-[280px] lg:shrink-0"
       action={
         frozen ? (
           <button

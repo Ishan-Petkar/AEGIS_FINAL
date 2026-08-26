@@ -299,7 +299,12 @@ def test_alerts_composite_index_acknowledged_ts_desc():
 # ---------------------------------------------------------------------------
 
 
-def test_seed_rows_cover_all_16_graph_nodes():
+def test_seed_rows_cover_all_graph_nodes():
+    """Phase 5 Ticket #16 (city scale-up): 45 curated assets + 4 gateways
+    (Gateway_L1/L3/L4/L5 — unchanged, see test_exactly_four_gateways_seeded)
+    + 1 synthesized node (City_Grid) = 50. See
+    docs/PHASE5_CITY_SCALE_PLAN.md for the additive-only scale-up that grew
+    this from the original 16."""
     import sys
     from pathlib import Path
 
@@ -308,7 +313,7 @@ def test_seed_rows_cover_all_16_graph_nodes():
 
     rows = compute_seed_rows()
     graph_nodes = set(build_graph(directed=True).nodes())
-    assert len(rows) == 16
+    assert len(rows) == 50
     assert {r["name"] for r in rows} == graph_nodes
 
 
@@ -385,7 +390,9 @@ def test_curated_assets_keep_real_config_values():
         assert row["is_gateway"] is False
 
 
-def test_eleven_curated_assets_match_smart_city_assets():
+def test_curated_assets_match_smart_city_assets():
+    """Phase 5 Ticket #16: 45 curated assets after the additive city
+    scale-up (11 original + 34 new — see docs/PHASE5_CITY_SCALE_PLAN.md)."""
     import sys
     from pathlib import Path
 
@@ -394,7 +401,7 @@ def test_eleven_curated_assets_match_smart_city_assets():
 
     rows = {r["name"]: r for r in compute_seed_rows()}
     curated_names = {a["asset_name"] for a in SMART_CITY_ASSETS}
-    assert len(curated_names) == 11
+    assert len(curated_names) == 45
     for name in curated_names:
         assert rows[name]["is_gateway"] is False
         assert rows[name]["type"] != ASSET_TYPE_GATEWAY
@@ -466,10 +473,10 @@ def test_live_create_tables_and_seed_assets(live_session):
 
     result = seed_assets(live_session)
     live_session.commit()
-    assert result["total"] == 16
+    assert result["total"] == 50
 
     count = live_session.query(Asset).count()
-    assert count == 16
+    assert count == 50
 
     gateways = live_session.query(Asset).filter(Asset.is_gateway.is_(True)).all()
     assert len(gateways) == 4
