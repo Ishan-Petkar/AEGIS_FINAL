@@ -67,6 +67,7 @@ from backend.models import (  # noqa: E402
     Base,
     Event,
 )
+from backend.ingest import IngestStats  # noqa: E402
 from backend.replay_engine import ReplayEngine  # noqa: E402
 from backend.replay_reader import ReplayFlow  # noqa: E402
 from backend.routes import get_runtime, get_session_scope  # noqa: E402
@@ -1052,6 +1053,192 @@ def test_inject_honeytoken_scenario_sets_flag_on_real_flows():
         assert all(f.label == "Bot" for f in batch)  # telemetry stays real
     finally:
         runtime.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# GET /api/stats (Ticket #16)
+# ---------------------------------------------------------------------------
+
+
+class _FakeStatsPipeline:
+    """Spy `IngestPipeline` substitute exposing only `.stats()` — the one
+    method `get_stats` reads. Lets a test hand the route arbitrary
+    `IngestStats` values without driving a real pipeline through a batch.
+    """
+
+    def __init__(self, stats: IngestStats | None = None) -> None:
+        self._stats = stats if stats is not None else IngestStats()
+
+    def stats(self) -> IngestStats:
+        return self._stats
+
+
+def make_stats_runtime(
+    *, n_flows: int = 20, ingest_stats: IngestStats | None = None
+) -> AppRuntime:
+    """A fake `AppRuntime` with a REAL `ReplayEngine` (genuine
+    start/stop/status) and a spy `IngestPipeline` (`_FakeStatsPipeline`)
+    whose `.stats()` returns caller-controlled counters — mirrors
+    `make_engine_runtime` above but additionally sets `pipeline`, which
+    `GET /api/stats` reads and `make_engine_runtime` deliberately leaves
+    `None` (that fixture only backs replay-control-route tests, which
+    never touch `runtime.pipeline`).
+    """
+    flows = [_flow(BASE_TS + timedelta(seconds=i), f"synthetic:{i}") for i in range(n_flows)]
+    engine = ReplayEngine(
+        consumer=_noop_consumer,
+        reader=_FakeReader(flows),
+        tick_interval=0.01,
+        thread_join_timeout=2.0,
+    )
+    return AppRuntime(
+        scorer=object(),
+        pipeline=_FakeStatsPipeline(ingest_stats),
+        engine=engine,
+        scorer_load_error=None,
+        started_at=datetime.now(timezone.utc),
+    )
+
+
+def test_stats_503_when_scorer_failed_to_load():
+    runtime = make_no_scorer_runtime()
+    client = make_client(runtime=runtime)
+    r = client.get("/api/stats")
+    assert r.status_code == 503
+
+
+def test_stats_no_replay_no_alerts_sane_zeros(sqlite_session_scope):
+    runtime = make_stats_runtime()
+    client = make_client(runtime=runtime, session_scope=sqlite_session_scope)
+    r = client.get("/api/stats")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ingest"] == {
+        "batches": 0,
+        "flows_received": 0,
+        "events_inserted": 0,
+        "events_deduplicated": 0,
+        "anomalies": 0,
+        "tripwire_hits": 0,
+        "cii_computed": 0,
+        "cii_reused": 0,
+        "alerts_created": 0,
+        "alerts_suppressed": 0,
+        "broadcast_failures": 0,
+        "events_pruned": 0,
+    }
+    assert body["replay"]["running"] is False
+    assert body["alerts"] == {"total": 0, "unacknowledged": 0, "by_severity": []}
+    # Zero unacknowledged alerts is a real state — 0, never null.
+    assert body["risk_index"] == 0
+
+
+def test_stats_ingest_counters_come_from_pipeline_stats_not_fabricated(sqlite_session_scope):
+    seeded = IngestStats(
+        batches=3,
+        flows_received=150,
+        events_inserted=150,
+        events_deduplicated=2,
+        anomalies=11,
+        tripwire_hits=1,
+        cii_computed=4,
+        cii_reused=7,
+        alerts_created=2,
+        alerts_suppressed=9,
+        broadcast_failures=0,
+        events_pruned=0,
+    )
+    runtime = make_stats_runtime(ingest_stats=seeded)
+    client = make_client(runtime=runtime, session_scope=sqlite_session_scope)
+    body = client.get("/api/stats").json()
+    assert body["ingest"]["flows_received"] == 150
+    assert body["ingest"]["alerts_suppressed"] == 9
+    assert body["ingest"]["tripwire_hits"] == 1
+
+
+def test_stats_replay_status_reflects_a_running_engine(sqlite_session_scope):
+    runtime = make_stats_runtime()
+    client = make_client(runtime=runtime, session_scope=sqlite_session_scope)
+    try:
+        client.post("/api/replay/start", json={"speed": 1000.0})
+        body = client.get("/api/stats").json()
+        assert body["replay"]["running"] is True
+        assert body["replay"]["speed"] == 1000.0
+    finally:
+        runtime.engine.stop()
+
+
+def test_stats_alert_counts_come_from_database_not_in_memory_counter(sqlite_session_scope):
+    """The in-memory IngestStats.alerts_created is deliberately left at 0
+    here (simulating a fresh process after a restart) while two alert rows
+    already exist in the database — the alert counts in the response must
+    come from the DB and therefore still report 2, proving a restart does
+    not reset what this panel shows."""
+    with sqlite_session_scope() as session:
+        session.add(make_alert(asset="City_Payment_Gateway", severity="critical"))
+        session.add(make_alert(asset="City_Payment_Gateway", severity="warning", acknowledged=True))
+        session.commit()
+
+    runtime = make_stats_runtime(ingest_stats=IngestStats())  # alerts_created stays 0
+    client = make_client(runtime=runtime, session_scope=sqlite_session_scope)
+    body = client.get("/api/stats").json()
+    assert body["ingest"]["alerts_created"] == 0
+    assert body["alerts"]["total"] == 2
+    assert body["alerts"]["unacknowledged"] == 1
+    by_sev = {b["severity"]: b for b in body["alerts"]["by_severity"]}
+    assert by_sev["critical"]["unacknowledged"] == 1
+    assert by_sev["warning"]["acknowledged"] == 1
+
+
+def test_stats_risk_index_rises_on_unacknowledged_alert(sqlite_session_scope):
+    with sqlite_session_scope() as session:
+        session.add(make_alert(asset="City_Payment_Gateway", severity="critical"))
+        session.commit()
+
+    runtime = make_stats_runtime()
+    client = make_client(runtime=runtime, session_scope=sqlite_session_scope)
+    body = client.get("/api/stats").json()
+    assert body["risk_index"] > 0
+
+
+def test_stats_acknowledging_the_only_alert_drops_risk_index_to_zero(sqlite_session_scope):
+    """The load-bearing check (docs/PHASE5_TICKET16_PLAN.md section 7,
+    step 4): acknowledging the only outstanding alert must visibly lower
+    the risk index — here to exactly zero, proving the index is wired to
+    real, current database state rather than painted once and left."""
+    with sqlite_session_scope() as session:
+        alert = make_alert(asset="City_Payment_Gateway", severity="critical")
+        session.add(alert)
+        session.commit()
+        session.refresh(alert)
+        alert_id = alert.id
+
+    runtime = make_stats_runtime()
+    client = make_client(runtime=runtime, session_scope=sqlite_session_scope)
+
+    before = client.get("/api/stats").json()["risk_index"]
+    assert before > 0
+
+    ack = client.post(f"/api/alerts/{alert_id}/ack")
+    assert ack.status_code == 200
+
+    after = client.get("/api/stats").json()["risk_index"]
+    assert after == 0
+    assert after < before
+
+
+def test_stats_unresolved_asset_alert_contributes_nothing_to_risk_index(sqlite_session_scope):
+    """An alert on an asset with no real criticality basis (not a node in
+    the dependency graph) must not fabricate a risk contribution."""
+    with sqlite_session_scope() as session:
+        session.add(make_alert(asset="Unresolved_10.9.9.9", severity="critical"))
+        session.commit()
+
+    runtime = make_stats_runtime()
+    client = make_client(runtime=runtime, session_scope=sqlite_session_scope)
+    body = client.get("/api/stats").json()
+    assert body["alerts"]["unacknowledged"] == 1  # the alert is still counted
+    assert body["risk_index"] == 0  # but contributes no risk
 
 
 # ---------------------------------------------------------------------------

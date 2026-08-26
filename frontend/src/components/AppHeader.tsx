@@ -3,8 +3,35 @@
 import { ConnectionState } from "./ConnectionState";
 import { StreamState } from "./StreamState";
 import { StatChip } from "./StatChip";
+import { useConnection } from "@/lib/connection-context";
 import { useStream } from "@/lib/stream-context";
 import type { HelloEnvelopeData } from "@/lib/types";
+
+/**
+ * `RISK` chip tooltip (D16-1) — the number in a header labelled RISK
+ * reads as authoritative, so its exact definition is stated inline
+ * rather than left for an operator to guess. Kept in one place so the
+ * chip's `title` and any future surface using the same figure agree.
+ */
+const RISK_INDEX_TOOLTIP =
+  "risk = clamp(0-100) of Σ over UNACKNOWLEDGED alerts of " +
+  "(severity_weight × asset_criticality), normalised against a " +
+  "configured presentation-scale constant (BACKEND_SETTINGS." +
+  "risk_index_full_scale) -- not a calibrated probability. Falls when " +
+  "alerts are acknowledged. Deliberately not built on CII, which is " +
+  "currently near-binary across the graph.";
+
+const ALERTS_SUPPRESSED_TOOLTIP =
+  "Volumetric anomalies that were detected, scored, persisted, and " +
+  "broadcast, but deliberately did NOT page an operator -- the " +
+  "unsupervised channel measures ~0.02 precision on real replayed " +
+  "traffic (docs/DETECTION_STUDY.md). Cumulative since the backend last " +
+  "restarted.";
+
+const ALERTS_CHIP_TOOLTIP =
+  "Alerts received over this browser tab's live connection since it " +
+  "last connected -- resets on reconnect. See the alerts panel for the " +
+  "full, durable history.";
 
 /**
  * AppHeader (DESIGN_CONSOLE.md §5, §6) — brand, live pulse dot, stat
@@ -14,13 +41,29 @@ import type { HelloEnvelopeData } from "@/lib/types";
  * `useStream` (the shared `StreamProvider` instance of `useEventStream`,
  * WS /ws/stream — see Ticket #10 fix round HIGH-1: every consumer reads
  * the same socket/buffer so the header and the feed can never disagree).
- * The Risk stat chip stays a placeholder — no single "risk" figure exists
- * yet. Speed control and inject stay disabled per PHASE5_TICKET3_PLAN §1
+ *
+ * The Risk chip and the Suppressed chip (Ticket #16) read `GET
+ * /api/stats` via the shared `useConnection()` context, which polls it on
+ * the SAME interval as `GET /api/health` (no second timer — see
+ * `connection-context.tsx`). `stats === null` means "no basis to
+ * compute" (no replay engine loaded yet, or the backend hasn't answered
+ * the first poll) and renders `—`; a `risk_index` of `0` is a real
+ * "nothing outstanding" state and renders `0`, never `—` (decision
+ * D16-1). This route deliberately returns no `events/s` field of its own
+ * (decision D16-2) — the Events/s chip below stays sourced from
+ * `useStream()`, the one authoritative source for that figure.
+ *
+ * Speed control and inject stay disabled per PHASE5_TICKET3_PLAN §1
  * (out of scope: Ticket #13).
  */
 export function AppHeader() {
   const { status: streamStatus, eventsPerSecond, alertCount, hello, liveEmittedSinceHello, lastVirtualPosition } =
     useStream();
+  const { stats } = useConnection();
+
+  const riskIndex = stats?.risk_index ?? null;
+  const riskTone =
+    riskIndex === null ? "text" : riskIndex === 0 ? "text" : riskIndex >= 50 ? "critical" : "warning";
 
   return (
     <header className="glass-panel flex h-14 shrink-0 items-center gap-6 rounded-none border-x-0 border-t-0 px-4">
@@ -42,8 +85,22 @@ export function AppHeader() {
           label="Alerts"
           value={String(alertCount)}
           tone={alertCount > 0 ? "critical" : "text"}
+          title={ALERTS_CHIP_TOOLTIP}
         />
-        <StatChip label="Risk" value="—" tone="text" />
+        <StatChip
+          label="Risk"
+          value={riskIndex === null ? "—" : String(riskIndex)}
+          tone={riskTone}
+          title={RISK_INDEX_TOOLTIP}
+        />
+        <div className="hidden lg:flex">
+          <StatChip
+            label="Suppressed"
+            value={stats ? String(stats.ingest.alerts_suppressed) : "—"}
+            tone="text"
+            title={ALERTS_SUPPRESSED_TOOLTIP}
+          />
+        </div>
       </div>
 
       <ReplayProgress hello={hello} liveEmittedSinceHello={liveEmittedSinceHello} lastVirtualPosition={lastVirtualPosition} />

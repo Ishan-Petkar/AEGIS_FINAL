@@ -14,9 +14,7 @@ backend/routes.py — Phase 5 Ticket #8 (nine REST routes) + Ticket #13
     WS   /ws/stream           (Ticket #9)
     GET  /api/inject/scenarios  (Ticket #13)
     POST /api/inject            (Ticket #13)
-
-`GET /api/stats` (Ticket #16) is still explicitly OUT of scope — do not
-add it here.
+    GET  /api/stats              (Ticket #16)
 
 Two overridable dependencies carry every route's external state, so the
 default test suite needs neither Postgres nor a real `AppRuntime`
@@ -66,24 +64,27 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from backend.config import BACKEND_SETTINGS
 from backend.db import session_scope
 from backend.inject import SCENARIOS, InjectionError, build_injection_flows
-from backend.ingest import build_criticality_map
+from backend.ingest import build_criticality_map, compute_risk_index
 from backend.models import Alert, Event
 from backend.replay_engine import ReplayEngineError, ReplayStatus
 from backend.runtime import AppRuntime
 from backend.schemas import (
+    AlertCountersOut,
     AlertOut,
     AlertsResponse,
+    AlertSeverityCount,
     CiiResponse,
     DEFAULT_INJECT_TARGET_ASSET,
     EventOut,
     EventsResponse,
     HealthResponse,
+    IngestCountersOut,
     InjectRequest,
     InjectResponse,
     ReplaySpeedRequest,
@@ -91,6 +92,7 @@ from backend.schemas import (
     ReplayStatusResponse,
     ScenarioOut,
     ScenariosResponse,
+    StatsResponse,
     TopologyEdge,
     TopologyNode,
     TopologyResponse,
@@ -662,6 +664,97 @@ def post_inject(
             )
         ),
         replay_session_id=status.replay_session_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/stats (Ticket #16)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/api/stats", response_model=StatsResponse)
+def get_stats(
+    runtime: AppRuntime = Depends(get_runtime),
+    scope: Callable[[], ContextManager[Session]] = Depends(get_session_scope),
+) -> StatsResponse:
+    """The header counters (docs/PHASE5_BUILD_PLAN.md section 7:
+    "events/s, alerts, risk index"). Composed from THREE independently
+    real sources -- see `StatsResponse`'s docstring for why they stay
+    distinguishable rather than being flattened together.
+
+    503 if the scorer never loaded (`_require_replay_engine`, mirroring
+    every other replay-control route, docs/PHASE5_TICKET16_PLAN.md
+    section 2) -- there is no `IngestPipeline` to read counters from in
+    that state, and reporting fabricated zeros instead would misrepresent
+    "never started" as "ran and saw nothing".
+
+    Alert counts come from the DATABASE via two bounded `GROUP BY`
+    aggregates (never the in-memory `IngestStats.alerts_created` counter,
+    and never a per-row fetch): one grouped by `(severity, acknowledged)`
+    for the totals below, and one grouped by `(severity, asset)` -- WHERE
+    acknowledged is false -- feeding `compute_risk_index`. Aggregating in
+    Postgres means the result set is bounded by the number of DISTINCT
+    (severity, asset) combinations an operator has left outstanding, not
+    by how many alert rows the table has ever accumulated; `.limit()` is
+    applied anyway as a hard backstop, matching every other paginated
+    route in this module.
+
+    Using the database (not the in-memory counter) is what makes this
+    survive a process restart -- an operator restarting the backend mid-
+    incident must still see the alerts that already happened, not a
+    reset-to-zero panel.
+    """
+    engine = _require_replay_engine(runtime)
+    ingest_stats = runtime.pipeline.stats()
+
+    with scope() as session:
+        severity_ack_rows = session.execute(
+            select(Alert.severity, Alert.acknowledged, func.count())
+            .group_by(Alert.severity, Alert.acknowledged)
+            .limit(BACKEND_SETTINGS.api_events_max_limit)
+        ).all()
+        unacknowledged_rows = session.execute(
+            select(Alert.severity, Alert.asset, func.count())
+            .where(Alert.acknowledged.is_(False))
+            .group_by(Alert.severity, Alert.asset)
+            .limit(BACKEND_SETTINGS.api_events_max_limit)
+        ).all()
+
+    alerts_total = 0
+    alerts_unacknowledged = 0
+    by_severity: dict[str, dict[str, int]] = {}
+    for severity, acknowledged, count in severity_ack_rows:
+        count = int(count)
+        alerts_total += count
+        bucket = by_severity.setdefault(severity, {"acknowledged": 0, "unacknowledged": 0})
+        if acknowledged:
+            bucket["acknowledged"] += count
+        else:
+            bucket["unacknowledged"] += count
+            alerts_unacknowledged += count
+
+    criticality_map = build_criticality_map()
+    risk_index = compute_risk_index(
+        [(severity, asset, int(count)) for severity, asset, count in unacknowledged_rows],
+        criticality_map,
+    )
+
+    return StatsResponse(
+        ingest=IngestCountersOut(**vars(ingest_stats)),
+        replay=ReplayStatusResponse.from_status(engine.status()),
+        alerts=AlertCountersOut(
+            total=alerts_total,
+            unacknowledged=alerts_unacknowledged,
+            by_severity=[
+                AlertSeverityCount(
+                    severity=severity,
+                    acknowledged=bucket["acknowledged"],
+                    unacknowledged=bucket["unacknowledged"],
+                )
+                for severity, bucket in sorted(by_severity.items())
+            ],
+        ),
+        risk_index=risk_index,
     )
 
 

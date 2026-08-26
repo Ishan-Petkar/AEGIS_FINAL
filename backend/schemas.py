@@ -324,3 +324,91 @@ class InjectResponse(BaseModel):
     is_honeytoken: bool
     message: str
     replay_session_id: Optional[UUID]
+
+
+# ---------------------------------------------------------------------------
+# GET /api/stats (Ticket #16)
+# ---------------------------------------------------------------------------
+
+
+class IngestCountersOut(BaseModel):
+    """Cumulative counters since process start -- field-for-field mirror of
+    `backend.ingest.IngestStats` (see that dataclass's docstring for what
+    each counter means). Process-lifetime only: reset by a backend
+    restart, in memory only. Contrast with `AlertCountersOut` below, whose
+    numbers come from the database and survive a restart.
+
+    `alerts_suppressed` (decision D16-3) counts volumetric anomalies that
+    were detected, scored, persisted, and broadcast but deliberately did
+    NOT page an operator -- see `backend/ingest.py`'s "Alert policy"
+    module-docstring section and `docs/DETECTION_STUDY.md` (~0.02
+    precision on the volumetric channel). Surfacing it makes the alert
+    policy visible instead of hidden: the system is saying "I saw N of
+    these and chose not to wake you" rather than staying silent about the
+    ones it filtered.
+    """
+
+    batches: int
+    flows_received: int
+    events_inserted: int
+    events_deduplicated: int
+    anomalies: int
+    tripwire_hits: int
+    cii_computed: int
+    cii_reused: int
+    alerts_created: int
+    alerts_suppressed: int
+    broadcast_failures: int
+    events_pruned: int
+
+
+class AlertSeverityCount(BaseModel):
+    severity: str
+    acknowledged: int
+    unacknowledged: int
+
+
+class AlertCountersOut(BaseModel):
+    """Alert counts read from the `alerts` TABLE (never the in-memory
+    `IngestStats.alerts_created` counter) -- so these survive a backend
+    restart, unlike `IngestCountersOut` above. Computed via a bounded
+    `GROUP BY severity, acknowledged` aggregate (`backend/routes.py`'s
+    `get_stats`), never a per-row fetch.
+    """
+
+    total: int
+    unacknowledged: int
+    by_severity: list[AlertSeverityCount]
+
+
+class StatsResponse(BaseModel):
+    """GET /api/stats (Ticket #16) -- the header counters. Composed from
+    THREE independently real sources, deliberately kept distinguishable
+    rather than flattened into one ambiguous namespace (docs/
+    PHASE5_TICKET16_PLAN.md section 2):
+
+    - `ingest`  -- `IngestPipeline.stats()`, cumulative since process start.
+    - `replay`  -- `ReplayEngine.status()`, the live snapshot (same shape
+      every other replay-control route already returns).
+    - `alerts`  -- real counts from the alerts table, survive a restart.
+    - `risk_index` -- decision D16-1; see `backend.ingest.compute_risk_index`
+      for the exact formula and why it is not built on CII. `0` (never
+      `null`/omitted) when there are no unacknowledged alerts -- that is a
+      real "nothing outstanding" state, not "no basis to compute".
+
+    Deliberately does NOT return an `events/s` or any other rate field
+    (decision D16-2): the frontend already computes a live per-second
+    rate from what it actually received over the WebSocket
+    (`useEventStream`'s `eventsPerSecond`), and a second server-side
+    number under the same-looking name is exactly the
+    two-numbers-that-can-disagree defect this project hit twice already
+    (Ticket #3's header/panel contradiction, Ticket #10's duplicate
+    sockets). A caller that wants a rate should derive one from two
+    `ingest` snapshots' `events_inserted`, timestamped by the caller
+    itself.
+    """
+
+    ingest: IngestCountersOut
+    replay: ReplayStatusResponse
+    alerts: AlertCountersOut
+    risk_index: int

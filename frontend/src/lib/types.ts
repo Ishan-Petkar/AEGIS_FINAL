@@ -160,6 +160,78 @@ export interface ReplayStatusResponse {
 }
 
 // ---------------------------------------------------------------------------
+// GET /api/stats (Ticket #16)
+// ---------------------------------------------------------------------------
+
+/**
+ * Cumulative counters since backend process start (`backend.ingest.
+ * IngestStats`, field-for-field). Process-lifetime only — reset by a
+ * backend restart, in memory only. Contrast with `AlertCountersOut`
+ * below, whose numbers come from the database and survive a restart.
+ *
+ * `alerts_suppressed` (D16-3): volumetric anomalies that were detected,
+ * scored, persisted, and broadcast, but deliberately did NOT page an
+ * operator (docs/DETECTION_STUDY.md — ~0.02 precision on that channel).
+ * Rendered with a tooltip, never silently dropped — showing it makes the
+ * alert policy visible instead of hidden.
+ */
+export interface IngestCountersOut {
+  batches: number;
+  flows_received: number;
+  events_inserted: number;
+  events_deduplicated: number;
+  anomalies: number;
+  tripwire_hits: number;
+  cii_computed: number;
+  cii_reused: number;
+  alerts_created: number;
+  alerts_suppressed: number;
+  broadcast_failures: number;
+  events_pruned: number;
+}
+
+export interface AlertSeverityCount {
+  severity: string;
+  acknowledged: number;
+  unacknowledged: number;
+}
+
+/** Alert counts from the alerts TABLE (never the in-memory
+ * `IngestCountersOut.alerts_created`) — survive a backend restart. */
+export interface AlertCountersOut {
+  total: number;
+  unacknowledged: number;
+  by_severity: AlertSeverityCount[];
+}
+
+/**
+ * GET /api/stats — the header counters (docs/PHASE5_BUILD_PLAN.md §7).
+ * Composed from three independently real sources on the backend, kept
+ * distinguishable rather than flattened (see `backend/schemas.py`
+ * `StatsResponse`'s docstring for the full rationale).
+ *
+ * `risk_index` (decision D16-1): `clamp(0, 100)` of
+ * `100 * sum(severity_weight * asset_criticality over UNACKNOWLEDGED
+ * alerts) / risk_index_full_scale`. `risk_index_full_scale` is a
+ * PRESENTATION SCALE, not a calibrated probability — there is no ground
+ * truth for "100% risk" in this system. Deliberately NOT built on CII
+ * (currently near-binary across the graph — see backend/config.py's
+ * `risk_index_full_scale` docstring). `0` (never omitted) when there are
+ * no unacknowledged alerts — that is a real "nothing outstanding" state.
+ *
+ * Deliberately has NO `events/s` or other rate field (decision D16-2) —
+ * `useEventStream`'s `eventsPerSecond` is the one authoritative source
+ * for that, computed from what this tab actually received over the
+ * WebSocket. Never render a second number under that label.
+ */
+export interface StatsResponse {
+  ingest: IngestCountersOut;
+  replay: ReplayStatusResponse;
+  alerts: AlertCountersOut;
+  risk_index: number;
+}
+
+// ---------------------------------------------------------------------------
 // WS /ws/stream envelopes (Ticket #4/#9) — field names copied verbatim from
 // `backend/ingest.py`'s `_broadcast_batch` (event) and `_handle_anomalies`
 // (alert, cii). `ENVELOPE_EVENT`/`ENVELOPE_ALERT`/`ENVELOPE_CII` there are

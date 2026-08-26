@@ -380,3 +380,46 @@ def test_warmup_min_rows_overridable_via_env(monkeypatch):
     monkeypatch.setenv("AEGIS_WARMUP_MIN_ROWS", "2000")
     s = BackendSettings()
     assert s.warmup_min_rows == 2000
+
+
+# ---------------------------------------------------------------------------
+# Ticket #16 — GET /api/stats risk-index settings
+# ---------------------------------------------------------------------------
+
+
+def test_risk_index_defaults():
+    from backend.config import BackendSettings
+
+    s = BackendSettings()
+    assert s.risk_severity_weight_critical == pytest.approx(1.0)
+    assert s.risk_severity_weight_warning == pytest.approx(0.35)
+    assert s.risk_severity_weight_default == pytest.approx(0.1)
+    assert s.risk_index_full_scale == pytest.approx(5.0)
+
+
+def test_risk_severity_weight_critical_overridable_via_env(monkeypatch):
+    from backend.config import BackendSettings
+
+    monkeypatch.setenv("AEGIS_RISK_SEVERITY_WEIGHT_CRITICAL", "2.0")
+    s = BackendSettings()
+    assert s.risk_severity_weight_critical == pytest.approx(2.0)
+
+
+def test_risk_index_full_scale_rejects_zero_and_negative():
+    from backend.config import BackendSettings
+
+    with pytest.raises(pydantic.ValidationError):
+        BackendSettings(risk_index_full_scale=0.0)
+    with pytest.raises(pydantic.ValidationError):
+        BackendSettings(risk_index_full_scale=-1.0)
+
+
+def test_risk_severity_weights_reject_negative():
+    from backend.config import BackendSettings
+
+    with pytest.raises(pydantic.ValidationError):
+        BackendSettings(risk_severity_weight_critical=-0.1)
+    with pytest.raises(pydantic.ValidationError):
+        BackendSettings(risk_severity_weight_warning=-0.1)
+    with pytest.raises(pydantic.ValidationError):
+        BackendSettings(risk_severity_weight_default=-0.1)

@@ -17,6 +17,7 @@ import type {
   AlertsResponse,
   CiiResponse,
   HealthResponse,
+  StatsResponse,
   TopologyResponse,
 } from "./types";
 
@@ -138,6 +139,17 @@ export function ackAlert(id: number): Promise<AlertOut> {
 export function getCii(asset: string, anomalyScore?: number): Promise<CiiResponse> {
   const qs = anomalyScore !== undefined ? `?anomaly_score=${anomalyScore}` : "";
   return apiFetch<CiiResponse>(`/api/cii/${encodeURIComponent(asset)}${qs}`);
+}
+
+/**
+ * GET /api/stats (Ticket #16) — the header counters. 503s (scorer never
+ * loaded, no replay engine) surface as `ApiError` with `status === 503`;
+ * callers must render that as "no basis to compute" (e.g. `—`), never as
+ * zeros — see `StatsResponse`'s docstring in `./types` for why zero and
+ * "no basis" are different, real states.
+ */
+export function getStats(): Promise<StatsResponse> {
+  return apiFetch<StatsResponse>("/api/stats");
 }
 
 export { API_BASE_URL };

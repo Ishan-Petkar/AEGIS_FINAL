@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from backend.config import BackendSettings
 from backend.ingest import (
     DETECTOR_TRIPWIRE,
     DETECTOR_VOLUMETRIC,
@@ -33,6 +34,7 @@ from backend.ingest import (
     IngestPipeline,
     NullBroadcaster,
     build_criticality_map,
+    compute_risk_index,
     default_tripwire_signal,
 )
 from backend.models import Alert, CiiSnapshot
@@ -274,6 +276,97 @@ def test_scores_the_whole_batch_in_one_call():
 def test_default_tripwire_signal_is_false_for_plain_replay_flow():
     """Replayed 2017 capture traffic never touched an AEGIS honeytoken."""
     assert default_tripwire_signal(make_flow("f:1")) is False
+
+
+# ---------------------------------------------------------------------------
+# compute_risk_index — Ticket #16, decision D16-1
+# ---------------------------------------------------------------------------
+
+
+def test_compute_risk_index_no_unacknowledged_alerts_is_zero_not_none():
+    """Zero unacknowledged alerts is a real state -- 0, never None/'—'."""
+    cm = {"City_Payment_Gateway": 0.95}
+    assert compute_risk_index([], cm) == 0
+
+
+def test_compute_risk_index_critical_alert_on_criticality_one_asset():
+    """A single critical alert on the single highest-criticality asset in
+    the graph (criticality 1.0) reads ~20/100 under the default settings
+    (risk_severity_weight_critical=1.0, risk_index_full_scale=5.0) --
+    pinning the documented example in BackendSettings.risk_index_full_scale's
+    docstring."""
+    cm = {"Power_Substation": 1.0}
+    index = compute_risk_index([(SEVERITY_CRITICAL, "Power_Substation", 1)], cm)
+    assert index == 20
+
+
+def test_compute_risk_index_ignores_asset_not_in_criticality_map():
+    """An asset with no real criticality basis (e.g. an auto-registered
+    Unresolved_<ip>) contributes nothing -- never a fabricated guess."""
+    cm = {"City_Payment_Gateway": 0.95}
+    index = compute_risk_index([(SEVERITY_CRITICAL, "Unresolved_10.9.9.9", 1)], cm)
+    assert index == 0
+
+
+def test_compute_risk_index_unknown_severity_uses_default_weight():
+    cm = {"City_Payment_Gateway": 1.0}
+    settings = BackendSettings(
+        risk_severity_weight_critical=1.0,
+        risk_severity_weight_warning=0.35,
+        risk_severity_weight_default=0.1,
+        risk_index_full_scale=1.0,
+    )
+    index = compute_risk_index(
+        [("normal", "City_Payment_Gateway", 1)], cm, settings=settings
+    )
+    assert index == 10  # 100 * (0.1 * 1.0) / 1.0
+
+
+def test_compute_risk_index_warning_weighted_below_critical():
+    cm = {"City_Payment_Gateway": 1.0}
+    settings = BackendSettings(risk_index_full_scale=1.0)
+    critical = compute_risk_index(
+        [(SEVERITY_CRITICAL, "City_Payment_Gateway", 1)], cm, settings=settings
+    )
+    warning = compute_risk_index(
+        [(SEVERITY_WARNING, "City_Payment_Gateway", 1)], cm, settings=settings
+    )
+    assert warning < critical
+
+
+def test_compute_risk_index_is_clamped_at_100():
+    cm = {"Power_Substation": 1.0}
+    settings = BackendSettings(risk_index_full_scale=1.0)
+    index = compute_risk_index(
+        [(SEVERITY_CRITICAL, "Power_Substation", 50)], cm, settings=settings
+    )
+    assert index == 100
+
+
+def test_compute_risk_index_counts_multiply_contribution():
+    """The (severity, asset, count) shape mirrors a GROUP BY aggregate --
+    N alerts on the same asset/severity must contribute N times, not once."""
+    cm = {"City_Payment_Gateway": 1.0}
+    settings = BackendSettings(risk_index_full_scale=10.0)
+    one = compute_risk_index(
+        [(SEVERITY_CRITICAL, "City_Payment_Gateway", 1)], cm, settings=settings
+    )
+    five = compute_risk_index(
+        [(SEVERITY_CRITICAL, "City_Payment_Gateway", 5)], cm, settings=settings
+    )
+    assert five == pytest.approx(one * 5, abs=1)
+
+
+def test_compute_risk_index_acknowledging_the_only_alert_drops_index_to_zero():
+    """The behaviour the ticket's own verification hinges on: removing an
+    alert from the unacknowledged set (i.e. acking it) must visibly lower
+    the index -- here, to zero, since it was the only outstanding alert."""
+    cm = {"City_Payment_Gateway": 0.95}
+    before = compute_risk_index([(SEVERITY_CRITICAL, "City_Payment_Gateway", 1)], cm)
+    after = compute_risk_index([], cm)  # simulates the alert being acked
+    assert before > 0
+    assert after == 0
+    assert after < before
 
 
 def test_tripwire_signal_hook_drives_the_real_detector():

@@ -8,8 +8,8 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { getHealth } from "@/lib/api";
-import type { HealthResponse } from "@/lib/types";
+import { getHealth, getStats } from "@/lib/api";
+import type { HealthResponse, StatsResponse } from "@/lib/types";
 
 export type ConnectionStatus = "connecting" | "connected" | "degraded" | "unreachable";
 
@@ -18,6 +18,20 @@ const POLL_INTERVAL_MS = 5000;
 interface ConnectionContextValue {
   status: ConnectionStatus;
   health: HealthResponse | null;
+  /**
+   * GET /api/stats (Ticket #16), polled on the SAME interval as `health`
+   * above — reusing this provider's existing cadence rather than standing
+   * up a second timer (docs/PHASE5_TICKET16_PLAN.md §6). `null` until the
+   * first successful response, and again whenever the backend answers a
+   * real 503 (no replay engine — scorer never loaded): that is "no basis
+   * to compute" (render `—`), distinct from a `risk_index` of `0`, which
+   * `StatsResponse` returns explicitly when there are simply no
+   * unacknowledged alerts — a real, meaningful state, not an absence of
+   * one. A stats fetch failure never flips `status` below — reachability
+   * is governed solely by `health`, matching D4-3's "stream connectivity
+   * is a separate concern" precedent applied here to the stats endpoint.
+   */
+  stats: StatsResponse | null;
   /** True once the health endpoint has answered at all, even if degraded. */
   isReachable: boolean;
   /**
@@ -44,6 +58,7 @@ const ConnectionContext = createContext<ConnectionContextValue | null>(null);
 export function ConnectionProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   const [health, setHealth] = useState<HealthResponse | null>(null);
+  const [stats, setStats] = useState<StatsResponse | null>(null);
   const [reconnectEpoch, setReconnectEpoch] = useState(0);
   const wasUnreachable = useRef(false);
 
@@ -66,6 +81,20 @@ export function ConnectionProvider({ children }: { children: ReactNode }) {
         setStatus("unreachable");
         wasUnreachable.current = true;
       }
+
+      // Same tick as the health check above (D16's "reuse the existing
+      // cadence, don't add a second timer") but its own try/catch: a
+      // backend that is reachable but has no replay engine loaded
+      // answers /api/health fine and /api/stats with a real 503, and
+      // that must not be misread as the backend being unreachable.
+      try {
+        const result = await getStats();
+        if (cancelled) return;
+        setStats(result);
+      } catch {
+        if (cancelled) return;
+        setStats(null);
+      }
     }
 
     poll();
@@ -80,7 +109,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }) {
 
   return (
     <ConnectionContext.Provider
-      value={{ status, health, isReachable, reconnectEpoch }}
+      value={{ status, health, stats, isReachable, reconnectEpoch }}
     >
       {children}
     </ConnectionContext.Provider>

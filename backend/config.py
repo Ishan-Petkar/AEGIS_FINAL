@@ -451,6 +451,79 @@ class BackendSettings(BaseSettings):
         ),
     )
 
+    # ---- API (Ticket #16): risk index -------------------------------------
+    # GET /api/stats' `risk_index` is a DEFINED, DERIVED quantity, never an
+    # invented number (docs/PHASE5_TICKET16_PLAN.md section 3, decision
+    # D16-1): sum of (severity_weight x asset_criticality) over
+    # UNACKNOWLEDGED alerts, normalised against risk_index_full_scale. It
+    # is deliberately NOT built on CII -- measured across all 50 assets in
+    # config.SMART_CITY_ASSETS this session, CII is currently near-binary
+    # (28 report exactly 0.0, 18 exactly 1.0, only 4 in between), and
+    # feeding that degeneracy into the first number an operator reads
+    # would propagate it into the headline figure rather than fix it.
+    risk_severity_weight_critical: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=10.0,
+        description=(
+            "Contribution weight for an unacknowledged 'critical'-severity "
+            "alert (backend.ingest.SEVERITY_CRITICAL) in the GET /api/stats "
+            "risk index. The highest severity weight: today only a "
+            "tripwire hit (an unambiguous honeytoken touch, which cannot "
+            "be a false positive by construction -- docs/DETECTION_STUDY.md "
+            "section 5) is raised at this severity."
+        ),
+    )
+    risk_severity_weight_warning: float = Field(
+        default=0.35,
+        ge=0.0,
+        le=10.0,
+        description=(
+            "Contribution weight for an unacknowledged 'warning'-severity "
+            "alert (backend.ingest.SEVERITY_WARNING -- a volumetric "
+            "anomaly that cleared alert_volumetric_min_calibrated_score) "
+            "in the risk index. Well below the critical weight because "
+            "docs/DETECTION_STUDY.md measured this channel at ~0.02 "
+            "precision on real replayed traffic: it should still move the "
+            "index, but far less per alert than an unambiguous tripwire "
+            "hit."
+        ),
+    )
+    risk_severity_weight_default: float = Field(
+        default=0.1,
+        ge=0.0,
+        le=10.0,
+        description=(
+            "Fallback contribution weight for any alert severity string "
+            "other than 'critical' or 'warning'. backend.ingest raises "
+            "only those two severities today, but Alert.severity is a "
+            "plain unconstrained `str` column (backend/models.py) -- this "
+            "exists so a future third tier (e.g. 'normal', per "
+            "docs/PHASE5_TICKET16_PLAN.md section 3's illustrative "
+            "'critical > warning > normal' ordering) contributes "
+            "proportionally to the risk index instead of being silently "
+            "dropped or raising a KeyError."
+        ),
+    )
+    risk_index_full_scale: float = Field(
+        default=5.0,
+        gt=0.0,
+        le=1000.0,
+        description=(
+            "Denominator for GET /api/stats' risk_index: clamp(0, 100) of "
+            "100 * sum(severity_weight * asset_criticality over "
+            "unacknowledged alerts) / risk_index_full_scale. THIS IS A "
+            "PRESENTATION SCALE, NOT A CALIBRATED PROBABILITY -- there is "
+            "no ground truth for what '100% risk' means in this system, "
+            "only a chosen denominator that makes the number legible. "
+            "Chosen so a single critical-severity alert on the single "
+            "highest-criticality asset in the graph (criticality 1.0) "
+            "reads as a clearly-visible ~20/100, leaving headroom for "
+            "several concurrent unacknowledged alerts before the index "
+            "saturates at 100."
+        ),
+    )
+
     ingest_retention_check_every_n_batches: int = Field(
         default=200,
         ge=1,

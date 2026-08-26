@@ -89,7 +89,7 @@ import numpy as np
 import pandas as pd
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from backend.config import BACKEND_SETTINGS
+from backend.config import BACKEND_SETTINGS, BackendSettings
 from backend.db import session_scope
 from backend.models import Alert, CiiSnapshot, Event, EventScore
 from backend.replay_engine import BatchMeta
@@ -288,6 +288,70 @@ def build_criticality_map() -> dict[str, float]:
     of truth.
     """
     return {row["name"]: float(row["criticality"]) for row in compute_seed_rows()}
+
+
+def compute_risk_index(
+    unacknowledged_counts: Sequence[tuple[str, str, int]],
+    criticality_map: dict[str, float],
+    settings: Optional[BackendSettings] = None,
+) -> int:
+    """GET /api/stats' `risk_index` (Ticket #16, decision D16-1)::
+
+        risk = clamp(0, 100) of
+               100 * Sum over UNACKNOWLEDGED alerts of
+                     (severity_weight x asset_criticality)
+               / BACKEND_SETTINGS.risk_index_full_scale
+
+    `unacknowledged_counts` is `(severity, asset, count)` triples -- the
+    shape a bounded `GROUP BY severity, asset` aggregate over the alerts
+    table naturally produces (see `backend/routes.py`'s `get_stats`), so
+    a table with a large history of alert rows still costs one small
+    aggregate query, never a per-row fetch into Python.
+
+    `severity_weight` comes from `BACKEND_SETTINGS.risk_severity_weight_*`
+    (falling back to `risk_severity_weight_default` for any severity
+    string other than "critical"/"warning" -- see that field's docstring).
+    `asset_criticality` comes from `criticality_map`
+    (`build_criticality_map()` above -- the one graph authority,
+    Invariant D), defaulting to 0.0 for an asset that is not a graph node.
+    That is a real case, not a hypothetical: an auto-registered
+    `Unresolved_<ip>` asset (risk T5) can legitimately have an alert --
+    `_compute_or_reuse_cii` above still raises one, just without a CII
+    snapshot -- and there is no real criticality basis for such an asset,
+    so it contributes nothing to the index rather than a fabricated guess.
+
+    UNACKNOWLEDGED ONLY, deliberately. Acknowledging an alert must
+    visibly lower this number -- that is what makes it an operator tool
+    ("I've seen this, it's handled") rather than a decoration that never
+    changes once painted. An empty `unacknowledged_counts` returns `0`,
+    never `None`: zero unacknowledged alerts is a real, meaningful
+    "nothing is outstanding" state, distinct from "no basis to compute"
+    (reserved for when there is no replay engine at all -- see
+    `_require_replay_engine` in `backend/routes.py`).
+
+    Deliberately NOT built on CII (D16-1): measured across all 50 assets
+    in `config.SMART_CITY_ASSETS` this session, CII is currently
+    near-binary -- 28 report exactly 0.0, 18 exactly 1.0, only 4 in
+    between -- and feeding that degeneracy into the first number an
+    operator reads would propagate it into the headline figure. See
+    docs/PHASE5_TICKET16_PLAN.md section 3.
+
+    `risk_index_full_scale` is a PRESENTATION SCALE, not a calibrated
+    probability (see that field's docstring in `backend/config.py`) --
+    there is no ground truth for "100% risk" in this system, only a
+    chosen denominator that keeps the number legible.
+    """
+    s = settings if settings is not None else BACKEND_SETTINGS
+    weights = {
+        SEVERITY_CRITICAL: s.risk_severity_weight_critical,
+        SEVERITY_WARNING: s.risk_severity_weight_warning,
+    }
+    total = 0.0
+    for severity, asset, count in unacknowledged_counts:
+        weight = weights.get(severity, s.risk_severity_weight_default)
+        total += weight * criticality_map.get(asset, 0.0) * count
+    scaled = 100.0 * total / s.risk_index_full_scale
+    return int(round(max(0.0, min(100.0, scaled))))
 
 
 def _jsonable(value: Any) -> Any:

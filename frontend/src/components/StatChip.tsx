@@ -19,6 +19,13 @@ interface StatChipProps {
   label: string;
   value: string;
   tone?: SemanticTone;
+  /**
+   * Native `title` tooltip on hover — how a derived/defined figure (e.g.
+   * Ticket #16's risk index, or a suppressed-alert count) states its own
+   * definition inline rather than leaving an operator to guess what a
+   * number in a header chip means (D16-1, D16-3).
+   */
+  title?: string;
 }
 
 /**
@@ -26,9 +33,9 @@ interface StatChipProps {
  * The value is colored by its own semantic scale, never by `--accent`
  * (brand color is reserved for interactive elements per §2).
  */
-export function StatChip({ label, value, tone = "text" }: StatChipProps) {
+export function StatChip({ label, value, tone = "text", title }: StatChipProps) {
   return (
-    <div className="flex flex-col items-start gap-0.5">
+    <div className="flex flex-col items-start gap-0.5" title={title}>
       <span
         className={`font-mono text-base font-semibold tabular-nums leading-none ${TONE_CLASS[tone]}`}
       >
