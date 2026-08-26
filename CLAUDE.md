@@ -135,9 +135,26 @@ compromised node where each edge fires with probability `prob`, capped at
 - `shares_provider` — intended as correlated common-mode failure via
   `provider_id`; currently sampled independently (see Known issues).
 
-Per-iteration impact = `anomaly_score × Σ criticality(compromised nodes)`,
-clamped to `SETTINGS.cii.cii_max_value`. Results are reported as a
-**distribution** (median, p5, p95), not a point estimate.
+Per-iteration impact = `anomaly_score × (Σ criticality(compromised nodes) /
+Σ criticality(every other node))` — a **fraction of the city's criticality
+mass**, so 0.22 reads as "about a fifth of the city falls over" and the
+score is comparable across graphs of different sizes. Results are reported
+as a **distribution** (median, p5, p95), not a point estimate.
+
+This normalisation replaced an absolute sum clamped at
+`SETTINGS.cii.cii_max_value`, which saturated once the topology grew: on
+the 50-node city, 18 of 50 origin assets returned exactly the clamp and 28
+returned exactly 0, so the operations hub (30 assets impacted) scored
+identically to a traffic controller (26 impacted). The same degeneracy was
+already latent on the old 16-node graph (6 zeros / 8 clamped / 2 between),
+so the scale-up exposed it rather than caused it. `cii_max_value` is now a
+safety clamp only — normalised scores cannot exceed 1.0 by construction.
+
+**A median of exactly 0.0 is common and honest**: it means more than half
+the Monte Carlo iterations propagated nothing, which is the truth for a
+weakly-coupled leaf. The p5/p95 interval carries the tail (an asset may
+report median 0.0 with p95 0.185 — "usually nothing, occasionally
+moderate"). Read the interval, not just the median.
 
 Two public entry points: `compute_cascading_impact()` returns the legacy
 3-tuple; `compute_cascading_impact_full()` returns the full `CIIResult`. The

@@ -100,10 +100,17 @@ def _simulate_one_iteration(
     default_criticality: float,
     rng: random.Random,
     gateway_nodes: frozenset[str],
+    graph_criticality_mass: float = 0.0,
 ) -> tuple[float, dict[str, int]]:
     """Run a single Monte Carlo iteration of edge-failure sampling.
 
     Returns (total_impact, compromised_nodes_with_hop).
+
+    `graph_criticality_mass` is the summed criticality of every node in
+    the graph. When > 0 the raw impact is expressed as a FRACTION of it
+    (see the normalisation note in `compute_cascading_impact_full`); when
+    0 the legacy absolute sum is returned unchanged, so callers that
+    build their own tiny fixture graphs keep their previous semantics.
     """
     # BFS from source, but each edge fires probabilistically
     compromised: dict[str, int] = {source_node: 0}  # node → hop at which compromised
@@ -190,6 +197,18 @@ def _simulate_one_iteration(
         crit = _criticality_of(node, criticality_map, default_criticality, gateway_nodes)
         total_impact += crit
 
+    # Normalisation (see compute_cascading_impact_full's docstring): express
+    # the compromised mass as a FRACTION of the graph's total criticality
+    # rather than as an absolute sum. Without this the score saturates:
+    # measured on the 50-node city, 18 of 50 origin assets returned exactly
+    # the clamp and 28 returned exactly 0, leaving only 4 in between — the
+    # operations hub (30 impacted) and a traffic controller (26 impacted)
+    # were indistinguishable. An absolute sum grows with the size of the
+    # city, so every well-connected asset eventually pins to cii_max_value
+    # and the "distribution, not a point estimate" claim stops being true.
+    if graph_criticality_mass > 0.0:
+        total_impact /= graph_criticality_mass
+
     cii = anomaly_score * total_impact
     return cii, compromised
 
@@ -260,6 +279,36 @@ def compute_cascading_impact_full(
     Full Monte Carlo CII computation returning a CIIResult with distributions.
 
     See compute_cascading_impact() for parameter documentation.
+
+    Scale — CII is a FRACTION of the city's criticality mass
+    ------------------------------------------------------
+    Each iteration's impact is the summed criticality of the compromised
+    nodes divided by the summed criticality of every other node in the
+    graph, then scaled by `anomaly_score`. So 0.22 reads as "roughly a
+    fifth of the city's critical mass falls over", and the number is
+    comparable across graphs of different sizes.
+
+    This replaced an absolute sum clamped at `cii_max_value`, which
+    saturated as soon as the topology grew. Measured on the 50-node city
+    before the change: 18 of 50 origin assets returned exactly the clamp
+    and 28 returned exactly 0, leaving 4 in between — the operations
+    hub (30 assets impacted) scored identically to a traffic controller
+    (26 impacted), and the "distribution, not a point estimate" property
+    the rest of this module is built around was not actually true. After
+    normalising: 0 saturated, 22 in between, same runtime. The same
+    degeneracy was already present on the old 16-node graph (6 zeros, 8
+    at the clamp, 2 between), so this was a latent flaw the scale-up
+    exposed rather than one it introduced.
+
+    A median of exactly 0.0 remains common and is honest: it means more
+    than half of the Monte Carlo iterations propagated nothing, which is
+    the truth for a weakly-coupled leaf. The p5/p95 interval carries the
+    tail — e.g. an asset can report median 0.0 with p95 0.185, meaning
+    "usually nothing, occasionally moderate". Read the interval, not just
+    the median.
+
+    `cii_max_value` is retained as a safety clamp only; normalised scores
+    cannot exceed 1.0 by construction.
     """
     if max_hops is None:
         max_hops = SETTINGS.cii.bfs_max_hops
@@ -342,10 +391,21 @@ def compute_cascading_impact_full(
     node_compromise_count: dict[str, int] = {}
     node_hop_sums: dict[str, float] = {}
 
+    # Total criticality of the graph, computed ONCE (not per iteration).
+    # Excludes the origin, mirroring _simulate_one_iteration's own
+    # exclusion of the source node, so a fully-cascading compromise
+    # approaches 1.0 rather than an arbitrary fraction below it.
+    graph_criticality_mass = sum(
+        _criticality_of(n, criticality_map, default_criticality, gw_nodes)
+        for n in DG.nodes()
+        if n != anomalous_asset_name
+    )
+
     for _ in range(mc_iterations):
         cii, compromised = _simulate_one_iteration(
             DG, anomalous_asset_name, anomaly_score,
             criticality_map, max_hops, default_criticality, rng, gw_nodes,
+            graph_criticality_mass,
         )
         cii_scores.append(min(cii_max, cii))
 
