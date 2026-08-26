@@ -26,6 +26,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from backend.config import BACKEND_SETTINGS
+
 # ---------------------------------------------------------------------------
 # GET /api/health
 # ---------------------------------------------------------------------------
@@ -248,3 +250,70 @@ class ReplayStatusResponse(BaseModel):
             consumer_error_count=status.consumer_error_count,
             consumer_failed_flow_count=status.consumer_failed_flow_count,
         )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/inject/scenarios | POST /api/inject (Ticket #13)
+# ---------------------------------------------------------------------------
+
+
+class ScenarioOut(BaseModel):
+    """One entry from `backend.inject.SCENARIOS` — real dataset day + real
+    label, never a fabrication knob. `is_honeytoken` names the one
+    scenario (decision D13-2) that additionally sets AEGIS's own
+    deception-layer control flag on otherwise-real, unmodified flows."""
+
+    name: str
+    day: str
+    label: str
+    is_honeytoken: bool
+    description: str
+
+
+class ScenariosResponse(BaseModel):
+    scenarios: list[ScenarioOut]
+
+
+#: Curated default target — the smart-city payment gateway, the same
+#: asset the ticket's own verification example names. Used only when the
+#: caller omits `target_asset` entirely.
+DEFAULT_INJECT_TARGET_ASSET = "City_Payment_Gateway"
+
+
+class InjectRequest(BaseModel):
+    """`scenario` is required and must be a key in `backend.inject.
+    SCENARIOS` (422 otherwise). `target_asset` defaults to
+    `DEFAULT_INJECT_TARGET_ASSET` and must be a CURATED asset with a real
+    static IP identifier (422 otherwise — see `backend.inject.
+    resolvable_target_assets()`, stricter than plain graph membership).
+    `count` is bounded by `BACKEND_SETTINGS.inject_max_flows` at the
+    Pydantic layer (422 above the cap, never silently clamped, mirroring
+    `/api/events`'s `limit`).
+    """
+
+    scenario: str
+    target_asset: Optional[str] = Field(
+        default=None,
+        description=f"Curated asset to compromise. Defaults to {DEFAULT_INJECT_TARGET_ASSET!r}.",
+    )
+    count: int = Field(
+        default=100,
+        ge=1,
+        le=BACKEND_SETTINGS.inject_max_flows,
+        description="Number of real flows to replay. Bounded by BACKEND_SETTINGS.inject_max_flows.",
+    )
+
+
+class InjectResponse(BaseModel):
+    """Explicitly names the scenario and states plainly that these are
+    real capture flows re-targeted for a what-if — decision D13-1's
+    "must be unmistakable" requirement. Never phrased as observed
+    telemetry."""
+
+    scenario: str
+    target_asset: str
+    flows_injected: int
+    real_label: str
+    is_honeytoken: bool
+    message: str
+    replay_session_id: Optional[UUID]

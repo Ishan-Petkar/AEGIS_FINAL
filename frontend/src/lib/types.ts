@@ -179,6 +179,14 @@ export interface EventEnvelopeData {
   confidence: number;
   replay_session_id: string;
   batch_index: number;
+  /**
+   * `"replay"` for real captured telemetry, `"injected"` for a Ticket #13
+   * operator what-if (real captured attack flows re-targeted onto a
+   * curated asset). The feed MUST distinguish these — an injected
+   * scenario shown as observed capture traffic is exactly the confusion
+   * this field exists to prevent.
+   */
+  batch_origin: string;
 }
 
 export interface AlertEnvelopeData {

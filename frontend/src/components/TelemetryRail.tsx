@@ -199,6 +199,18 @@ export function TelemetryRail() {
                   <span className="min-w-0 flex-1 truncate text-text-dim">
                     {src} <span aria-hidden="true">&rarr;</span> {dst}
                   </span>
+                  {/* Ticket #13 what-if scenarios replay REAL captured
+                      attack flows re-targeted onto a curated asset. That
+                      is an operator hypothesis, not observed telemetry,
+                      and the feed must never let the two look alike. */}
+                  {e.batch_origin === "injected" && (
+                    <span
+                      className="shrink-0 rounded-sm border border-accent/50 px-1 text-[10px] uppercase tracking-wider text-accent"
+                      title="Operator what-if: real captured attack flows re-targeted onto a curated asset — not observed telemetry"
+                    >
+                      inject
+                    </span>
+                  )}
                   <SeverityGlyph severity={severity} className="ml-auto shrink-0" />
                 </li>
               );

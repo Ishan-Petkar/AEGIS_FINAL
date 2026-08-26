@@ -37,6 +37,7 @@ module merely reads from.
 from __future__ import annotations
 
 import importlib
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -197,15 +198,17 @@ def _noop_consumer(batch, meta) -> None:
     return None
 
 
-def make_engine_runtime(n_flows: int = 20) -> AppRuntime:
+def make_engine_runtime(n_flows: int = 20, consumer=None) -> AppRuntime:
     """A fake `AppRuntime` wired to a REAL `ReplayEngine` (genuine
     start/stop/speed/409 control-plane behaviour) over a synthetic,
     in-memory flow list — no dataset file, no DB, no scorer needed for
-    these control-plane assertions.
+    these control-plane assertions. `consumer` defaults to a no-op but can
+    be swapped for a recording consumer (see `_RecordingConsumer` below)
+    by Ticket #13's inject tests, which need to observe emitted batches.
     """
     flows = [_flow(BASE_TS + timedelta(seconds=i), f"synthetic:{i}") for i in range(n_flows)]
     engine = ReplayEngine(
-        consumer=_noop_consumer,
+        consumer=consumer if consumer is not None else _noop_consumer,
         reader=_FakeReader(flows),
         tick_interval=0.01,
         thread_join_timeout=2.0,
@@ -217,6 +220,21 @@ def make_engine_runtime(n_flows: int = 20) -> AppRuntime:
         scorer_load_error=None,
         started_at=datetime.now(timezone.utc),
     )
+
+
+class _RecordingConsumer:
+    """Thread-safe spy consumer: records every `(batch, meta)` the engine
+    thread emits, so a test can inspect injected flows without a real
+    `IngestPipeline`/DB. Used by the Ticket #13 `POST /api/inject` tests.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.calls: list[tuple[list, object]] = []
+
+    def __call__(self, batch, meta) -> None:
+        with self._lock:
+            self.calls.append((list(batch), meta))
 
 
 def make_no_scorer_runtime() -> AppRuntime:
@@ -819,6 +837,218 @@ def test_replay_start_maps_dataset_to_day_and_honours_limit_and_start_at():
             time.sleep(0.02)
         status = runtime.engine.status()
         assert status.emitted_count == 3
+    finally:
+        runtime.engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# POST /api/inject | GET /api/inject/scenarios (Ticket #13)
+# ---------------------------------------------------------------------------
+
+import backend.inject as inject_module  # noqa: E402
+from backend.replay_reader import ReplayFlow as _RF  # noqa: E402
+
+
+class _FakeInjectReader:
+    """Stands in for `backend.inject.ReplayFlowReader` so these tests never
+    touch a real (75-280MB) dataset CSV. Yields synthetic but realistically
+    shaped real-attack-labelled flows for the days the scenario registry
+    references.
+    """
+
+    _BY_DAY = {
+        "friday-morning": [
+            _RF(
+                ts=BASE_TS,
+                source_ip="192.168.10.5",
+                source_port=4444,
+                destination_ip="192.168.10.50",
+                destination_port=80,
+                protocol="TCP",
+                duration_sec=12.5,
+                packets=7,
+                bytes=4321,
+                label="Bot",
+                is_attack=True,
+                timing_provenance=TIMING_PROVENANCE_CAPTURE_SECONDS,
+                source_row_id=f"Friday-WorkingHours-Morning.pcap_ISCX.csv:{i}",
+                source_dataset="CIC-IDS2017-TrafficLabelling",
+            )
+            for i in range(5)
+        ],
+    }
+
+    def iter_flows(self, day=None, limit=None):
+        yield from self._BY_DAY.get(day, [])
+
+
+@pytest.fixture(autouse=True)
+def _reset_inject_pool_cache(monkeypatch):
+    """Route to the fake reader (never a real CSV) and reset the
+    module-level pool cache around every test in this file, since it is
+    process-global and would otherwise leak state between tests."""
+    monkeypatch.setattr(inject_module, "ReplayFlowReader", _FakeInjectReader)
+    inject_module.clear_pool_cache()
+    yield
+    inject_module.clear_pool_cache()
+
+
+def test_inject_scenarios_lists_the_real_registry():
+    client = make_client()
+    r = client.get("/api/inject/scenarios")
+    assert r.status_code == 200
+    names = {s["name"] for s in r.json()["scenarios"]}
+    assert {"bot_c2", "ddos", "port_scan", "honeytoken"} <= names
+    honeytoken = next(s for s in r.json()["scenarios"] if s["name"] == "honeytoken")
+    assert honeytoken["is_honeytoken"] is True
+    assert honeytoken["label"] == "Bot"
+
+
+def test_inject_503_when_scorer_failed_to_load():
+    runtime = make_no_scorer_runtime()
+    client = make_client(runtime=runtime)
+    r = client.post("/api/inject", json={"scenario": "bot_c2"})
+    assert r.status_code == 503
+
+
+def test_inject_409_when_no_replay_running():
+    """Correctness requirement: inject() only drains on the engine's tick,
+    which only runs while start() has the engine thread alive. This must
+    be an explicit 409, never a silent no-op."""
+    runtime = make_engine_runtime()
+    client = make_client(runtime=runtime)
+    r = client.post(
+        "/api/inject",
+        json={"scenario": "bot_c2", "target_asset": "City_Payment_Gateway"},
+    )
+    assert r.status_code == 409
+    assert "not running" in r.json()["detail"] or "no replay session" in r.json()["detail"]
+
+
+def test_inject_422_unknown_scenario():
+    runtime = make_engine_runtime()
+    client = make_client(runtime=runtime)
+    try:
+        client.post("/api/replay/start", json={"speed": 1000.0})
+        r = client.post("/api/inject", json={"scenario": "not_a_scenario"})
+        assert r.status_code == 422
+    finally:
+        runtime.engine.stop()
+
+
+def test_inject_422_unresolvable_target_asset():
+    runtime = make_engine_runtime()
+    client = make_client(runtime=runtime)
+    try:
+        client.post("/api/replay/start", json={"speed": 1000.0})
+        r = client.post(
+            "/api/inject",
+            json={"scenario": "bot_c2", "target_asset": "Gateway_L4"},
+        )
+        assert r.status_code == 422
+    finally:
+        runtime.engine.stop()
+
+
+def test_inject_count_above_max_is_422():
+    from backend.config import BACKEND_SETTINGS
+
+    runtime = make_engine_runtime()
+    client = make_client(runtime=runtime)
+    try:
+        client.post("/api/replay/start", json={"speed": 1000.0})
+        r = client.post(
+            "/api/inject",
+            json={
+                "scenario": "bot_c2",
+                "count": BACKEND_SETTINGS.inject_max_flows + 1,
+            },
+        )
+        assert r.status_code == 422
+    finally:
+        runtime.engine.stop()
+
+
+def test_inject_success_emits_real_labelled_flows_tagged_injected():
+    consumer = _RecordingConsumer()
+    runtime = make_engine_runtime(consumer=consumer)
+    client = make_client(runtime=runtime)
+    try:
+        # A modest speed (not the 1000x+ used by pure control-plane tests)
+        # so the 20-flow synthetic schedule takes long enough in wall time
+        # for the injected batch to land on a tick before the scheduled
+        # run naturally exhausts and the engine thread exits.
+        client.post("/api/replay/start", json={"speed": 50.0})
+        r = client.post(
+            "/api/inject",
+            json={
+                "scenario": "bot_c2",
+                "target_asset": "City_Payment_Gateway",
+                "count": 5,
+            },
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["scenario"] == "bot_c2"
+        assert body["target_asset"] == "City_Payment_Gateway"
+        assert body["real_label"] == "Bot"
+        assert body["is_honeytoken"] is False
+        assert body["flows_injected"] == 5
+        assert "what-if" in body["message"].lower()
+
+        # Wait for the engine's next tick to drain and emit the injected
+        # batch to the recording consumer.
+        injected_calls = []
+        for _ in range(150):
+            with consumer._lock:
+                injected_calls = [
+                    (batch, meta) for batch, meta in consumer.calls if meta.origin == "injected"
+                ]
+                if injected_calls:
+                    break
+            time.sleep(0.02)
+        assert injected_calls, "no injected batch was ever emitted"
+        batch, meta = injected_calls[0]
+        assert len(batch) == 5
+        assert all(f.source_ip == "10.0.1.20" for f in batch)  # re-targeted
+        assert all(f.label == "Bot" for f in batch)  # real label preserved
+        assert all(f.is_honeytoken_use is False for f in batch)
+    finally:
+        runtime.engine.stop()
+
+
+def test_inject_honeytoken_scenario_sets_flag_on_real_flows():
+    consumer = _RecordingConsumer()
+    runtime = make_engine_runtime(consumer=consumer)
+    client = make_client(runtime=runtime)
+    try:
+        client.post("/api/replay/start", json={"speed": 50.0})
+        r = client.post(
+            "/api/inject",
+            json={
+                "scenario": "honeytoken",
+                "target_asset": "City_Payment_Gateway",
+                "count": 3,
+            },
+        )
+        assert r.status_code == 200
+        assert r.json()["is_honeytoken"] is True
+
+        injected_calls = []
+        for _ in range(150):
+            with consumer._lock:
+                injected_calls = [
+                    (batch, meta) for batch, meta in consumer.calls if meta.origin == "injected"
+                ]
+                if injected_calls:
+                    break
+            time.sleep(0.02)
+
+        assert injected_calls, "no injected batch was ever emitted"
+        batch, meta = injected_calls[0]
+        assert meta.origin == "injected"
+        assert all(f.is_honeytoken_use is True for f in batch)
+        assert all(f.label == "Bot" for f in batch)  # telemetry stays real
     finally:
         runtime.engine.stop()
 

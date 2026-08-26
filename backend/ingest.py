@@ -967,6 +967,18 @@ class IngestPipeline:
                         "confidence": float(confidence[i]),
                         "replay_session_id": str(meta.replay_session_id),
                         "batch_index": meta.batch_index,
+                        # BATCH_ORIGIN_REPLAY | BATCH_ORIGIN_INJECTED.
+                        # Additive, and load-bearing: Ticket #13 injects
+                        # REAL captured attack flows re-targeted onto a
+                        # curated asset as an operator "what-if", and that
+                        # must never be mistaken for observed capture
+                        # telemetry. `events.raw` already records it, so
+                        # GET /api/events could distinguish the two — but
+                        # the live feed is the surface an operator
+                        # actually watches, and without this field a
+                        # WebSocket client cannot tell an injected
+                        # scenario from real traffic in real time.
+                        "batch_origin": meta.origin,
                     },
                 }
             )

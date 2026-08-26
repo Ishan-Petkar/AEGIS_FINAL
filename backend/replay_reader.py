@@ -240,6 +240,22 @@ class ReplayFlow:
     init_win_bytes_backward: int = 0
     average_packet_size: float = 0.0
 
+    # ---- Ticket #13 additive extension: deception-layer control flag ---
+    # A honeytoken touch cannot exist in a 2017 public capture — the
+    # honeytoken is AEGIS's own planted credential, part of its deception
+    # instrumentation, not something an external dataset can contain. This
+    # field lets `backend.inject` (POST /api/inject's honeytoken scenario)
+    # mark real, unmodified capture flows as having touched the planted
+    # credential — the TELEMETRY stays real (bytes/packets/duration/
+    # protocol/ports/timing/label untouched), only this deception-layer
+    # control flag is set, via `dataclasses.replace()` (this dataclass is
+    # frozen) rather than mutation. `backend.ingest.default_tripwire_signal`
+    # already reads this exact attribute name with `getattr(..., False)` —
+    # that hook was built by Ticket #7 for exactly this seam, so no change
+    # to `backend/ingest.py` is needed. Defaults False: replayed real
+    # 2017 capture traffic never touched an AEGIS honeytoken.
+    is_honeytoken_use: bool = False
+
 
 @dataclass(frozen=True)
 class ReadStats:

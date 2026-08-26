@@ -1,5 +1,6 @@
 """
-backend/routes.py — Phase 5 Ticket #8: the nine REST routes.
+backend/routes.py — Phase 5 Ticket #8 (nine REST routes) + Ticket #13
+(POST /api/inject, GET /api/inject/scenarios).
 
     GET  /api/health
     GET  /api/topology
@@ -11,10 +12,11 @@ backend/routes.py — Phase 5 Ticket #8: the nine REST routes.
     POST /api/replay/stop
     POST /api/replay/speed
     WS   /ws/stream           (Ticket #9)
+    GET  /api/inject/scenarios  (Ticket #13)
+    POST /api/inject            (Ticket #13)
 
-Explicitly OUT of scope (docs/PHASE5_TICKET8_PLAN.md section 1): `POST
-/api/inject` (Ticket #13), `GET /api/stats` (Ticket #16). Do not add
-them here.
+`GET /api/stats` (Ticket #16) is still explicitly OUT of scope — do not
+add it here.
 
 Two overridable dependencies carry every route's external state, so the
 default test suite needs neither Postgres nor a real `AppRuntime`
@@ -69,6 +71,7 @@ from sqlalchemy.orm import Session
 
 from backend.config import BACKEND_SETTINGS
 from backend.db import session_scope
+from backend.inject import SCENARIOS, InjectionError, build_injection_flows
 from backend.ingest import build_criticality_map
 from backend.models import Alert, Event
 from backend.replay_engine import ReplayEngineError, ReplayStatus
@@ -77,12 +80,17 @@ from backend.schemas import (
     AlertOut,
     AlertsResponse,
     CiiResponse,
+    DEFAULT_INJECT_TARGET_ASSET,
     EventOut,
     EventsResponse,
     HealthResponse,
+    InjectRequest,
+    InjectResponse,
     ReplaySpeedRequest,
     ReplayStartRequest,
     ReplayStatusResponse,
+    ScenarioOut,
+    ScenariosResponse,
     TopologyEdge,
     TopologyNode,
     TopologyResponse,
@@ -533,6 +541,118 @@ def set_replay_speed(
         raise HTTPException(status_code=409, detail="replay is not running")
     engine.set_speed(body.multiplier)
     return ReplayStatusResponse.from_status(engine.status())
+
+
+# ---------------------------------------------------------------------------
+# GET /api/inject/scenarios | POST /api/inject (Ticket #13)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/api/inject/scenarios", response_model=ScenariosResponse)
+def list_inject_scenarios() -> ScenariosResponse:
+    """The real-attack scenario registry (`backend.inject.SCENARIOS`), so
+    the UI lists scenarios rather than hardcoding them. Every entry
+    replays real, labelled CIC-IDS2017 attack traffic — see
+    `backend/inject.py`'s module docstring for the verified per-label
+    flow counts. No DB, no scorer, no engine required.
+    """
+    return ScenariosResponse(
+        scenarios=[
+            ScenarioOut(
+                name=spec.name,
+                day=spec.day,
+                label=spec.label,
+                is_honeytoken=spec.is_honeytoken,
+                description=spec.description,
+            )
+            for spec in SCENARIOS.values()
+        ]
+    )
+
+
+@router.post("/api/inject", response_model=InjectResponse)
+def post_inject(
+    body: InjectRequest,
+    runtime: AppRuntime = Depends(get_runtime),
+) -> InjectResponse:
+    """Replay REAL captured attack flows (never fabricated —
+    `src/data_generator.generate_scripted_attack()` is never called here),
+    re-targeted at an operator-chosen curated asset (decision D13-1), via
+    the EXISTING `ReplayEngine.inject()` — no second injection path.
+
+    503 if the scorer never loaded (`_require_replay_engine`, mirroring
+    every other replay-control route).
+
+    409 if no replay is currently running. This is NOT a cosmetic choice:
+    `ReplayEngine.inject()` only queues flows into `_injection_buffer`,
+    which is drained exclusively inside `_tick_once()`, which only runs
+    from the engine's background thread while `start()` has it running.
+    `start()` itself unconditionally clears any pending injection buffer
+    before spawning that thread. So calling `inject()` while stopped does
+    not raise, but the flows would sit queued and then be silently wiped
+    out by the next `start()` — a silent no-op this route refuses to
+    produce (docs/PHASE5_TICKET13_PLAN.md section 5: "if it does [require
+    a started engine], say so explicitly rather than silently no-oping").
+    An operator must `POST /api/replay/start` first.
+
+    422 for an unknown `scenario`, or a `target_asset` that is not a
+    curated asset with a real static IP identifier (stricter than plain
+    `build_criticality_map()` membership — see `backend.inject.
+    resolvable_target_assets()`'s docstring for why a gateway/synthesized
+    node cannot be a valid target here).
+
+    `count` above `BACKEND_SETTINGS.inject_max_flows` is already 422'd by
+    `InjectRequest`'s own Pydantic bound before this body runs.
+    """
+    engine = _require_replay_engine(runtime)
+    status = engine.status()
+    if not status.running:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "no replay session is running; POST /api/inject requires "
+                "an active replay (start one via POST /api/replay/start) "
+                "because ReplayEngine.inject() only drains its queue on "
+                "the engine's next scheduling tick — injecting into a "
+                "stopped engine would silently do nothing."
+            ),
+        )
+
+    target_asset = body.target_asset or DEFAULT_INJECT_TARGET_ASSET
+    try:
+        flows = build_injection_flows(body.scenario, target_asset, body.count)
+    except InjectionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    try:
+        engine.inject(flows)
+    except ReplayEngineError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    spec = SCENARIOS[body.scenario]
+    return InjectResponse(
+        scenario=body.scenario,
+        target_asset=target_asset,
+        flows_injected=len(flows),
+        real_label=spec.label,
+        is_honeytoken=spec.is_honeytoken,
+        message=(
+            f"What-if injected: {len(flows)} REAL captured "
+            f"{spec.label!r} flows ({spec.day}) re-targeted at "
+            f"{target_asset!r}. This is a what-if scenario, not observed "
+            "capture traffic -- every injected event is persisted with "
+            "batch_origin='injected'."
+            + (
+                " AEGIS's own planted honeytoken credential flag was "
+                "additionally set on these real flows (decision D13-2); "
+                "a honeytoken touch cannot exist in the 2017 public "
+                "capture itself."
+                if spec.is_honeytoken
+                else ""
+            )
+        ),
+        replay_session_id=status.replay_session_id,
+    )
 
 
 # ---------------------------------------------------------------------------

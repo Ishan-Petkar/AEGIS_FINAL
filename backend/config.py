@@ -340,6 +340,27 @@ class BackendSettings(BaseSettings):
         ),
     )
 
+    # ---- Injection (Ticket #13) -------------------------------------------
+    inject_max_flows: int = Field(
+        default=500,
+        ge=1,
+        le=10_000,
+        description=(
+            "Hard cap on `count` for POST /api/inject. Injected flows are "
+            "handed straight to `ReplayEngine.inject()`, which emits them "
+            "as ONE micro-batch on the engine's very next tick — an "
+            "operator-supplied `count` with no ceiling would hand the "
+            "ingest pipeline (scoring + a bulk INSERT) and the WebSocket "
+            "broadcaster an arbitrarily large burst in one shot, the same "
+            "risk `replay_max_batch_size` already guards against for the "
+            "scheduled stream. 500 matches that default and comfortably "
+            "covers the demo scenarios (bot_c2 has 1,966 real matching "
+            "flows to draw from; ddos and port_scan have well over "
+            "100,000), so the cap is never the limiting factor for a "
+            "realistic what-if burst."
+        ),
+    )
+
     # ---- Retention (Ticket #2) ------------------------------------------
     db_event_retention_max_rows: int = Field(
         default=500_000,
