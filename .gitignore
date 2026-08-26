@@ -9,7 +9,7 @@ venv/
 ENV/
 .env
 .venv
-datasets/
+/datasets/
 datasets.zip
 
 # Phase 5 backend
