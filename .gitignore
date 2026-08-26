@@ -31,3 +31,5 @@ graphify-out/
 frontend/node_modules/
 frontend/.next/
 frontend/out/
+.coverage
+coverage.xml

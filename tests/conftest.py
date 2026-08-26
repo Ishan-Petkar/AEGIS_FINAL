@@ -9,6 +9,16 @@ import os
 # Ensure the src directory is on the path for all tests.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+# Ensure the repo root is on the path too, so `backend` (a top-level
+# package, not under src/) is importable. `python -m pytest` adds the
+# current working directory to sys.path automatically, which is why this
+# was never caught by any local run all session -- CI invokes the bare
+# `pytest` console script instead, which does not, and every backend test
+# module failed collection with `ModuleNotFoundError: No module named
+# 'backend'` as a result. Reproduced locally with the same bare-pytest
+# invocation before this fix; confirmed fixed after.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
 
 # ---------------------------------------------------------------------------
 # Shared graph fixtures
