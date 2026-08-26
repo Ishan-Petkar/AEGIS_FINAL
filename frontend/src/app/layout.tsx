@@ -31,9 +31,19 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
     <html
       lang="en"
-      className={`${inter.variable} ${jetbrainsMono.variable} h-full`}
+      className={`${inter.variable} ${jetbrainsMono.variable} xl:h-full`}
     >
-      <body className="min-h-full flex flex-col antialiased">
+      {/* The fixed-viewport clamp (`h-full` + `overflow-hidden`) only
+          applies at the `xl` breakpoint, matching page.tsx's switch to
+          the 3-column grid (`xl:flex-row`). That clamp is what gives the
+          graph canvas a definite height to bottom out on and is what
+          killed the runaway ResizeObserver feedback loop (see
+          CityGraph.tsx) — but it clamps the *whole document*, so below
+          `xl` (where panels stack) it must not apply: otherwise content
+          below the fold is clipped with no scrollbar to reach it. Below
+          `xl` the document scrolls normally and each stacked panel gets
+          its own definite height instead (see page.tsx / GraphPanel.tsx). */}
+      <body className="flex flex-col antialiased xl:h-full xl:overflow-hidden">
         <ConnectionProvider>
           <StreamProvider>{children}</StreamProvider>
         </ConnectionProvider>
