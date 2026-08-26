@@ -18,8 +18,15 @@ live path is synthetic.
 **Operations Console** (`backend/` + `frontend/`) — the live view. Real
 CIC-IDS2017 traffic replayed in timestamp order, scored by a pre-fitted
 model, persisted to PostgreSQL, streamed over a WebSocket, and rendered in
-a Next.js console: live telemetry feed, a 50-node city graph with animated
-blast-radius cascades, and an alerts panel with per-alert explanations.
+a Next.js console.
+
+The city graph shows **11 sector nodes by default** — clustered around a
+central operations hub and sized by how many assets each holds — and
+expands to all **50 individual assets** on demand, because 50 labelled
+nodes are not legible in a side panel but are perfectly legible full
+screen. Alongside it: a live telemetry feed, an alerts panel with
+per-alert explanations and an acknowledge flow, a per-sector health strip,
+and live replay progress against the capture day.
 
 **Research Console** (`src/aegis_demo.py`, Streamlit) — the analytics
 workbench: dataset selection, detector benchmarking, and the evaluation
@@ -56,6 +63,16 @@ work; the Operations Console is where you watch it happen.
   PortScan) re-targeted onto a chosen asset. Injected events are tagged
   `batch_origin=injected` end to end and badged in the UI, so an operator
   hypothesis can never be mistaken for observed telemetry.
+- **A risk index that is defined, not asserted.** The header's `RISK`
+  figure is `Σ(severity_weight × asset_criticality)` over **unacknowledged**
+  alerts, normalised against a documented presentation scale — the formula
+  is in the UI tooltip. Acknowledging an alert visibly lowers it, which is
+  what makes it an operator tool rather than a decoration. It is
+  deliberately **not** built on CII (see *Honest limitations*).
+- **The alert policy is visible, not hidden.** The console reports how
+  many anomalies it detected and deliberately did *not* page you for —
+  typically a few hundred against one real alert. Suppression is a stated
+  policy with a measured justification, not silent filtering.
 - **Honest evaluation** (`src/evaluation/`) — segment-wise recall with
   row-wise precision for ICS time series (a deliberate rejection of the
   "point-adjust" metric, which can make random noise look
@@ -199,6 +216,28 @@ ReplayEngine ──► IngestPipeline ──► PostgreSQL
 
 The detection and risk math are unchanged from the research phase — the
 operations layer packages the engine, it does not replace it.
+
+### API
+
+Twelve REST routes plus the stream. Interactive docs at
+<http://127.0.0.1:8000/docs> once the backend is running.
+
+| | |
+|---|---|
+| `GET /api/health` | liveness, database, whether the model artifact loaded |
+| `GET /api/topology` | the 50-node graph — nodes, edges, sectors |
+| `GET /api/events` | recent events, cursor-paged |
+| `GET /api/alerts` · `POST /api/alerts/{alert_id}/ack` | alert list and acknowledge |
+| `GET /api/cii/{asset}` | on-demand blast radius for any asset |
+| `GET /api/stats` | ingest counters, replay status, alert counts, risk index |
+| `POST /api/replay/start` · `stop` · `speed` | replay control |
+| `GET /api/inject/scenarios` · `POST /api/inject` | what-if scenarios |
+| `WS /ws/stream` | live `event` / `alert` / `cii` envelopes |
+
+`GET /api/events` takes `since` as an **event id, not a timestamp** —
+hundreds of events share one timestamp on a minute-bucketed capture day,
+so a time cursor silently loses rows. That mistake cost two separate
+rounds of debugging here; the constraint is documented on the route.
 
 ---
 
