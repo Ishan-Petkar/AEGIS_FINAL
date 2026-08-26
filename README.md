@@ -1,100 +1,234 @@
 # AEGIS: Anomalous Event Graph Intelligence System
 
-AEGIS is a cyber-physical risk analytics platform for a simulated smart city
-(municipal infrastructure + municipal financial systems). It combines
-unsupervised anomaly detection with graph-based cascading impact analysis to
-answer two questions: which telemetry events are anomalous, and if this
-asset is compromised, what else falls over.
+AEGIS is a cyber-physical risk analytics platform for a smart city —
+municipal infrastructure plus municipal financial systems. It answers two
+questions:
+
+1. **Detection** — which telemetry events are anomalous?
+2. **Blast radius** — if this asset is compromised, what else falls over?
+
+It runs on **real captured network traffic** (CIC-IDS2017, 3.2 GB across
+eight capture days), replayed in true chronological order. Nothing in the
+live path is synthetic.
+
+---
 
 ## Two consoles
 
-- **Research Console** (`src/aegis_demo.py`, Streamlit) — the complete,
-  working analytics engine: dataset selection, anomaly detection, the CII
-  blast-radius calculator, scripted attack injection, and the evaluation/
-  benchmark panel (honest precision/recall/F1/AUC and tripwire lead time
-  against real ground truth). This is what you get running today.
-- **Operations Console** (`backend/`, **Phase 5 — in progress**) — a live
-  operations view built on the same engine: real CIC-IDS2017 traffic
-  streamed in timestamp order, persisted to PostgreSQL, served through an
-  API. **This is not yet a running product.** As of this writing the
-  PostgreSQL schema, seeding, and a replay engine (real IP/timestamp
-  extraction, chronological pacing, batched emission) exist and are tested;
-  the FastAPI service, WebSocket streaming, the ingest pipeline that scores
-  and persists events, and the Next.js frontend have **not** been built yet.
-  See `PLAN_MASTER.md` §Phase 5 and `docs/PHASE5_STATE.md` for the current
-  ticket-by-ticket status.
+**Operations Console** (`backend/` + `frontend/`) — the live view. Real
+CIC-IDS2017 traffic replayed in timestamp order, scored by a pre-fitted
+model, persisted to PostgreSQL, streamed over a WebSocket, and rendered in
+a Next.js console: live telemetry feed, a 50-node city graph with animated
+blast-radius cascades, and an alerts panel with per-alert explanations.
 
-## Core capabilities
+**Research Console** (`src/aegis_demo.py`, Streamlit) — the analytics
+workbench: dataset selection, detector benchmarking, and the evaluation
+harness that produces the honest precision/recall/F1/AUC numbers quoted
+below.
 
-- **Unsupervised anomaly detection** — Isolation Forest (with Z-Score, MAD,
-  and One-Class SVM baselines) over network-flow, financial-transaction, or
-  ICS-sensor telemetry, no labeled training data required.
-- **Mandatory gateway topology** — every path to a high-criticality asset is
-  structurally rewritten to route through a Purdue-zone gateway node
-  (`src/graph_manager.py`); this is a hard chokepoint in the graph itself,
-  not a passive monitoring tap an attacker could bypass.
-- **Honeytoken tripwire detection** — a fake credential seeded in each
-  gateway zone (`src/deception/`); any use is unambiguous compromise by
-  construction, with zero false positives and a measured lead-time
-  advantage over volumetric detection (mean 58.4s across the four scripted
-  attack scenarios).
-- **Cascading Impact Index (CII)** — Monte Carlo simulation over a
-  hand-curated asset dependency graph, reporting a **distribution**
-  (median, p5, p95) of blast radius rather than a single point estimate.
-- **Honest evaluation** (`src/evaluation/`) — segment-wise recall / row-wise
-  precision for ICS time-series data (a deliberate, documented rejection of
-  the "point-adjust" metric, which can make random noise look like a
-  state-of-the-art detector), a guard that raises rather than silently
-  reports zeros on a degenerate train/test split, and lead-time measured
-  from real replayed attack timelines.
+Both run on the same engine. The Research Console is where you check the
+work; the Operations Console is where you watch it happen.
 
-## Quick start — Research Console
+---
+
+## What it does
+
+- **Three detection channels, reported side by side.** An unsupervised
+  Isolation Forest (novel-threat channel), a supervised RandomForest
+  (known-threat channel), and a honeytoken tripwire (deception channel).
+  Their real, measured strengths and limits are in §*Honest limitations*.
+- **Mandatory gateway topology** — every path to a high-criticality asset
+  is structurally rewritten to route through a Purdue-zone gateway node
+  (`src/graph_manager.py`). It is a chokepoint in the graph itself, not a
+  passive monitoring tap an attacker could route around.
+- **Honeytoken tripwire** — a credential seeded in each gateway zone with
+  zero legitimate use anywhere in the system. Any use is unambiguous
+  compromise by construction: no false positives are possible, and it
+  needs no training data. Its lead time over volumetric detection measures
+  **58.4 s mean** — see the qualification in §*Honest limitations*, because
+  that number is **not** measured on real capture traffic.
+- **Cascading Impact Index (CII)** — Monte Carlo simulation over a curated
+  50-node dependency graph, reporting a **distribution** (median, p5, p95),
+  not a point estimate. Scores are a *fraction of the city's criticality
+  mass*, so 0.22 reads as "about a fifth of the city falls over".
+- **Operator what-if injection** — `POST /api/inject` replays **real
+  labelled attack flows** from the capture (1,966 Bot, 128k DDoS, 159k
+  PortScan) re-targeted onto a chosen asset. Injected events are tagged
+  `batch_origin=injected` end to end and badged in the UI, so an operator
+  hypothesis can never be mistaken for observed telemetry.
+- **Honest evaluation** (`src/evaluation/`) — segment-wise recall with
+  row-wise precision for ICS time series (a deliberate rejection of the
+  "point-adjust" metric, which can make random noise look
+  state-of-the-art), and a guard that raises rather than silently
+  reporting zeros on a degenerate split.
+
+---
+
+## Honest limitations
+
+These are measured, reproducible, and deliberately published. A benchmark
+showing a detector's real limits is more credible than one showing only
+its wins.
+
+| Channel | Known threat | Novel threat | Training data |
+|---|---|---|---|
+| Unsupervised (Isolation Forest) | weak (**P ≈ 0.02**) | weak | benign baseline |
+| Supervised (RandomForest) | **strong (P ≈ 0.996)** | **zero** | labelled attacks |
+| Honeytoken tripwire | perfect | **perfect** | **none** |
+
+- **The unsupervised detector is weak on real traffic.** On real replayed
+  friday-morning data it produced **5 true positives against 811 false
+  positives**. Bot C2 beaconing is *smaller* than benign traffic (median 6
+  bytes vs 70), so an outlier detector over volume looks in the wrong
+  direction. Feature engineering made it worse, not better (AUC 0.67 →
+  0.21). Full write-up: `docs/DETECTION_STUDY.md`.
+- **Because of that, volumetric anomalies do not page an operator by
+  default.** They are still scored, persisted, and shown in the live feed —
+  the console reports how many it suppressed and why. A typical run shows
+  **265 suppressed against 1 alert raised**. The alert policy is visible,
+  not hidden.
+- **The supervised detector is blind to what it has not seen.** Honest
+  temporal-split evaluation: AUC 0.847, precision 0.996, recall 0.595. On a
+  novel attack family its precision is **0.000**. It is reported with those
+  numbers, never with same-distribution self-test figures.
+- **Real capture traffic does not intersect the modelled city.** Measured:
+  **0 of 20,000** real source IPs resolve to a dependency-graph asset —
+  CIC-IDS2017 hosts are `192.168.10.x`, the curated assets are `10.0.1.x`.
+  The graph therefore draws two honestly *disconnected* layers and says so
+  on screen, rather than inventing edges to make a cascade look connected.
+- **A CII median of 0.0 is common and truthful.** It means more than half
+  the Monte Carlo iterations propagated nothing — the right answer for a
+  weakly-coupled leaf. Read the p5–p95 interval, not just the median: an
+  asset can honestly report median 0.0 with p95 0.185.
+- **The 58.4 s tripwire lead time is measured on scripted attack
+  timelines, not on real capture traffic** (`src/evaluation/lead_time.py`).
+  That is a real constraint, not an evasion: a honeytoken is AEGIS's own
+  planted credential, so `is_honeytoken_use` is false on every row of a
+  2017 public capture by definition, and running the tripwire through the
+  ordinary precision/recall harness would trivially predict "normal" for
+  the entire dataset — a meaningless result rather than a poor one. Lead
+  time is the tripwire's own metric on its own two-stage recon-then-exfil
+  timeline. Read it as evidence about *when in an attack the deception
+  layer fires*, not as a detection rate on captured traffic.
+
+---
+
+## SDG alignment
+
+**SDG 9 — Industry, Innovation and Infrastructure.** Municipal
+infrastructure is increasingly cyber-physical, and its failures cascade:
+compromising a payment gateway can reach a bank interface and then a
+welfare disbursement system. AEGIS makes that dependency structure
+explicit and quantifies it, so resilience can be reasoned about before an
+incident rather than reconstructed after one. The Purdue-zone gateway
+model reflects how operational-technology networks are actually segmented.
+
+**SDG 11 — Sustainable Cities and Communities.** The assets modelled are
+the ones cities actually run: water treatment, power substations, traffic
+control, emergency dispatch, hospital networks, and the financial systems
+that pay for them. The blast-radius view is designed to answer a question
+a city operator genuinely has — *which of my services stop working, and in
+what order* — including the socially critical ones, which is why welfare
+disbursement sits in the dependency graph alongside the power grid.
+
+The honesty posture above is part of this claim, not separate from it.
+Infrastructure decisions made on an overstated detector are worse than
+decisions made with none.
+
+---
+
+## Quick start
+
+**Prerequisites:** Python 3.11–3.13, Node 20+, PostgreSQL 16.
 
 ```bash
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt -r requirements-backend.txt
+```
+
+Place the CIC-IDS2017 CSVs under `datasets/` (see `docs/DATASETS.md` — they
+are gitignored and must be obtained separately).
+
+### Operations Console
+
+```bash
+cp .env.example .env
+python -m backend.init_db
+python -m backend.warmup
+```
+
+`warmup` fits the streaming model **once**, at build time, and saves the
+artifact. The console deliberately refuses to fit a model on live stream
+data — that would let the baseline drift toward the attack.
+
+```bash
+PYTHONPATH=src uvicorn backend.main:app --host 127.0.0.1 --port 8000
+```
+
+```bash
+npm --prefix frontend install && npm --prefix frontend run dev
+```
+
+Open <http://localhost:3000>, then start a replay:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/replay/start -H 'Content-Type: application/json' -d '{"dataset":"friday-morning","speed":20.0}'
+```
+
+### Research Console
+
+```bash
 streamlit run src/aegis_demo.py
 ```
 
-Full instructions, including placing real datasets under `datasets/`:
-`docs/SETUP.md`. Evaluation harness usage and metric definitions:
-`docs/EVALUATION.md`.
+---
 
-## Quick start — Phase 5 backend (in progress)
+## Architecture
 
-The backend pieces that exist today can be exercised directly (schema init,
-seeding, connectivity check, and the replay engine's own test suite); there
-is no running API or UI yet.
-
-```bash
-pip install -r requirements-backend.txt
-cp .env.example .env               # local-dev-only defaults; see docs/SETUP.md
-python -m backend.init_db          # create tables + seed assets, idempotent
-python -m backend.db_check         # verify connectivity
+```
+CIC-IDS2017 CSVs
+      │  ReplayFlowReader — real IPs, corrected timestamps, chronological
+      ▼
+ReplayEngine ──► IngestPipeline ──► PostgreSQL
+  paced,           score · resolve      events · scores
+  batched          fuse · CII           alerts · cii_snapshots
+                        │
+                        └──► WS /ws/stream ──► Next.js console
+                                                feed │ graph │ alerts
 ```
 
-Full PostgreSQL setup (Homebrew install, role/database creation,
-configuration): `docs/SETUP.md` §5. Architecture, ticket breakdown, and
-design decisions: `PLAN_MASTER.md`.
+The detection and risk math are unchanged from the research phase — the
+operations layer packages the engine, it does not replace it.
+
+---
+
+## Tests
+
+```bash
+PYTHONPATH=src python -m pytest tests/ -q
+```
+
+**538 passed, 13 skipped.** Skips are real-dataset tests gated on
+`datasets/` being present, plus live-database tests gated on
+`AEGIS_TEST_LIVE_DB=1`.
+
+---
 
 ## Documentation
 
-- `PLAN_MASTER.md` — the authoritative plan: history, architecture
-  decisions, phase-by-phase build record, and the active Phase 5 sprint plan.
-- `docs/SETUP.md` — installation, including the PostgreSQL section for
-  Phase 5.
-- `docs/EVALUATION.md` — the evaluation protocol and how to reproduce
-  published metrics.
-- `docs/DATA_SCHEMA.md` — the canonical event schema and the Phase 5
-  PostgreSQL schema.
-- `docs/DEVELOPMENT.md` — how to add a dataset adapter, testing, linting,
-  and the conventions CI enforces.
-- `docs/DATASETS.md` — dataset sources and licences.
-- `docs/DESIGN.md` — the dark-theme design tokens the dashboard CSS
-  implements.
+| Doc | What it covers |
+|---|---|
+| `PLAN_MASTER.md` | authoritative plan, architecture decisions, phase history |
+| `docs/PHASE5_STATE.md` | ticket-by-ticket build record and known issues |
+| `docs/DETECTION_STUDY.md` | the detector measurements behind §*Honest limitations* |
+| `docs/SETUP.md` | installation, including PostgreSQL |
+| `docs/EVALUATION.md` | evaluation protocol and how to reproduce the metrics |
+| `docs/DATA_SCHEMA.md` | canonical event schema and the PostgreSQL schema |
+| `docs/DATASETS.md` | dataset sources and licences |
+| `docs/DESIGN_CONSOLE.md` | Operations Console design tokens |
+| `docs/DESIGN.md` | Research Console design tokens |
 
-Treat the code as authoritative where a doc disagrees with it — this project
-has gone through several phase migrations, and stale docs describing
-superseded designs are a known, actively-tracked failure mode here (see
-`PLAN_MASTER.md`'s own audit history). If you find another one, fix it.
+Treat the code as authoritative where a doc disagrees with it. This
+project has been through several phase migrations, and stale docs
+describing superseded designs are a known, actively-tracked failure mode
+here. If you find one, fix it.
