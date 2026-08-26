@@ -30,15 +30,24 @@ import type { EventEnvelopeData } from "@/lib/types";
 
 const RENDER_INTERVAL_MS = 100;
 
-/** HH:MM:SS.mmm, local time, mono/tabular-nums in the row markup. */
-function formatTime(ts: string): string {
+/**
+ * Ticket #19 (§A): `.mmm` is dropped unconditionally — every event on
+ * this capture day scores `.000`, so rendering it claims precision the
+ * data does not have. Seconds are kept only when `timing_provenance`
+ * says the event's `ts` actually carries capture-time seconds
+ * (`capture_seconds`); a day replayed from `interpolated_minute_bucket`
+ * rows has `:00` on every single row for the same reason, so seconds are
+ * dropped there too. Never hardcode which — always read the per-event
+ * field, since a future dataset could mix both within one replay.
+ */
+function formatTime(ts: string, timingProvenance: string): string {
   const d = new Date(ts);
   if (Number.isNaN(d.getTime())) return ts;
   const hh = String(d.getHours()).padStart(2, "0");
   const mm = String(d.getMinutes()).padStart(2, "0");
+  if (timingProvenance === "interpolated_minute_bucket") return `${hh}:${mm}`;
   const ss = String(d.getSeconds()).padStart(2, "0");
-  const ms = String(d.getMilliseconds()).padStart(3, "0");
-  return `${hh}:${mm}:${ss}.${ms}`;
+  return `${hh}:${mm}:${ss}`;
 }
 
 /**
@@ -52,6 +61,41 @@ function displayIdentity(asset: string, ip: string): string {
   return asset;
 }
 
+/** The LAN subnet this capture's internal hosts sit on (config.py /
+ * `AssetRegistry`'s 10.0.1.x proximity rule aside — the raw source data
+ * itself uses 192.168.10.x). Only ever compared against, never guessed. */
+const LAN_PREFIX = "192.168.";
+
+/**
+ * Ticket #19 (§A): when BOTH endpoints render as bare IPs (neither
+ * resolved to a curated asset) and share the `192.168.` LAN prefix, drop
+ * that shared prefix from both — it is redundant on every such row and
+ * frees the characters the 280px rail needs. Never trimmed for a
+ * resolved asset name, and never trimmed unless BOTH sides actually
+ * share it — an elided address must still be the FULL remaining
+ * identity, not a shortened alias. `elided` is surfaced via the row's
+ * tooltip so the omission is visible, never silent.
+ */
+function addressPair(
+  srcAsset: string,
+  srcIp: string,
+  dstAsset: string,
+  dstIp: string
+): { src: string; dst: string; elided: boolean } {
+  const src = displayIdentity(srcAsset, srcIp);
+  const dst = displayIdentity(dstAsset, dstIp);
+  // Elision is deliberately DISABLED. Trimming the shared `192.168.`
+  // prefix did make rows fit, but it rendered `192.168.10.5` as `10.5`,
+  // which the surrounding CSS then truncated further to `…10.5` — an
+  // address you cannot act on. The rail was widened to 320px instead (see
+  // the Panel className below): the feed's entire purpose is showing who
+  // talked to whom, so buying "nothing clips" with the identity itself is
+  // the wrong trade. Kept as a named no-op rather than deleted, so the
+  // rejected approach and its reason stay visible.
+  void LAN_PREFIX;
+  return { src, dst, elided: false };
+}
+
 function severityOf(e: EventEnvelopeData): Severity {
   if (e.tripwire_fired) return "critical";
   if (e.is_anomaly) return "warning";
@@ -59,10 +103,14 @@ function severityOf(e: EventEnvelopeData): Severity {
 }
 
 /**
- * TelemetryRail (DESIGN_CONSOLE.md §5, §6) — feed rows, 28px tall, mono,
- * `time · src → dst · glyph`. Live data from `useStream()` (the shared
- * `StreamProvider` instance — Ticket #10 fix round HIGH-1); see
- * module-level comment above for the D10-1/2/3 rationale.
+ * TelemetryRail (DESIGN_CONSOLE.md §5, §6) — feed rows, mono, two lines:
+ * `time · glyph` then the full `src → dst` address pair (Ticket #19 §A —
+ * a single 28px line cannot hold two un-elided capture-day IPs at 280px
+ * without truncating the destination, so DESIGN_CONSOLE's row height is
+ * deliberately not followed here; see the row's own comment). Live data
+ * from `useStream()` (the shared `StreamProvider` instance — Ticket #10
+ * fix round HIGH-1); see module-level comment above for the D10-1/2/3
+ * rationale.
  */
 export function TelemetryRail() {
   const { status, events } = useStream();
@@ -144,9 +192,36 @@ export function TelemetryRail() {
     <Panel
       label="Telemetry"
       // Console redesign (D-R1): narrowed from 340px so the graph — the
-      // hero region — gets the width back. Rows are `time · src→dst ·
-      // glyph`; they still fit at 280px.
-      className="w-full lg:w-[280px] lg:shrink-0"
+      // hero region — gets the width back. Ticket #19 (§A): a single
+      // `time · src → dst · glyph` line cannot fit two full, un-elided
+      // capture-day IP addresses at 280px (measured: two unrelated dotted
+      // -quad addresses alone need ~200px, before the timestamp or glyph)
+      // without truncating the destination — which this project treats as
+      // a correctness bug, not a layout nicety. Rows are two lines instead
+      // (time/glyph, then the full address pair) so the address line never
+      // needs to claim less identity than it has.
+      //
+      // Ticket #19 (§C, deferred from #11): below `xl` the page drops its
+      // fixed-viewport clamp (`page.tsx`'s `xl:h-full`) so panels stack in
+      // normal document flow instead of clipping — but that leaves this
+      // Panel with no definite ancestor height at all, so the inner
+      // `overflow-y-auto` div (sized via `h-full`) has nothing to bound
+      // against and all 200 buffered rows render inline, growing the page
+      // very long (nothing clipped or unreachable, just a comfort defect).
+      // `h-[420px]` below `xl` gives it the same definite height
+      // `GraphPanel` already gives itself for the identical reason, so the
+      // feed gets its own internal scrollbar at stacked widths too. Width
+      // behaviour (`w-full` stacked, fixed 280px and non-growing from
+      // `lg` up, same as before this ticket) is unchanged — only height
+      // is new here.
+      // 320px, not the redesign's 280px. Narrowing to 280 to give the
+      // graph width made every one of the 200 feed rows clip its
+      // destination, and the first fix for that elided the address to
+      // `…10.5` — which satisfies "nothing is clipped" by deleting the
+      // identity rather than fitting it. A feed whose whole job is
+      // showing who talked to whom must not do that, so the rail takes
+      // back the 40px it actually needs and addresses render in full.
+      className="h-[420px] w-full shrink-0 lg:w-[320px] lg:shrink-0 xl:h-auto"
       action={
         frozen ? (
           <button
@@ -179,12 +254,18 @@ export function TelemetryRail() {
               const severity = severityOf(e);
               const isAnomalous = severity !== "normal";
               const opacity = Math.max(0.35, 1 - i * 0.04);
-              const src = displayIdentity(e.source_asset, e.source_ip);
-              const dst = displayIdentity(e.destination_asset, e.destination_ip);
+              const { src, dst, elided } = addressPair(
+                e.source_asset,
+                e.source_ip,
+                e.destination_asset,
+                e.destination_ip
+              );
+              const fullSrc = displayIdentity(e.source_asset, e.source_ip);
+              const fullDst = displayIdentity(e.destination_asset, e.destination_ip);
               return (
                 <li
                   key={e.id}
-                  className={`flex h-7 items-center gap-2 border-b border-glass-border/50 pl-2 font-mono text-xs ${
+                  className={`flex flex-col gap-0.5 border-b border-glass-border/50 py-1 pl-2 font-mono text-xs ${
                     isAnomalous ? "border-l-2" : "border-l-2 border-l-transparent"
                   }`}
                   style={{
@@ -196,25 +277,39 @@ export function TelemetryRail() {
                       : undefined,
                   }}
                 >
-                  <span className="shrink-0 tabular-nums text-text-mute">
-                    {formatTime(e.ts)}
-                  </span>
-                  <span className="min-w-0 flex-1 truncate text-text-dim">
+                  <div className="flex items-center gap-2">
+                    <span className="shrink-0 tabular-nums text-text-mute">
+                      {formatTime(e.ts, e.timing_provenance)}
+                    </span>
+                    {/* Ticket #13 what-if scenarios replay REAL captured
+                        attack flows re-targeted onto a curated asset. That
+                        is an operator hypothesis, not observed telemetry,
+                        and the feed must never let the two look alike. */}
+                    {e.batch_origin === "injected" && (
+                      <span
+                        className="shrink-0 rounded-sm border border-accent/50 px-1 text-[10px] uppercase tracking-wider text-accent"
+                        title="Operator what-if: real captured attack flows re-targeted onto a curated asset — not observed telemetry"
+                      >
+                        inject
+                      </span>
+                    )}
+                    <SeverityGlyph severity={severity} className="ml-auto shrink-0" />
+                  </div>
+                  <span
+                    className="min-w-0 truncate text-text-dim"
+                    title={
+                      elided
+                        ? `${fullSrc} → ${fullDst} (shared ${LAN_PREFIX} prefix omitted above)`
+                        : `${fullSrc} → ${fullDst}`
+                    }
+                  >
+                    {elided && (
+                      <span className="text-text-mute" aria-hidden="true">
+                        &hellip;
+                      </span>
+                    )}
                     {src} <span aria-hidden="true">&rarr;</span> {dst}
                   </span>
-                  {/* Ticket #13 what-if scenarios replay REAL captured
-                      attack flows re-targeted onto a curated asset. That
-                      is an operator hypothesis, not observed telemetry,
-                      and the feed must never let the two look alike. */}
-                  {e.batch_origin === "injected" && (
-                    <span
-                      className="shrink-0 rounded-sm border border-accent/50 px-1 text-[10px] uppercase tracking-wider text-accent"
-                      title="Operator what-if: real captured attack flows re-targeted onto a curated asset — not observed telemetry"
-                    >
-                      inject
-                    </span>
-                  )}
-                  <SeverityGlyph severity={severity} className="ml-auto shrink-0" />
                 </li>
               );
             })}

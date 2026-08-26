@@ -260,6 +260,14 @@ export interface EventEnvelopeData {
   replay_session_id: string;
   batch_index: number;
   /**
+   * `"capture_seconds"` | `"interpolated_minute_bucket"` (backend/models.py
+   * `VALID_TIMING_PROVENANCE`) — Ticket #19 (§A): whether `ts` carries real
+   * capture-time seconds or was interpolated to a minute bucket. Drives how
+   * much of `ts` the feed is honest to render; never format `ts` without
+   * consulting this.
+   */
+  timing_provenance: string;
+  /**
    * `"replay"` for real captured telemetry, `"injected"` for a Ticket #13
    * operator what-if (real captured attack flows re-targeted onto a
    * curated asset). The feed MUST distinguish these — an injected

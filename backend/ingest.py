@@ -1031,6 +1031,14 @@ class IngestPipeline:
                         "confidence": float(confidence[i]),
                         "replay_session_id": str(meta.replay_session_id),
                         "batch_index": meta.batch_index,
+                        # Ticket #19 (§A): the live feed must not render
+                        # millisecond/second precision this capture day does
+                        # not have. `flow.timing_provenance` is the per-event
+                        # ground truth (`capture_seconds` vs
+                        # `interpolated_minute_bucket`, backend/models.py) —
+                        # the frontend uses it to decide how much of `ts` is
+                        # honest to display, instead of a hardcoded format.
+                        "timing_provenance": flow.timing_provenance,
                         # BATCH_ORIGIN_REPLAY | BATCH_ORIGIN_INJECTED.
                         # Additive, and load-bearing: Ticket #13 injects
                         # REAL captured attack flows re-targeted onto a

@@ -177,9 +177,15 @@ function ReplayProgress({
   const running = (hello?.running ?? false) || liveEmittedSinceHello > 0;
   const day = hello?.day ?? null;
 
+  // Ticket #19 (§E states/widths audit): was `md:flex` (768px) — measured
+  // the header's fixed-height single row overflowing horizontally at
+  // 860px (the `Inject` button's right edge landed off-screen,
+  // unreachable without a horizontal scroll the header never offers).
+  // `lg:flex` matches the breakpoint the `Suppressed` stat chip already
+  // uses for the identical reason (not enough row width below `lg`).
   if (!running && !day) {
     return (
-      <div className="hidden min-w-[160px] flex-col justify-center gap-1 md:flex" aria-live="off">
+      <div className="hidden min-w-[160px] flex-col justify-center gap-1 lg:flex" aria-live="off">
         <span className="text-[10px] uppercase tracking-[0.08em] text-text-dim">Replay</span>
         <span className="font-mono text-xs text-text-mute">idle — no session this connection</span>
       </div>
@@ -192,7 +198,7 @@ function ReplayProgress({
   const position = lastVirtualPosition ? formatVirtualTime(lastVirtualPosition) : null;
 
   return (
-    <div className="hidden min-w-[200px] flex-col justify-center gap-1 md:flex" aria-live="off">
+    <div className="hidden min-w-[200px] flex-col justify-center gap-1 lg:flex" aria-live="off">
       <div className="flex items-center justify-between gap-2 text-[10px] uppercase tracking-[0.08em] text-text-dim">
         <span>Replay {day ?? "—"}</span>
         <span className="font-mono normal-case tracking-normal text-text-mute">
