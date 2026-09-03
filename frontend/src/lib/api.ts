@@ -71,6 +71,27 @@ export class ApiNetworkError extends Error {
   }
 }
 
+/**
+ * Per-request ceiling, in milliseconds.
+ *
+ * Without this, a backend that accepts the TCP connection but never
+ * answers — a wedged worker, a suspended container, a network blackhole —
+ * leaves `fetch` pending forever. That is materially worse than the
+ * backend being *down*: a refused connection rejects immediately, so the
+ * panels render their "unavailable" state with a Retry button, whereas a
+ * hung one leaves every panel on "Loading…" indefinitely with no error
+ * and no retry affordance at all. Verified against this console by
+ * `SIGSTOP`ing the backend: 20s+ of spinner, no timeout, no way back
+ * except a manual page reload.
+ *
+ * 15s is deliberately well above the slowest legitimate call (`/api/cii`
+ * runs Monte Carlo server-side) and well below an operator's patience.
+ * A timeout surfaces as `ApiNetworkError`, the same type a refused
+ * connection produces, so every existing caller's error branch — and the
+ * Retry button it renders — works unchanged.
+ */
+const REQUEST_TIMEOUT_MS = 15_000;
+
 async function apiFetch<T>(
   path: string,
   init?: RequestInit
@@ -85,6 +106,10 @@ async function apiFetch<T>(
         ...init?.headers,
       },
       cache: "no-store",
+      // Declared after the `...init` spread so this key wins the literal;
+      // the `init?.signal ??` is what preserves a caller-supplied signal,
+      // making the timeout a default rather than an override.
+      signal: init?.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
   } catch (cause) {
     throw new ApiNetworkError(cause);

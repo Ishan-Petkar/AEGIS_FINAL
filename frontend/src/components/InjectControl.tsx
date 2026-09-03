@@ -153,11 +153,29 @@ export function InjectControl({ running }: { running: boolean }) {
         Inject
       </button>
 
+      {/*
+        The popover is deliberately NOT `.glass-panel`. It floats over the
+        Active Alerts column, and `.glass-panel`'s 4.5%-opacity `--glass` fill
+        is only legible thanks to the `backdrop-filter: blur(14px)` that is
+        meant to accompany it — a blur that does not survive the build.
+        Tailwind v4's Lightning CSS pass collapses the rule's
+        `backdrop-filter` / `-webkit-backdrop-filter` pair down to the
+        `-webkit-` form alone, and Chromium supports only the UNPREFIXED
+        property there (`CSS.supports('-webkit-backdrop-filter','blur(1px)')`
+        returns false), so the computed value is `none`. globals.css's
+        `@supports not (...)` opaque fallback cannot rescue it either: that
+        condition tests for standard support, which IS present. Net effect is
+        a ~4%-opaque panel with no blur, through which alert text reads
+        straight through. Every other `.glass-panel` sits over the flat
+        `--ground` page background where this is invisible; only this popover
+        overlaps real content, so it takes an opaque surface rather than
+        depending on an effect that never reaches the browser.
+      */}
       {open && (
         <div
           role="dialog"
           aria-label="Inject what-if scenario"
-          className="glass-panel absolute right-0 top-[calc(100%+8px)] z-50 w-72 rounded-[var(--radius-panel)] border border-glass-border p-3 shadow-lg"
+          className="absolute right-0 top-[calc(100%+8px)] z-50 w-72 rounded-[var(--radius-panel)] border border-glass-border bg-ground-raised p-3 shadow-lg"
         >
           <div className="mb-2 flex items-center justify-between">
             <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-text-dim">
