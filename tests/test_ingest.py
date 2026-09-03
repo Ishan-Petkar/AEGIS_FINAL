@@ -642,6 +642,45 @@ def test_alert_debounce_expires():
     assert result.alerts_created == 1
 
 
+def test_cii_envelope_still_broadcast_when_alert_is_debounce_suppressed():
+    """Regression guard: a debounced repeat compromise on the same asset
+    must not freeze the live graph's cascade view. Before this fix, the
+    cii envelope was only appended alongside a CREATED alert -- a second
+    tripwire hit inside alert_asset_debounce_sec computed (or reused) a
+    real blast radius but never pushed it to the WebSocket, so an
+    operator watching a sustained compromise would see the cascade
+    overlay stop updating after the first hit even though the
+    compromise, and its recorded blast radius, was ongoing."""
+    clock = {"t": 0.0}
+    broadcaster = CollectingBroadcaster()
+    pipeline, session = make_pipeline(
+        scorer=FakeScorer(anomaly_flags=[False]),
+        tripwire_signal=lambda f: True,
+        alert_asset_debounce_sec=60.0,
+        clock=lambda: clock["t"],
+        broadcaster=broadcaster,
+    )
+    first = pipeline([make_flow("f:1")], make_meta(1))
+    clock["t"] = 5.0  # well inside the 60s debounce window
+    second = pipeline([make_flow("f:2")], make_meta(2))
+
+    assert first.alerts_created == 1
+    assert second.alerts_created == 0
+    assert second.alerts_suppressed == 1  # confirms this really was suppressed, not skipped
+    # The second batch is a genuine CII cache HIT too (cii_debounce_sec's
+    # own default, 30s, also hasn't elapsed) -- proving the fix covers
+    # both debounce paths, not just the alert one. See the companion fix
+    # in _cii_for: a cache hit used to return cii_result=None, which
+    # would have silently starved this exact envelope regardless of the
+    # alert-suppression fix above.
+    assert second.cii_reused == 1
+    assert second.cii_computed == 0
+
+    cii_envelopes = broadcaster.of_type(ENVELOPE_CII)
+    assert len(cii_envelopes) == 2  # one per batch, including the suppressed one
+    assert all(e["data"]["origin_asset"] == "City_Payment_Gateway" for e in cii_envelopes)
+
+
 def test_alert_debounce_zero_disables_dedup():
     pipeline, session = make_pipeline(
         scorer=FakeScorer(anomaly_flags=[False] * 3),

@@ -1094,6 +1094,22 @@ class IngestPipeline:
             )
 
             if is_anomaly[i]:
+                # Broadcast the cii envelope BEFORE the alert-suppression
+                # check, not after -- this channel already genuinely fired.
+                # Previously this envelope was appended only alongside a
+                # created alert, so a debounced repeat compromise (same
+                # asset, inside alert_asset_debounce_sec) computed a fresh
+                # blast radius -- a real Monte Carlo re-run against the
+                # current graph state -- but never pushed it to the live
+                # view: the graph sat showing the FIRST hit's cascade while
+                # every later hit silently updated only Postgres. An
+                # operator watching a sustained compromise would see the
+                # CII overlay freeze the moment the debounce window opened,
+                # which reads as "the blast radius stopped growing" when it
+                # did not. Mirrors the comment above (computation was never
+                # gated on alerting) now honoured for the broadcast too.
+                self._publish_cii_envelope(cii_outcome, cii_result, snapshot_id, origin_asset, event_id)
+
                 should_alert, suppressed_reason = self._alert_decision(
                     scored_flow, is_tripwire, origin_asset
                 )
@@ -1110,6 +1126,23 @@ class IngestPipeline:
                 )
             else:
                 # hybrid_candidate is True here by the loop guard above.
+                # UNLIKE the is_anomaly[i] branch above, the cii envelope
+                # here is broadcast only once _hybrid_alert_decision
+                # actually approves an alert (below), not unconditionally.
+                # This is deliberate, not an inconsistency: an
+                # is_anomaly[i] flow already came from a channel (tripwire
+                # or volumetric) that genuinely fired -- suppression there
+                # is purely a "don't page anyone" policy choice, so the
+                # cascade is real and worth showing regardless. A
+                # hybrid_candidate flow, by contrast, is one NEITHER
+                # existing channel flagged; its only signal is the hybrid
+                # layer's own fused opinion, which is explicitly
+                # observable-not-authoritative while hybrid_gates_alerts
+                # defaults False (see that setting's docstring). Lighting
+                # up the graph's cascade overlay for a flow with no
+                # corresponding alert to explain it would contradict that
+                # posture -- an operator would see "CII cascade from X"
+                # with nothing in the alerts panel accounting for it.
                 should_alert, hybrid_reason = self._hybrid_alert_decision(
                     fused_decisions[i], origin_asset
                 )
@@ -1124,6 +1157,7 @@ class IngestPipeline:
                     session, fused_decisions[i], origin_asset, snapshot_id
                 )
                 alert_outcome.hybrid_gated += 1
+                self._publish_cii_envelope(cii_outcome, cii_result, snapshot_id, origin_asset, event_id)
 
             alert_outcome.created += 1
             alert_outcome.envelopes.append(
@@ -1142,22 +1176,42 @@ class IngestPipeline:
                     },
                 }
             )
-            if cii_result is not None and snapshot_id is not None:
-                cii_outcome.envelopes.append(
-                    {
-                        "type": ENVELOPE_CII,
-                        "data": {
-                            "snapshot_id": snapshot_id,
-                            "origin_asset": origin_asset,
-                            "cii_median": float(cii_result.cii_median),
-                            "cii_p5": float(cii_result.cii_p5),
-                            "cii_p95": float(cii_result.cii_p95),
-                            "impacted": _jsonable(list(cii_result.impacted_assets)),
-                            "trigger_event_id": event_id,
-                        },
-                    }
-                )
         return cii_outcome, alert_outcome
+
+    @staticmethod
+    def _publish_cii_envelope(
+        cii_outcome: "_CiiOutcome",
+        cii_result: Optional[CIIResult],
+        snapshot_id: Optional[int],
+        origin_asset: str,
+        event_id: int,
+    ) -> None:
+        """Append a `cii` WebSocket envelope for an already-computed
+        snapshot, if there's one to publish.
+
+        Split out purely to avoid writing this dict literal twice in
+        `_handle_anomalies` (its two call sites publish at different
+        points relative to alert creation -- see the comments at each
+        call site for why that timing differs). No side effect on the
+        database; `cii_outcome`'s DB persistence already happened inside
+        `_cii_for()`, before either call site runs.
+        """
+        if cii_result is None or snapshot_id is None:
+            return
+        cii_outcome.envelopes.append(
+            {
+                "type": ENVELOPE_CII,
+                "data": {
+                    "snapshot_id": snapshot_id,
+                    "origin_asset": origin_asset,
+                    "cii_median": float(cii_result.cii_median),
+                    "cii_p5": float(cii_result.cii_p5),
+                    "cii_p95": float(cii_result.cii_p95),
+                    "impacted": _jsonable(list(cii_result.impacted_assets)),
+                    "trigger_event_id": event_id,
+                },
+            }
+        )
 
     def _alert_decision(
         self, scored_flow: ScoredFlow, is_tripwire: bool, origin_asset: str
@@ -1226,11 +1280,21 @@ class IngestPipeline:
         """Compute (or reuse) the blast radius for `origin_asset`.
 
         Debounced per origin asset by `cii_debounce_sec`. Within the
-        window the cached `CIIResult` and its snapshot id are reused, so
-        the alert still carries a blast radius -- only the Monte Carlo
-        recomputation is skipped, never the linkage. That distinction
-        matters: skipping the linkage would leave alerts with no blast
-        radius, which is the one thing the alerts panel exists to show.
+        window the cached `CIIResult` and its snapshot id are BOTH
+        reused (the docstring here used to describe this correctly while
+        the code beneath it returned `None` for the result on a cache
+        hit -- a real doc/code mismatch, fixed alongside the CII
+        broadcast-on-suppression fix, since both bugs meant the same
+        thing in practice: a live compromise updating the graph less
+        often than it was actually being detected). Only the Monte Carlo
+        recomputation is skipped, never the linkage or the result
+        itself -- skipping the linkage would leave alerts with no blast
+        radius, which is the one thing the alerts panel exists to show,
+        and skipping the result silently starved
+        `_publish_cii_envelope` on every cache-hit batch, which is
+        MOST batches during a sustained attack once `cii_debounce_sec`
+        (default 30s) is comfortably longer than the replay's batch
+        interval.
         """
         # An asset that is not a node in the dependency graph has no edges
         # to propagate along, so compute_cascading_impact_full() returns an
@@ -1252,7 +1316,7 @@ class IngestPipeline:
         if entry is not None and (now - entry.computed_at) < self._cii_debounce_sec:
             self._cii_cache.move_to_end(origin_asset)
             outcome.reused += 1
-            return entry.snapshot_id, None
+            return entry.snapshot_id, entry.result
 
         result = compute_cascading_impact_full(
             anomalous_asset_name=origin_asset,

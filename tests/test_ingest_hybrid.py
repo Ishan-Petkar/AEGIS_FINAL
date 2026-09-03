@@ -30,6 +30,7 @@ from backend.detection.fusion import HybridFusionEngine
 from backend.detection.signature import SignatureEngine
 from backend.ingest import (
     DETECTOR_VOLUMETRIC,
+    ENVELOPE_CII,
     ENVELOPE_EVENT,
     SEVERITY_WARNING,
     TITLE_HYBRID,
@@ -252,6 +253,44 @@ def test_hybrid_candidate_precheck_skips_cii_for_an_ordinary_quiet_flow():
 # ---------------------------------------------------------------------------
 # Broadcast envelope: additive `hybrid` key
 # ---------------------------------------------------------------------------
+
+
+def test_hybrid_only_alert_gates_the_cii_broadcast_too():
+    """UNLIKE the existing tripwire/volumetric channel (see
+    tests/test_ingest.py::
+    test_cii_envelope_still_broadcast_when_alert_is_debounce_suppressed,
+    which broadcasts cii regardless of alert suppression), a
+    hybrid-candidate flow with hybrid_gates_alerts left at its default
+    (False) must NOT broadcast a cii envelope either -- there is no
+    existing-channel signal behind it, only the hybrid layer's own
+    fused opinion, which is explicitly observable-not-authoritative
+    while this setting is off. Lighting up the graph's cascade overlay
+    with nothing in the alerts panel to explain it would contradict
+    that posture."""
+    from backend.ingest import CollectingBroadcaster
+
+    broadcaster = CollectingBroadcaster()
+    pipeline, session = _escalating_pipeline(broadcaster=broadcaster)  # hybrid_gates_alerts default False
+    result = pipeline([make_flow("f:1")], make_meta())
+    assert result.alerts_created == 0
+    assert broadcaster.of_type(ENVELOPE_CII) == []
+
+
+def test_hybrid_gated_alert_does_broadcast_its_cii_envelope():
+    """Companion to the test above: once hybrid_gates_alerts=True and the
+    hybrid layer's own decision actually creates an alert, its cii
+    envelope IS broadcast -- there is now a real alert in the panel to
+    account for the cascade shown."""
+    from backend.ingest import CollectingBroadcaster
+
+    broadcaster = CollectingBroadcaster()
+    pipeline, session = _escalating_pipeline(hybrid_gates_alerts=True, broadcaster=broadcaster)
+    result = pipeline([make_flow("f:1")], make_meta())
+    assert result.alerts_created == 1
+    assert result.hybrid_gated_alerts == 1
+    cii_envelopes = broadcaster.of_type(ENVELOPE_CII)
+    assert len(cii_envelopes) == 1
+    assert cii_envelopes[0]["data"]["origin_asset"] == "City_Payment_Gateway"
 
 
 def test_broadcast_envelope_carries_hybrid_summary_when_enabled():
