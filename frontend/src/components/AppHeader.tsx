@@ -1,11 +1,16 @@
 "use client";
 
+import { useState } from "react";
 import { ConnectionState } from "./ConnectionState";
 import { StreamState } from "./StreamState";
 import { StatChip } from "./StatChip";
+import { InjectControl } from "./InjectControl";
+import { ApiError, ApiNetworkError, setReplaySpeed } from "@/lib/api";
 import { useConnection } from "@/lib/connection-context";
 import { useStream } from "@/lib/stream-context";
 import type { HelloEnvelopeData } from "@/lib/types";
+
+const SPEED_OPTIONS = [1, 5, 20, 60] as const;
 
 /**
  * `RISK` chip tooltip (D16-1) — the number in a header labelled RISK
@@ -53,13 +58,30 @@ const ALERTS_CHIP_TOOLTIP =
  * (decision D16-2) — the Events/s chip below stays sourced from
  * `useStream()`, the one authoritative source for that figure.
  *
- * Speed control and inject stay disabled per PHASE5_TICKET3_PLAN §1
- * (out of scope: Ticket #13).
+ * Speed control and Inject (Phase A improvement pass, roadmap "Wire the
+ * Speed and Inject controls") both call the real backend now — the speed
+ * `<select>` below calls `POST /api/replay/speed` directly; `Inject` opens
+ * `InjectControl`, a popover backed by `GET /api/inject/scenarios` and
+ * `POST /api/inject`. Both were previously permanently `disabled` per
+ * PHASE5_TICKET3_PLAN §1 (Ticket #13 was out of scope at the time).
  */
 export function AppHeader() {
-  const { status: streamStatus, eventsPerSecond, alertCount, hello, liveEmittedSinceHello, lastVirtualPosition } =
-    useStream();
+  const {
+    status: streamStatus,
+    eventsPerSecond,
+    alertCount,
+    hello,
+    liveEmittedSinceHello,
+    lastVirtualPosition,
+    forceReconnect,
+  } = useStream();
   const { stats } = useConnection();
+
+  // Same "is a session live" derivation `ReplayProgress` already uses
+  // below — `hello.running` is a one-time snapshot from connect/reconnect,
+  // so a session started after that snapshot is detected via real traffic
+  // instead (`liveEmittedSinceHello > 0`), never fabricated or polled.
+  const running = (hello?.running ?? false) || liveEmittedSinceHello > 0;
 
   const riskIndex = stats?.risk_index ?? null;
   const riskTone =
@@ -77,6 +99,7 @@ export function AppHeader() {
         </span>
         <ConnectionState />
         <StreamState status={streamStatus} />
+        <RestartStreamButton forceReconnect={forceReconnect} />
       </div>
 
       <div className="flex items-center gap-6">
@@ -106,32 +129,140 @@ export function AppHeader() {
       <ReplayProgress hello={hello} liveEmittedSinceHello={liveEmittedSinceHello} lastVirtualPosition={lastVirtualPosition} />
 
       <div className="ml-auto flex items-center gap-3">
-        <label className="flex items-center gap-2 text-[11px] uppercase tracking-[0.08em] text-text-dim">
-          Speed
-          <select
-            disabled
-            defaultValue="1"
-            aria-label="Replay speed (not yet wired — Ticket #4/#12)"
-            title="Replay speed control lands with the WebSocket stream (Ticket #4/#12)"
-            className="rounded-[var(--radius-dense)] border border-glass-border bg-transparent px-2 py-1 font-mono text-xs text-text-mute disabled:cursor-not-allowed"
-          >
-            <option value="1">1x</option>
-            <option value="5">5x</option>
-            <option value="20">20x</option>
-          </select>
-        </label>
-
-        <button
-          type="button"
-          disabled
-          aria-label="Inject attack scenario (not yet wired — Ticket #13)"
-          title="Injection control lands in Ticket #13"
-          className="rounded-[var(--radius-panel)] border border-glass-border px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.08em] text-text-mute disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          Inject
-        </button>
+        <SpeedControl currentSpeed={hello?.speed ?? null} running={running} />
+        <InjectControl running={running} />
       </div>
     </header>
+  );
+}
+
+/**
+ * RestartStreamButton — forces a fresh WS /ws/stream connection on demand.
+ * The normal reconnect path (exponential backoff, `useEventStream.ts`)
+ * already recovers from a real drop on its own; this exists for the case
+ * where the socket LOOKS connected but the feed has gone quiet for reasons
+ * a client can't diagnose (a wedged proxy, a backend that stopped
+ * broadcasting without closing the socket, etc.) — an operator's own "did
+ * you try turning it off and on again" escape hatch, not a substitute for
+ * the automatic recovery. `forceReconnect()` resets backoff to its initial
+ * value and reconnects immediately rather than waiting out whatever delay
+ * a real drop might currently have queued, and any events missed during
+ * the gap are backfilled the same way a real reconnect already backfills
+ * them (`GET /api/events?since=`, see useEventStream.ts).
+ *
+ * Disabled for a moment after each click — a debounce against spamming
+ * reconnects, not a network call, so no error path is needed for it.
+ */
+function RestartStreamButton({ forceReconnect }: { forceReconnect: () => void }) {
+  const [justClicked, setJustClicked] = useState(false);
+
+  function handleClick() {
+    forceReconnect();
+    setJustClicked(true);
+    setTimeout(() => setJustClicked(false), 1200);
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={handleClick}
+      disabled={justClicked}
+      aria-label="Restart the live event stream"
+      title="Force a fresh connection to the live stream -- use this if the feed looks stuck. Anything missed is backfilled automatically."
+      className="flex h-5 w-5 shrink-0 items-center justify-center rounded-[var(--radius-dense)] text-text-dim transition-colors hover:text-accent focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      <span
+        className={`inline-block text-sm leading-none ${justClicked ? "animate-spin" : ""}`}
+        aria-hidden="true"
+      >
+        ↻
+      </span>
+    </button>
+  );
+}
+
+type SpeedSubmitState =
+  | { kind: "idle" }
+  | { kind: "pending" }
+  | { kind: "error"; message: string };
+
+/**
+ * SpeedControl — calls `POST /api/replay/speed` on change. `currentSpeed`
+ * seeds the select from the last-known server state (`hello.speed`, a
+ * one-time snapshot from connect/reconnect — see `ReplayProgress`'s
+ * docstring on why there is no periodic status re-broadcast to read
+ * instead); once an operator changes it here, the local selection is the
+ * source of truth until the next reconnect, since `POST /api/replay/speed`
+ * returns the new authoritative value directly.
+ */
+function SpeedControl({ currentSpeed, running }: { currentSpeed: number | null; running: boolean }) {
+  const [speed, setSpeed] = useState<number>(currentSpeed ?? 20);
+  // Tracks the last `currentSpeed` value this component has already
+  // reacted to, so the render-time adjustment below fires only when the
+  // prop genuinely changes (e.g. a fresh `hello` on reconnect) — never on
+  // every re-render, and never re-applying a stale snapshot over an
+  // operator's own in-between manual choice. This is React's documented
+  // "adjusting state when a prop changes" pattern (react.dev/learn/
+  // you-might-not-need-an-effect) — no `useEffect` needed, and calling
+  // `setState` here (during render, not inside an effect) is explicitly
+  // supported: React re-renders immediately with the corrected state
+  // before committing anything to the screen.
+  const [lastSeenSpeed, setLastSeenSpeed] = useState<number | null>(currentSpeed);
+  const [submit, setSubmit] = useState<SpeedSubmitState>({ kind: "idle" });
+
+  if (currentSpeed !== lastSeenSpeed) {
+    setLastSeenSpeed(currentSpeed);
+    if (currentSpeed !== null && submit.kind === "idle") setSpeed(currentSpeed);
+  }
+
+  async function handleChange(next: number) {
+    const prior = speed;
+    setSpeed(next);
+    setSubmit({ kind: "pending" });
+    try {
+      const res = await setReplaySpeed(next);
+      setSpeed(res.speed ?? next);
+      setSubmit({ kind: "idle" });
+    } catch (err) {
+      setSpeed(prior);
+      const message =
+        err instanceof ApiNetworkError
+          ? "Could not reach the backend — speed unchanged."
+          : err instanceof ApiError
+            ? err.status === 409
+              ? "No replay running — start replay before changing speed."
+              : err.status === 401
+                ? "Unauthorized — this backend requires an API token (set NEXT_PUBLIC_API_TOKEN)."
+                : err.status === 429
+                  ? "Rate limited — too many requests in a short window."
+                  : `Speed change failed (HTTP ${err.status}): ${err.message}`
+            : "Unknown error changing speed.";
+      setSubmit({ kind: "error", message });
+    }
+  }
+
+  return (
+    <label
+      className="flex items-center gap-2 text-[11px] uppercase tracking-[0.08em] text-text-dim"
+      title={submit.kind === "error" ? submit.message : running ? "Change live replay speed" : "Replay is not running — changes will 409 until one starts"}
+    >
+      Speed
+      <select
+        value={speed}
+        onChange={(e) => handleChange(Number(e.target.value))}
+        disabled={submit.kind === "pending"}
+        aria-label="Replay speed multiplier"
+        className={`rounded-[var(--radius-dense)] border px-2 py-1 font-mono text-xs disabled:cursor-not-allowed disabled:opacity-60 ${
+          submit.kind === "error" ? "border-sev-critical text-sev-critical" : "border-glass-border text-text"
+        }`}
+      >
+        {SPEED_OPTIONS.map((v) => (
+          <option key={v} value={v}>
+            {v}x
+          </option>
+        ))}
+      </select>
+    </label>
   );
 }
 

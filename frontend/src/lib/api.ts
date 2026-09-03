@@ -16,13 +16,30 @@ import type {
   AlertOut,
   AlertsResponse,
   CiiResponse,
+  EventsResponse,
   HealthResponse,
+  InjectRequest,
+  InjectResponse,
+  ReplayStatusResponse,
+  ScenariosResponse,
   StatsResponse,
   TopologyResponse,
 } from "./types";
 
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+
+/**
+ * Phase B improvement pass: sent as `Authorization: Bearer <token>` on
+ * every request when set — a no-op header the backend ignores while
+ * `AEGIS_API_TOKEN` is unset there too (see that setting's docstring in
+ * `backend/config.py`). Read honestly: this is a build-time env var
+ * baked into the shipped JS bundle, not a runtime secret — anyone who
+ * opens devtools on this page can read it. It stops an unrelated page or
+ * opportunistic scanner from finding an open control surface; it is not
+ * a defense against someone reading this bundle.
+ */
+const API_TOKEN = process.env.NEXT_PUBLIC_API_TOKEN;
 
 /**
  * Thrown for any non-2xx response. `status` is the HTTP status code so
@@ -64,6 +81,7 @@ async function apiFetch<T>(
       ...init,
       headers: {
         Accept: "application/json",
+        ...(API_TOKEN ? { Authorization: `Bearer ${API_TOKEN}` } : {}),
         ...init?.headers,
       },
       cache: "no-store",
@@ -96,6 +114,26 @@ export function getHealth(): Promise<HealthResponse> {
 /** GET /api/topology */
 export function getTopology(): Promise<TopologyResponse> {
   return apiFetch<TopologyResponse>("/api/topology");
+}
+
+/**
+ * GET /api/events?since=&limit= — `since` is an EVENT ID, never a
+ * timestamp (see `EventsResponse`'s docstring in `./types`; two separate
+ * HIGH-severity backend bugs came from treating it as one). Omitting
+ * `since` returns the newest `limit` events; supplying it returns
+ * everything after that id, oldest-first, gapless by construction. Used
+ * by `useEventStream`'s reconnect handler to backfill events missed
+ * during a disconnect (Phase A improvement pass).
+ */
+export function getEvents(params?: {
+  since?: number;
+  limit?: number;
+}): Promise<EventsResponse> {
+  const search = new URLSearchParams();
+  if (params?.since !== undefined) search.set("since", String(params.since));
+  if (params?.limit !== undefined) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return apiFetch<EventsResponse>(`/api/events${qs ? `?${qs}` : ""}`);
 }
 
 /**
@@ -150,6 +188,43 @@ export function getCii(asset: string, anomalyScore?: number): Promise<CiiRespons
  */
 export function getStats(): Promise<StatsResponse> {
   return apiFetch<StatsResponse>("/api/stats");
+}
+
+/**
+ * POST /api/replay/speed — change the live replay pace. 409 (surfaced as
+ * `ApiError` with `status === 409`) when no replay is currently running;
+ * callers must not treat that as a generic failure — see
+ * `AppHeader`'s speed control for how it's rendered.
+ */
+export function setReplaySpeed(multiplier: number): Promise<ReplayStatusResponse> {
+  return apiFetch<ReplayStatusResponse>("/api/replay/speed", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ multiplier }),
+  });
+}
+
+/**
+ * GET /api/inject/scenarios (Ticket #13) — the real-attack scenario
+ * registry, so the UI lists scenarios rather than hardcoding them.
+ */
+export function getInjectScenarios(): Promise<ScenariosResponse> {
+  return apiFetch<ScenariosResponse>("/api/inject/scenarios");
+}
+
+/**
+ * POST /api/inject (Ticket #13) — replay REAL captured attack flows,
+ * re-targeted at an operator-chosen curated asset. 409 when no replay is
+ * running (the backend refuses to silently queue flows a stopped engine
+ * would wipe on the next start); 422 for an unknown scenario or a
+ * `target_asset` that isn't a curated asset with a real static IP.
+ */
+export function injectScenario(body: InjectRequest): Promise<InjectResponse> {
+  return apiFetch<InjectResponse>("/api/inject", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 }
 
 export { API_BASE_URL };

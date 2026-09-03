@@ -79,6 +79,16 @@ Two discoveries that change the design:
 
 **(1) Monday has genuine second-level precision.** Verified against 300,000 rows: **all 60 distinct second values present, near-uniformly distributed** (`05`×6203, `07`×6125, `04`×6111…). Rounded or synthetic data would show a handful of values. This is real capture timing. Monday is also the all-benign baseline day — exactly what the landing experience and the model warmup want.
 
+> **2026-09-02 note:** this recon recommended Monday for the *landing/demo*
+> day specifically; the implementation that shipped (`docs/PHASE5_STATE.md`,
+> `BACKEND_SETTINGS.replay_default_dataset_day`) uses Monday for model
+> **warmup** but `friday-morning` as the default **landing replay** day —
+> a deliberate reversal (friday-morning's attack content makes for a more
+> interesting default demo than an all-benign day) that was never recorded
+> as a revision to this recommendation until now. Flagged by an external
+> audit as an undocumented doc/implementation divergence; recorded here so
+> it stops looking like an oversight.
+
 **(2) Every file uses a 12-hour clock with no AM/PM marker.** No file reports an hour above 12; afternoon captures show 1–5. **A naive chronological sort is therefore wrong** — `1:00` (13:00) would sort before `8:59` (08:59). This must be corrected or Invariant E's "timestamp order" is silently violated.
 
 The correction is deterministic and documentable: hours **1–7 → PM (+12)**, hours **8–12 → AM**, justified by these being known working-hours captures (~08:00–17:00) with morning/afternoon split declared in the filenames. This *recovers* information the CSV encoded lossily; it does not invent any.

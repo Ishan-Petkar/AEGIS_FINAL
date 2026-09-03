@@ -97,6 +97,7 @@ from backend.replay_reader import ReplayFlow
 from backend.retention import prune_events
 from backend.seed import compute_seed_rows
 from backend.streaming import ScoredFlow, StreamingScorer, fuse_tripwire_confidence
+from backend.supervised_detector import SupervisedFlowScorer, SupervisedScoredFlow
 from cii_calculator import CIIResult, compute_cascading_impact_full
 from datasets.asset_registry import AssetRegistry
 from datasets.schema import SIGNAL_NETWORK_FLOW
@@ -116,6 +117,16 @@ DETECTOR_VOLUMETRIC = "isolation_forest"
 
 #: `event_scores.detector` value for the deception channel.
 DETECTOR_TRIPWIRE = "tripwire"
+
+#: `event_scores.detector` value for the KNOWN-THREAT channel (Phase B
+#: improvement pass) — deliberately NOT the same string as
+#: `backend.supervised_detector.DETECTOR_NAME` ("supervised_flow", the
+#: key in that module's own `BACKEND_DETECTORS` dict, a different
+#: namespace). "random_forest" names the actual algorithm, matching how
+#: `DETECTOR_VOLUMETRIC` names "isolation_forest" rather than a role
+#: label — readable directly in a raw `event_scores` row without cross-
+#: referencing another module's registry.
+DETECTOR_SUPERVISED = "random_forest"
 
 #: WebSocket envelope types (docs/PHASE5_BUILD_PLAN.md section 7). Ticket
 #: #9 owns the transport; this module owns the payloads it carries.
@@ -389,6 +400,17 @@ class IngestPipeline:
     broadcaster:
         Where typed envelopes go. Defaults to `NullBroadcaster` so the
         pipeline runs end-to-end before Ticket #9 lands.
+    supervised_scorer:
+        Optional fitted `SupervisedFlowScorer` (Phase B improvement pass)
+        — the KNOWN-THREAT channel. Unlike `scorer`, `None` is a fully
+        supported, common state (no artifact built yet): every event
+        still gets a volumetric + tripwire verdict exactly as before this
+        parameter existed; a `detector="random_forest"` row is simply
+        never written to `event_scores` for that event. Purely additive
+        and purely informational — it does NOT participate in
+        `fuse_tripwire_confidence()` or the alert/suppression policy, so
+        wiring it can never change `is_anomaly`, `alerts_created`, or any
+        other already-measured/published statistic.
     registry:
         Identifier -> asset resolver. Defaults to a fresh `AssetRegistry`.
         Pass a shared instance to keep auto-discovered assets consistent
@@ -416,6 +438,7 @@ class IngestPipeline:
         self,
         scorer: StreamingScorer,
         broadcaster: Optional[Broadcaster] = None,
+        supervised_scorer: Optional[SupervisedFlowScorer] = None,
         registry: Optional[AssetRegistry] = None,
         criticality_map: Optional[dict[str, float]] = None,
         tripwire_signal: Optional[Callable[[ReplayFlow], bool]] = None,
@@ -432,6 +455,7 @@ class IngestPipeline:
             raise ValueError("IngestPipeline requires a fitted StreamingScorer")
 
         self._scorer = scorer
+        self._supervised_scorer = supervised_scorer
         self._broadcaster: Broadcaster = broadcaster or NullBroadcaster()
         # from_config(), NOT AssetRegistry(): the bare constructor builds an
         # EMPTY registry, so every curated smart-city IP would fall through
@@ -513,6 +537,15 @@ class IngestPipeline:
         tripwire_fired = self._tripwire_flags(flows)
         volume_fired = np.array([s.is_anomaly for s in scored], dtype=bool)
         is_anomaly, confidence = fuse_tripwire_confidence(volume_fired, tripwire_fired)
+        # Phase B improvement pass: the KNOWN-THREAT channel, purely
+        # additive — never folded into `is_anomaly`/`confidence` above,
+        # so its presence can never change the alert/suppression policy
+        # or any already-published statistic derived from it.
+        supervised_scored = (
+            self._supervised_scorer.score_batch(flows)
+            if self._supervised_scorer is not None
+            else None
+        )
 
         # ---- 4. resolve identities ------------------------------------
         resolutions = [
@@ -529,7 +562,8 @@ class IngestPipeline:
                 session, flows, resolutions, meta
             )
             self._persist_scores(
-                session, scored, inserted_ids, tripwire_fired, is_anomaly, confidence
+                session, scored, inserted_ids, tripwire_fired, is_anomaly, confidence,
+                supervised_scored=supervised_scored,
             )
             cii_outcomes, alert_outcomes = self._handle_anomalies(
                 session, scored, inserted_ids, resolutions, tripwire_fired, is_anomaly
@@ -676,15 +710,25 @@ class IngestPipeline:
         tripwire_fired: np.ndarray,
         is_anomaly: np.ndarray,
         confidence: np.ndarray,
+        supervised_scored: Optional[Sequence[SupervisedScoredFlow]] = None,
     ) -> None:
         """Insert one volumetric score row per event, plus a tripwire row
-        only where the tripwire actually fired.
+        only where the tripwire actually fired, plus (Phase B improvement
+        pass) one KNOWN-THREAT row per event when `supervised_scored` is
+        supplied (i.e. `AppRuntime.supervised_scorer` loaded successfully).
 
         A tripwire row for every event would double `event_scores` volume
         to record "no honeytoken was touched", which is the default state
         of every ordinary flow and carries no information. Where it DID
         fire, the row is written so an operator can see the deception
         channel's verdict alongside the volumetric one.
+
+        `supervised_scored[i]`'s own `confidence` is that channel's own
+        `calibrated_score` (a native `P(attack)`), NOT the fused
+        `confidence[i]` the volumetric/tripwire rows use — this channel
+        was never part of that fusion (see `ingest_batch`'s comment) and
+        must not borrow a confidence value that reflects a different
+        detector's verdict.
         """
         rows: list[dict[str, Any]] = []
         for i, scored_flow in enumerate(scored):
@@ -713,6 +757,18 @@ class IngestPipeline:
                         "calibrated_score": 1.0,
                         "is_anomaly": True,
                         "confidence": float(confidence[i]),
+                    }
+                )
+            if supervised_scored is not None:
+                sup = supervised_scored[i]
+                rows.append(
+                    {
+                        "event_id": event_id,
+                        "detector": DETECTOR_SUPERVISED,
+                        "raw_score": sup.raw_score,
+                        "calibrated_score": sup.calibrated_score,
+                        "is_anomaly": bool(sup.is_anomaly),
+                        "confidence": sup.calibrated_score,
                     }
                 )
         if rows:

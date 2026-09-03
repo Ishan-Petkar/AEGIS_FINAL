@@ -1,10 +1,12 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ApiError, ApiNetworkError, getEvents } from "./api";
 import type {
   AlertEnvelopeData,
   CiiEnvelopeData,
   EventEnvelopeData,
+  EventOut,
   HelloEnvelopeData,
   StreamEnvelope,
 } from "./types";
@@ -52,6 +54,51 @@ function resolveWsUrl(): string {
   return process.env.NEXT_PUBLIC_WS_URL ?? DEFAULT_WS_URL;
 }
 
+/**
+ * Maps a REST `GET /api/events` row onto the same shape a live WS "event"
+ * envelope carries, for reconnect backfill (see `backfillMissedEvents`
+ * below). `batch_origin` is read from `raw.batch_origin` (`backend/
+ * ingest.py` writes it there — see `Event.raw`'s docstring in
+ * `backend/models.py`) rather than defaulted, since silently defaulting
+ * an injected what-if to `"replay"` is exactly the "injected traffic
+ * confused with observed telemetry" failure `batch_origin` exists to
+ * prevent. `batch_index` has no REST equivalent and nothing in this
+ * console renders it (confirmed: `TelemetryRail`/`CityGraph` never read
+ * it), so `-1` is a safe, inert sentinel here. `is_anomaly` defaulting to
+ * `false` when `EventOut.is_anomaly` is `null` is a real, if extremely
+ * unlikely, edge case — `IngestPipeline` writes exactly one volumetric
+ * score row per persisted event, so `null` here would mean that
+ * invariant was violated, not that the event was benign; see
+ * `EventOut`'s own docstring in `backend/schemas.py` for the full
+ * reasoning shared with `tripwire_fired`'s default.
+ */
+function toEventEnvelopeData(e: EventOut): EventEnvelopeData {
+  const batchOrigin =
+    e.raw && typeof e.raw.batch_origin === "string" ? (e.raw.batch_origin as string) : "replay";
+  return {
+    id: e.id,
+    ts: e.ts,
+    observed_at: e.observed_at ?? e.ts,
+    source_ip: e.source_id ?? "",
+    destination_ip: e.destination_id ?? "",
+    source_asset: e.source_asset ?? "",
+    destination_asset: e.destination_asset ?? "",
+    protocol: e.protocol ?? "",
+    bytes: e.bytes ?? 0,
+    packets: e.packets ?? 0,
+    duration_sec: e.duration_sec ?? 0,
+    raw_score: e.raw_score ?? 0,
+    calibrated_score: e.calibrated_score ?? 0,
+    is_anomaly: e.is_anomaly ?? false,
+    tripwire_fired: e.tripwire_fired,
+    confidence: e.confidence ?? 0,
+    replay_session_id: e.replay_session_id,
+    batch_index: -1,
+    timing_provenance: e.timing_provenance,
+    batch_origin: batchOrigin,
+  };
+}
+
 export interface UseEventStreamResult {
   status: StreamStatus;
   /** Most recent events first, capped at MAX_EVENTS_BUFFER. */
@@ -95,6 +142,16 @@ export interface UseEventStreamResult {
    * extrapolation.
    */
   lastVirtualPosition: string | null;
+  /**
+   * Manually tears down the current socket (if any) and reconnects
+   * immediately, bypassing any pending exponential-backoff delay and
+   * resetting it back to the initial one — for the header's "Restart
+   * stream" control. Safe to call at any time, including while already
+   * `connected` (forces a fresh connection) or already `reconnecting`
+   * (jumps the queue instead of waiting out the current backoff). A no-op
+   * after unmount.
+   */
+  forceReconnect: () => void;
 }
 
 export function useEventStream(): UseEventStreamResult {
@@ -114,6 +171,25 @@ export function useEventStream(): UseEventStreamResult {
   // envelope just to track a number nothing renders directly.
   const eventsSinceTickRef = useRef(0);
 
+  // The highest event `id` this connection has actually seen — a ref,
+  // not state, because every live "event" envelope updates it and it
+  // must never trigger a re-render of its own. `null` until the first
+  // real event arrives, which is also what makes backfill a no-op on the
+  // very first connect (there is nothing to backfill yet) without any
+  // separate "is this a reconnect" bookkeeping. Persists across
+  // reconnects on purpose — it is exactly what a reconnect's backfill
+  // request needs to ask "what did I miss since I was last connected".
+  const lastEventIdRef = useRef<number | null>(null);
+
+  // Populated inside the effect below with a closure that tears down the
+  // current socket (if any) and connects again immediately, bypassing
+  // whatever exponential-backoff delay is currently pending — the "Restart
+  // stream" header button (AppHeader) calls this via `forceReconnect`. A
+  // ref, not state: it needs to reach into the effect's own local
+  // `socket`/`backoffMs`/`reconnectTimer` closure variables, which have no
+  // other way to be reached from outside the effect.
+  const manualReconnectRef = useRef<() => void>(() => {});
+
   useEffect(() => {
     let cancelled = false;
     let socket: WebSocket | null = null;
@@ -127,6 +203,60 @@ export function useEventStream(): UseEventStreamResult {
         if (!cancelled) connect();
       }, backoffMs);
       backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF_MS);
+    }
+
+    // Backfill (Phase A improvement pass, "Backfill missed WebSocket
+    // events on reconnect") — every "event" envelope this hook has ever
+    // seen updates `lastEventIdRef`, so on (re)connect this asks
+    // `GET /api/events?since=<that id>` for exactly what was missed while
+    // disconnected, gapless by construction (that route's `since` branch
+    // is `ORDER BY id ASC` alone — see its docstring in `backend/
+    // routes.py`). A no-op on the very first connect, since
+    // `lastEventIdRef.current` is still `null` then. Enriched
+    // (`EventOut.raw_score`/`is_anomaly`/`tripwire_fired`/etc., added
+    // alongside this feature) so a backfilled row renders with the same
+    // fidelity as a live envelope — never a degraded stand-in.
+    async function backfillMissedEvents() {
+      const since = lastEventIdRef.current;
+      if (since === null) return;
+      let response;
+      try {
+        response = await getEvents({ since, limit: MAX_EVENTS_BUFFER });
+      } catch (err) {
+        // A failed backfill leaves a real gap in the feed rather than a
+        // fabricated one — same posture as `ws.onerror` below: nothing
+        // useful to do beyond letting the next reconnect (or the next
+        // live event) try again.
+        console.warn(
+          "AEGIS: event backfill after reconnect failed",
+          err instanceof ApiNetworkError || err instanceof ApiError ? err.message : err
+        );
+        return;
+      }
+      if (cancelled || response.events.length === 0) return;
+
+      const backfilled = response.events.map(toEventEnvelopeData);
+      setEvents((prev) => {
+        const seen = new Set(prev.map((e) => e.id));
+        // `response.events` arrives oldest-first; folding each missed
+        // event onto the front of the buffer in that order naturally
+        // produces newest-first overall (the same "cons onto the front"
+        // pattern the live "event" case above uses one envelope at a
+        // time) — no separate reverse/sort step needed.
+        let next = prev;
+        for (const e of backfilled) {
+          if (seen.has(e.id)) continue; // a live envelope for it may have
+          // arrived while this request was in flight — never duplicate.
+          seen.add(e.id);
+          next = [e, ...next];
+        }
+        return next.length > MAX_EVENTS_BUFFER ? next.slice(0, MAX_EVENTS_BUFFER) : next;
+      });
+
+      const maxBackfilledId = backfilled.reduce((max, e) => Math.max(max, e.id), since);
+      if (lastEventIdRef.current === null || maxBackfilledId > lastEventIdRef.current) {
+        lastEventIdRef.current = maxBackfilledId;
+      }
     }
 
     function connect() {
@@ -146,6 +276,7 @@ export function useEventStream(): UseEventStreamResult {
         if (cancelled) return;
         backoffMs = INITIAL_BACKOFF_MS;
         setStatus("connected");
+        backfillMissedEvents();
       };
 
       ws.onmessage = (ev) => {
@@ -160,6 +291,9 @@ export function useEventStream(): UseEventStreamResult {
         switch (envelope.type) {
           case "event":
             eventsSinceTickRef.current += 1;
+            if (lastEventIdRef.current === null || envelope.data.id > lastEventIdRef.current) {
+              lastEventIdRef.current = envelope.data.id;
+            }
             setEvents((prev) => {
               const next = [envelope.data, ...prev];
               return next.length > MAX_EVENTS_BUFFER
@@ -202,6 +336,34 @@ export function useEventStream(): UseEventStreamResult {
       };
     }
 
+    // "Restart stream" (manual): clear any pending scheduled reconnect,
+    // reset backoff back to the initial delay (a manual restart should
+    // feel instant, never wait out a backoff grown from earlier drops),
+    // and force the socket closed so the usual onclose -> reconnect path
+    // doesn't fire a SECOND time on top of the immediate `connect()` this
+    // triggers directly. `lastEventIdRef` is deliberately left untouched —
+    // a manual restart is exactly the reconnect case `backfillMissedEvents`
+    // exists for, so anything emitted while the old socket was being torn
+    // down still gets picked up on the new connection's `hello`.
+    manualReconnectRef.current = () => {
+      if (cancelled) return;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      backoffMs = INITIAL_BACKOFF_MS;
+      if (socket) {
+        const old = socket;
+        socket = null;
+        old.onopen = null;
+        old.onmessage = null;
+        old.onerror = null;
+        old.onclose = null;
+        old.close();
+      }
+      connect();
+    };
+
     // Defer the initial connect by a tick rather than calling connect()
     // synchronously. React StrictMode (dev only) double-invokes this
     // effect (mount -> cleanup -> mount) to surface non-idempotent
@@ -221,6 +383,7 @@ export function useEventStream(): UseEventStreamResult {
 
     return () => {
       cancelled = true;
+      manualReconnectRef.current = () => {};
       clearTimeout(initialConnectTimer);
       clearInterval(rateTimer);
       if (reconnectTimer) clearTimeout(reconnectTimer);
@@ -235,6 +398,10 @@ export function useEventStream(): UseEventStreamResult {
     };
   }, []);
 
+  const forceReconnect = useCallback(() => {
+    manualReconnectRef.current();
+  }, []);
+
   return {
     status,
     events,
@@ -245,5 +412,6 @@ export function useEventStream(): UseEventStreamResult {
     hello,
     liveEmittedSinceHello,
     lastVirtualPosition,
+    forceReconnect,
   };
 }

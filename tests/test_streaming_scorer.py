@@ -45,8 +45,14 @@ from backend.supervised_detector import (  # noqa: E402
     DETECTOR_NAME,
     SUPERVISED_FEATURE_NAMES,
     SupervisedFlowDetector,
+    SupervisedFlowScorer,
+    SupervisedFlowScorerArtifactMissing,
+    SupervisedFlowScorerError,
+    SupervisedFlowScorerIncompatible,
+    SupervisedFlowScorerNotFitted,
     temporal_split_evaluate,
 )
+from backend.supervised_detector import _ARTIFACT_SCHEMA_VERSION as _SUPERVISED_ARTIFACT_SCHEMA_VERSION  # noqa: E402
 from datasets.loader import DatasetNotAvailable  # noqa: E402
 from detectors.base import BaseDetector  # noqa: E402
 from detectors.registry import DETECTORS  # noqa: E402
@@ -589,6 +595,199 @@ class TestSupervisedDetector:
         assert result["precision"] >= 0.9  # measured 0.9979; known-threat precision is high
         assert "temporal_split" in result["method"]
         assert "self-test" in result["method"] or "same-distribution" in result["method"]
+
+
+# ---------------------------------------------------------------------------
+# SupervisedFlowScorer (Phase B improvement pass) — mirrors StreamingScorer's
+# own TestFitFromWarmup/TestPersistence/TestUnfitted coverage above, adapted
+# to a supervised fit.
+# ---------------------------------------------------------------------------
+
+
+def _mixed_flows_for_supervised(n_benign: int = 60, n_attack: int = 60, seed: int = 0) -> list[ReplayFlow]:
+    """Flows with a clearly separable attack/benign signal across the 7
+    supervised features, chronologically ordered (ts increasing) so a
+    positional split behaves like a real temporal split — RandomForest
+    should reliably learn this, unlike IsolationForest's volumetric-only
+    features (that separability gap is the whole point of the KNOWN-
+    THREAT channel, docs/DETECTION_STUDY.md)."""
+    rng = random.Random(seed)
+    flows = []
+    i = 0
+    for _ in range(n_benign):
+        flows.append(
+            _make_flow(
+                i,
+                duration_sec=rng.uniform(0.05, 0.2),
+                packets=rng.randint(3, 8),
+                bytes_=rng.randint(60, 120),
+                label="BENIGN",
+                bwd_packet_length_mean=rng.uniform(50, 90),
+                init_win_bytes_forward=rng.randint(8000, 9000),
+                init_win_bytes_backward=rng.randint(8000, 9000),
+                average_packet_size=rng.uniform(50, 90),
+            )
+        )
+        i += 1
+    for _ in range(n_attack):
+        flows.append(
+            _make_flow(
+                i,
+                duration_sec=rng.uniform(0.001, 0.01),
+                packets=rng.randint(1, 3),
+                bytes_=rng.randint(1, 20),
+                label="Bot",
+                bwd_packet_length_mean=rng.uniform(1, 8),
+                init_win_bytes_forward=rng.randint(0, 200),
+                init_win_bytes_backward=rng.randint(0, 200),
+                average_packet_size=rng.uniform(1, 8),
+            )
+        )
+        i += 1
+    return flows
+
+
+@pytest.fixture
+def fitted_supervised_scorer() -> SupervisedFlowScorer:
+    flows = _mixed_flows_for_supervised()
+    return SupervisedFlowScorer().fit_from_warmup(flows=flows, split_fraction=1.0)
+
+
+class TestSupervisedFlowScorerFitFromWarmup:
+    def test_fit_rejects_all_benign_training_slice(self):
+        flows = _benign_warmup_flows(n=50)
+        with pytest.raises(SupervisedFlowScorerError):
+            SupervisedFlowScorer().fit_from_warmup(flows=flows, split_fraction=1.0)
+
+    def test_fit_uses_only_the_first_split_fraction(self):
+        """The class's whole honesty story depends on this: training must
+        see ONLY the first `split_fraction`, never the back half."""
+        flows = _mixed_flows_for_supervised(n_benign=40, n_attack=40)
+        # All attack rows are the SECOND half of the flow list (see the
+        # helper) -- a 0.5 split therefore trains on a 100% BENIGN first
+        # half and must raise exactly like the all-benign case above.
+        with pytest.raises(SupervisedFlowScorerError):
+            SupervisedFlowScorer().fit_from_warmup(flows=flows, split_fraction=0.5)
+
+    def test_fit_records_warmup_metadata(self, fitted_supervised_scorer):
+        meta = fitted_supervised_scorer.baseline["warmup"]
+        assert meta["rows_used"] == 120
+        assert meta["attack_rows_in_training"] == 60
+        assert meta["split_fraction"] == 1.0
+        assert "fitted_at" in meta
+
+    def test_scorer_learns_the_separable_signal(self, fitted_supervised_scorer):
+        flows = _mixed_flows_for_supervised(seed=99)
+        scored = fitted_supervised_scorer.score_batch(flows)
+        benign_scored = scored[:60]
+        attack_scored = scored[60:]
+        assert sum(s.is_anomaly for s in attack_scored) / len(attack_scored) > 0.9
+        assert sum(s.is_anomaly for s in benign_scored) / len(benign_scored) < 0.1
+        # lower raw_score = more anomalous (this project's universal sign convention)
+        assert sum(s.raw_score for s in attack_scored) / len(attack_scored) < (
+            sum(s.raw_score for s in benign_scored) / len(benign_scored)
+        )
+
+    def test_calibrated_score_is_p_attack_not_a_sigmoid(self, fitted_supervised_scorer):
+        """Unlike the volumetric channel's calibrated_score (a fixed-slope
+        sigmoid of raw_score, ml_engine.py), this channel's is the native
+        RandomForest P(attack) -- verify the exact relationship rather
+        than just "some transform happened"."""
+        flows = _mixed_flows_for_supervised(seed=7)
+        scored = fitted_supervised_scorer.score_batch(flows)
+        for s in scored:
+            assert s.calibrated_score == pytest.approx(-s.raw_score)
+            assert 0.0 <= s.calibrated_score <= 1.0
+
+    def test_empty_batch_returns_empty_list(self, fitted_supervised_scorer):
+        assert fitted_supervised_scorer.score_batch([]) == []
+
+
+class TestSupervisedFlowScorerUnfitted:
+    def test_score_batch_before_fit_raises(self):
+        with pytest.raises(SupervisedFlowScorerNotFitted):
+            SupervisedFlowScorer().score_batch(_mixed_flows_for_supervised(n_benign=1, n_attack=1))
+
+    def test_baseline_before_fit_raises(self):
+        with pytest.raises(SupervisedFlowScorerNotFitted):
+            SupervisedFlowScorer().baseline
+
+    def test_is_fitted_false_before_fit(self):
+        assert SupervisedFlowScorer().is_fitted is False
+
+
+class TestSupervisedFlowScorerPersistence:
+    def test_save_load_round_trip(self, fitted_supervised_scorer, tmp_path):
+        path = tmp_path / "supervised.joblib"
+        fitted_supervised_scorer.save(path)
+        flows = _mixed_flows_for_supervised(seed=42)
+
+        before = fitted_supervised_scorer.score_batch(flows)
+        loaded = SupervisedFlowScorer.load(path)
+        after = loaded.score_batch(flows)
+
+        assert before == after
+        assert loaded.feature_names == fitted_supervised_scorer.feature_names
+        assert loaded.baseline["warmup"] == fitted_supervised_scorer.baseline["warmup"]
+
+    def test_save_uses_resolved_path(self, fitted_supervised_scorer, monkeypatch, tmp_path):
+        """Mirrors StreamingScorer's test_save_uses_resolved_path (K2):
+        preserves/restores any real artifact already on disk (K7) --
+        including one this very test session may have just built via
+        `python -m backend.warmup_supervised`."""
+        repo_root = Path(__file__).resolve().parent.parent
+        target = repo_root / "artifacts" / "supervised_flow_scorer.joblib"
+        preexisting = target.read_bytes() if target.exists() else None
+
+        monkeypatch.chdir(tmp_path)
+        try:
+            written = fitted_supervised_scorer.save()
+            assert written.is_absolute()
+            assert written == target
+            assert not (tmp_path / "artifacts").exists()
+        finally:
+            if preexisting is not None:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(preexisting)
+            else:
+                target.unlink(missing_ok=True)
+
+    def test_load_missing_artifact_raises_and_is_a_file_not_found_error(self, tmp_path):
+        missing = tmp_path / "does_not_exist.joblib"
+        with pytest.raises(SupervisedFlowScorerArtifactMissing) as excinfo:
+            SupervisedFlowScorer.load(missing)
+        message = str(excinfo.value)
+        assert str(missing) in message
+        assert "backend.warmup_supervised" in message
+        assert isinstance(excinfo.value, FileNotFoundError)
+
+    def test_load_rejects_incompatible_schema_version(self, fitted_supervised_scorer, tmp_path):
+        import joblib
+
+        path = tmp_path / "supervised.joblib"
+        fitted_supervised_scorer.save(path)
+        artifact = joblib.load(path)
+        artifact["artifact_schema_version"] = "999.0"
+        joblib.dump(artifact, path)
+        with pytest.raises(SupervisedFlowScorerIncompatible):
+            SupervisedFlowScorer.load(path)
+
+    def test_load_rejects_incompatible_feature_names(self, fitted_supervised_scorer, tmp_path):
+        import joblib
+
+        path = tmp_path / "supervised.joblib"
+        fitted_supervised_scorer.save(path)
+        artifact = joblib.load(path)
+        artifact["feature_names"] = ["duration_sec", "packets"]
+        joblib.dump(artifact, path)
+        with pytest.raises(SupervisedFlowScorerIncompatible):
+            SupervisedFlowScorer.load(path)
+
+    def test_artifact_schema_version_constant_is_this_module_scoped(self):
+        # Deliberately its own constant, not shared with StreamingScorer's
+        # ARTIFACT_SCHEMA_VERSION -- the two artifacts can evolve
+        # independently.
+        assert _SUPERVISED_ARTIFACT_SCHEMA_VERSION == "1.0"
 
 
 # ---------------------------------------------------------------------------

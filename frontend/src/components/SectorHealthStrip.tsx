@@ -27,8 +27,10 @@ import type { TopologyResponse } from "@/lib/types";
 //                        own per-sector pulse badge).
 //
 // Clicking a chip focuses that sector inline in the (non-maximised) graph
-// — sets `focusedSector` and drops `expanded` back to false so the chip
-// click has a visible effect even if the graph was maximised.
+// — toggles it into/out of `focusedSectors` and drops `expanded` back to
+// false so the chip click has a visible effect even if the graph was
+// maximised. Stackable: clicking a second chip adds it alongside whatever
+// is already focused rather than replacing it (`toggleFocusedSector`).
 const RENDER_INTERVAL_MS = 250;
 
 interface SectorSnapshot {
@@ -39,7 +41,7 @@ interface SectorSnapshot {
 export function SectorHealthStrip() {
   const { state } = useTopology();
   const { events } = useStream();
-  const { focusedSector, setFocusedSector, setExpanded } = useGraphFocus();
+  const { focusedSectors, toggleFocusedSector, setExpanded } = useGraphFocus();
 
   const nodes: TopologyResponse["nodes"] = useMemo(
     () => (state.kind === "loaded" ? state.data.nodes : []),
@@ -102,14 +104,14 @@ export function SectorHealthStrip() {
         const members = sectorMembers.get(sector) ?? [];
         const count = snapshot.get(sector)?.count ?? 0;
         const severity = snapshot.get(sector)?.severity ?? "normal";
-        const isFocused = focusedSector === sector;
+        const isFocused = focusedSectors.has(sector);
         return (
           <button
             key={sector}
             type="button"
             onClick={() => {
               setExpanded(false);
-              setFocusedSector((prev) => (prev === sector ? null : sector));
+              toggleFocusedSector(sector);
             }}
             aria-pressed={isFocused}
             title={`${sectorLabel(sector)} — ${members.length} asset${members.length === 1 ? "" : "s"} · ${count} event${count === 1 ? "" : "s"} this session`}

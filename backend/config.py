@@ -22,7 +22,7 @@ instance) without decomposing it into host/port/user/password/name.
 """
 
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, Optional
 from urllib.parse import quote_plus
 
 from pydantic import Field, model_validator
@@ -154,6 +154,48 @@ class BackendSettings(BaseSettings):
         ),
     )
 
+    # ---- Security (Phase B improvement pass) ------------------------------
+    api_token: Optional[str] = Field(
+        default=None,
+        description=(
+            "Bearer token required on every state-changing route (POST "
+            "/api/replay/start|stop|speed, POST /api/inject, POST "
+            "/api/alerts/{id}/ack) when set — `None` (the default) leaves "
+            "those routes exactly as unauthenticated as before, matching "
+            "api_host's own default posture: safe out of the box for a "
+            "loopback-bound local demo, opt-in to tighten. Read this "
+            "honestly: a token shipped to the browser via "
+            "NEXT_PUBLIC_API_TOKEN is visible to anyone who reads the "
+            "page's own JS bundle, so this is NOT resistant to a targeted "
+            "attacker with devtools open on the page itself — it stops an "
+            "unrelated web page, an opportunistic scanner, or a stray "
+            "curl from a LAN neighbour from finding an open, undocumented "
+            "control surface and using it, which is the actual threat "
+            "model for `api_host=0.0.0.0` (venue wifi, container "
+            "networking). A startup warning fires (see `main.py`'s "
+            "lifespan) if `api_host` is opened to the LAN while this is "
+            "still unset."
+        ),
+    )
+    rate_limit_max_requests: int = Field(
+        default=30,
+        ge=1,
+        description=(
+            "Max requests a single client IP may make to a state-changing "
+            "route within rate_limit_window_sec, before further ones get "
+            "429. Applies to the same route set api_token protects. "
+            "In-memory, per-process — resets on restart, does not survive "
+            "multiple backend instances (this project runs exactly one, "
+            "see PLAN_MASTER.md's explicit multi-instance/multi-tenancy "
+            "deferral)."
+        ),
+    )
+    rate_limit_window_sec: float = Field(
+        default=60.0,
+        gt=0.0,
+        description="Sliding window (seconds) rate_limit_max_requests is measured over.",
+    )
+
     # ---- Replay ------------------------------------------------------
     replay_speed: float = Field(
         default=20.0,
@@ -262,6 +304,43 @@ class BackendSettings(BaseSettings):
             "yields 3 zero-variance feature columns, head(2) yields 2; by "
             "head(1000) all three columns already have non-zero variance "
             "of the right order of magnitude relative to the full day."
+        ),
+    )
+
+    # ---- SupervisedFlowScorer (Phase B improvement pass) ------------------
+    supervised_model_artifact_path: Path = Field(
+        default=Path("artifacts/supervised_flow_scorer.joblib"),
+        description=(
+            "Filesystem path to the persisted, joblib-serialized "
+            "SupervisedFlowScorer (fit-once build artifact, mirroring "
+            "model_artifact_path/StreamingScorer exactly). Lives under the "
+            "gitignored artifacts/ directory. Unlike model_artifact_path, "
+            "a MISSING artifact here is not fatal to the API — the "
+            "known-threat channel is an additive third detector; its "
+            "absence degrades to 'two live channels' (Isolation Forest + "
+            "tripwire), never a 503 on replay-control routes. See "
+            "backend/runtime.py's build_runtime()."
+        ),
+    )
+    supervised_train_split_fraction: float = Field(
+        default=0.5,
+        gt=0.0,
+        lt=1.0,
+        description=(
+            "Fraction of BACKEND_SETTINGS.replay_default_dataset_day used "
+            "to train SupervisedFlowScorer at build time — the FIRST "
+            "split_fraction of the day, chronologically. Deliberately the "
+            "exact same value and methodology as "
+            "backend.supervised_detector.temporal_split_evaluate()'s own "
+            "default (0.5, 'train on the earlier half, test on the later "
+            "half of one day') — the live deployment reproduces the "
+            "already-published, already-defended docs/DETECTION_STUDY.md "
+            "Test 1 methodology rather than inventing a new one. Read "
+            "SupervisedFlowScorer's class docstring before assuming this "
+            "means the live channel is unbiased on the demo day: because "
+            "replay always restarts a day from position 0, it has "
+            "genuinely seen the labels for roughly the first half of any "
+            "live friday-morning replay."
         ),
     )
 
@@ -690,6 +769,15 @@ class BackendSettings(BaseSettings):
         if self.model_artifact_path.is_absolute():
             return self.model_artifact_path
         return _REPO_ROOT / self.model_artifact_path
+
+    @property
+    def supervised_model_artifact_path_resolved(self) -> Path:
+        """`supervised_model_artifact_path`, guaranteed absolute and
+        CWD-independent — see `model_artifact_path_resolved`'s docstring
+        for the identical rationale."""
+        if self.supervised_model_artifact_path.is_absolute():
+            return self.supervised_model_artifact_path
+        return _REPO_ROOT / self.supervised_model_artifact_path
 
 
 # Module-level singleton — import this everywhere.

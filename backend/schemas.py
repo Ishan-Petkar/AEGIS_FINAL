@@ -98,6 +98,24 @@ class TopologyResponse(BaseModel):
 
 
 class EventOut(BaseModel):
+    """`raw_score`/`calibrated_score`/`is_anomaly`/`confidence`/
+    `tripwire_fired` (Phase A improvement pass, roadmap "Backfill missed
+    WebSocket events on reconnect") are NOT columns on `Event` — they are
+    enriched in `list_events()` from a follow-up `event_scores` query, so
+    a REST-fetched event carries the same detector verdicts a live `WS
+    /ws/stream` "event" envelope does. `EventOut.model_validate(row)`
+    leaves them at their declared defaults (`None`/`False`) because a
+    plain `Event` ORM row has no such attributes; the route then
+    overwrites them once the scores are known. Never fabricated: a `None`
+    score means "no volumetric score row was found for this event" (would
+    indicate a real data gap), not "score is zero" — and `tripwire_fired`
+    defaults to `False` only because that default is actually correct
+    on its own terms (no `event_scores` row with `detector="tripwire"`
+    for this event IS the unambiguous "did not fire" case, per
+    `IngestPipeline._persist_scores`'s own docstring: a tripwire row is
+    written only where it fired).
+    """
+
     model_config = ConfigDict(from_attributes=True)
 
     id: int
@@ -118,6 +136,11 @@ class EventOut(BaseModel):
     replay_session_id: UUID
     source_row_id: str
     raw: Optional[dict[str, Any]]
+    raw_score: Optional[float] = None
+    calibrated_score: Optional[float] = None
+    is_anomaly: Optional[bool] = None
+    confidence: Optional[float] = None
+    tripwire_fired: bool = False
 
 
 class EventsResponse(BaseModel):

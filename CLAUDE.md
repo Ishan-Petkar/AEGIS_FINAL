@@ -109,8 +109,9 @@ aegis-project/
 
 ### Key invariant: the canonical schema
 Every ingestion path normalises into `CanonicalEvent` / `CanonicalBatch`
-(`src/datasets/schema.py`, `SCHEMA_VERSION = "1.0"`, 14 columns in
-`CANONICAL_COLUMNS`). **No downstream component may read a dataset-specific
+(`src/datasets/schema.py`, `SCHEMA_VERSION = "2.0"`, 17 columns in
+`CANONICAL_COLUMNS` — v2.0 added `signal_type`, `observed_at`, and
+`purdue_level` to the original 14). **No downstream component may read a dataset-specific
 column directly**, and **nothing should call an adapter directly** — go through
 `datasets.loader.load_dataset(name, limit=…)`. Adapters additionally attach
 three non-canonical ML feature columns (`duration_sec`, `packets`, `bytes`) that
@@ -149,6 +150,15 @@ identically to a traffic controller (26 impacted). The same degeneracy was
 already latent on the old 16-node graph (6 zeros / 8 clamped / 2 between),
 so the scale-up exposed it rather than caused it. `cii_max_value` is now a
 safety clamp only — normalised scores cannot exceed 1.0 by construction.
+
+Two correct, different node counts coexist — know which one you're citing.
+`config.py`'s raw `SMART_CITY_ASSETS` list is **45 assets / 63 edges**
+(`len(SMART_CITY_ASSETS)`, `len(DEPENDENCY_GRAPH)`). The **50-node city**
+figure above is the *rendered* graph `GET /api/topology` actually serves:
+`graph_manager.py`'s gateway rewrite adds 4 Purdue-zone gateway nodes plus
+1 synthesized `City_Grid` node (45 + 4 + 1 = 50) and consolidates/adds
+edges (63 → 75). Neither number is stale; they measure different stages
+of the same pipeline.
 
 **A median of exactly 0.0 is common and honest**: it means more than half
 the Monte Carlo iterations propagated nothing, which is the truth for a
@@ -275,11 +285,13 @@ Fix these if you touch the surrounding code; do not assume they are intentional.
   `Central_Bank_Interbank_Feed`, `Power_Substation_Alpha`, and
   `Water_Treatment_Plant`, none of which exist in `DEPENDENCY_GRAPH`. Selecting
   them returns an empty `CIIResult()` (all zeros) rather than an error.
-- **`evaluation.run_evaluation`** defaults to `dataset="swat"` while its
-  docstring, printed banners, and the `EvalResult.dataset` default all say
-  CIC-IDS2017.
-- **`src/datasets/PS_20174392719_1491204439457_log copy.csv`** is a stray data
-  file checked into the source tree; the loader reads from `datasets/`, not here.
+~~`evaluation.run_evaluation` defaults to `dataset="swat"`~~ — fixed; it now
+defaults to `"cic_ids2017"` (`src/evaluation/__init__.py:143`), matching its
+docstring, printed banners, and `EvalResult.dataset`'s default
+(`"CIC-IDS2017"`). ~~The stray `PS_20174392719_1491204439457_log copy.csv`
+file~~ has also been removed from `src/datasets/`. Both verified fixed
+2026-09-02; kept here (struck through, not deleted) since this file is the
+audit trail for what's actually been checked, not just a live TODO list.
 
 ## 8. Where to look for more
 

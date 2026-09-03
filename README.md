@@ -40,10 +40,17 @@ work; the Operations Console is where you watch it happen.
 
 ## What it does
 
-- **Three detection channels, reported side by side.** An unsupervised
-  Isolation Forest (novel-threat channel), a supervised RandomForest
-  (known-threat channel), and a honeytoken tripwire (deception channel).
-  Their real, measured strengths and limits are in §*Honest limitations*.
+- **Three detection channels, all scored live, every batch.** An
+  unsupervised Isolation Forest (novel-threat channel), a supervised
+  RandomForest (known-threat channel, fit once at build time on real
+  labelled attack traffic — `backend/warmup_supervised.py`), and a
+  honeytoken tripwire (deception channel), each persisted as its own
+  `event_scores` row per event. Their real, measured strengths and limits
+  are in §*Honest limitations* — in particular, watch the volumetric and
+  known-threat channels disagree live: inject a real Bot scenario
+  (`POST /api/inject`) and the Isolation Forest says "normal" while the
+  RandomForest flags it at 0.96+ confidence, the exact, concrete shape of
+  the paradigm gap this section describes.
 - **Mandatory gateway topology** — every path to a high-criticality asset
   is structurally rewritten to route through a Purdue-zone gateway node
   (`src/graph_manager.py`). It is a chokepoint in the graph itself, not a

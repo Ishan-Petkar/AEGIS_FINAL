@@ -12,6 +12,12 @@
       "runtimeExecutable": "npm",
       "runtimeArgs": ["--prefix", "frontend", "run", "dev"],
       "port": 3000
+    },
+    {
+      "name": "aegis-backend",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["-c", "PYTHONPATH=src venv/bin/uvicorn backend.main:app --host 127.0.0.1 --port 8000"],
+      "port": 8000
     }
   ]
 }

@@ -49,6 +49,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     runtime: AppRuntime = build_runtime()
     runtime.broadcaster.set_loop(asyncio.get_running_loop())
     app.state.runtime = runtime
+    # Phase B improvement pass: `api_host=0.0.0.0` is a deliberate opt-in
+    # to LAN exposure (see that setting's own docstring), and
+    # `BACKEND_SETTINGS.api_token` unset means the state-changing routes
+    # are still wide open to anyone on that LAN. Loud and explicit at
+    # startup, matching this project's existing risk-communication style
+    # (e.g. `api_host`'s own docstring), rather than a silent gap.
+    if BACKEND_SETTINGS.api_host != "127.0.0.1" and not BACKEND_SETTINGS.api_token:
+        logger.warning(
+            "AEGIS_API_HOST=%s exposes state-changing routes (replay "
+            "control, injection, alert ack) beyond loopback with NO "
+            "AEGIS_API_TOKEN set -- anyone who can reach this host on "
+            "the network has unauthenticated control of the demo. Set "
+            "AEGIS_API_TOKEN (and NEXT_PUBLIC_API_TOKEN on the frontend) "
+            "before exposing this beyond a single trusted machine.",
+            BACKEND_SETTINGS.api_host,
+        )
     try:
         yield
     finally:

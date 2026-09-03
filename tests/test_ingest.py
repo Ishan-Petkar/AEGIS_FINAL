@@ -21,6 +21,7 @@ import pytest
 
 from backend.config import BackendSettings
 from backend.ingest import (
+    DETECTOR_SUPERVISED,
     DETECTOR_TRIPWIRE,
     DETECTOR_VOLUMETRIC,
     ENVELOPE_ALERT,
@@ -41,6 +42,7 @@ from backend.models import Alert, CiiSnapshot
 from backend.replay_engine import BatchMeta
 from backend.replay_reader import ReplayFlow
 from backend.streaming import ScoredFlow
+from backend.supervised_detector import SupervisedScoredFlow
 
 BASE_TS = datetime(2017, 7, 7, 9, 0, 0, tzinfo=timezone.utc)
 
@@ -117,6 +119,35 @@ class FakeScorer:
             "top_feature": "bytes",
             "features": [{"name": "bytes", "z": 47.0, "degenerate_baseline": False}],
         }
+
+
+class FakeSupervisedScorer:
+    """Stands in for a fitted SupervisedFlowScorer (Phase B improvement
+    pass) — mirrors FakeScorer's pattern exactly, one level down (a
+    smaller, independent fake rather than extending FakeScorer, since the
+    two channels return different dataclasses and must never be
+    conflated)."""
+
+    def __init__(self, anomaly_flags=None, p_attack=0.97):
+        self.anomaly_flags = anomaly_flags
+        self.p_attack = p_attack
+        self.score_batch_calls = 0
+
+    def score_batch(self, flows):
+        self.score_batch_calls += 1
+        out = []
+        for i, f in enumerate(flows):
+            is_anom = False if self.anomaly_flags is None else self.anomaly_flags[i]
+            p = self.p_attack if is_anom else 1.0 - self.p_attack
+            out.append(
+                SupervisedScoredFlow(
+                    flow=f,
+                    raw_score=-p,
+                    calibrated_score=p,
+                    is_anomaly=bool(is_anom),
+                )
+            )
+        return out
 
 
 def stmt_table_name(stmt) -> str:
@@ -406,6 +437,100 @@ def test_tripwire_score_row_only_written_when_it_fires():
     rows = rows_of(stmts_for(session, "event_scores")[0])
     assert all(r["detector"] == DETECTOR_VOLUMETRIC for r in rows)
     assert len(rows) == 2
+
+
+# ---------------------------------------------------------------------------
+# Supervised (KNOWN-THREAT) channel — Phase B improvement pass. Purely
+# additive: must never change is_anomaly, the alert policy, or the
+# volumetric/tripwire rows' own confidence — see IngestPipeline's
+# supervised_scorer docstring.
+# ---------------------------------------------------------------------------
+
+
+def test_no_supervised_row_when_channel_not_configured():
+    """Default posture (no artifact built / not passed to IngestPipeline):
+    behaviour is byte-for-byte what it was before this channel existed."""
+    pipeline, session = make_pipeline(scorer=FakeScorer(anomaly_flags=[True]))
+    pipeline([make_flow("f:1")], make_meta())
+    rows = rows_of(stmts_for(session, "event_scores")[0])
+    assert DETECTOR_SUPERVISED not in {r["detector"] for r in rows}
+    assert len(rows) == 1  # volumetric only
+
+
+def test_supervised_row_written_when_channel_configured():
+    pipeline, session = make_pipeline(
+        scorer=FakeScorer(anomaly_flags=[False]),
+        supervised_scorer=FakeSupervisedScorer(anomaly_flags=[True], p_attack=0.93),
+    )
+    pipeline([make_flow("f:1")], make_meta())
+    rows = rows_of(stmts_for(session, "event_scores")[0])
+    detectors = {r["detector"] for r in rows}
+    assert DETECTOR_SUPERVISED in detectors
+    sup_row = next(r for r in rows if r["detector"] == DETECTOR_SUPERVISED)
+    assert sup_row["is_anomaly"] is True
+    assert sup_row["calibrated_score"] == pytest.approx(0.93)
+    assert sup_row["raw_score"] == pytest.approx(-0.93)
+    # This channel's own confidence is its own P(attack) — NOT the fused
+    # volumetric/tripwire confidence (which is 0.0 here: neither fired).
+    assert sup_row["confidence"] == pytest.approx(0.93)
+
+
+def test_supervised_channel_never_changes_is_anomaly_or_alert_policy():
+    """The load-bearing invariant: wiring this channel must be provably
+    unable to move any already-published statistic (alert counts,
+    suppression counts, is_anomaly) — it is purely informational."""
+    common_kwargs = dict(scorer=FakeScorer(anomaly_flags=[False]))  # volumetric says normal
+    pipeline_without, session_without = make_pipeline(**common_kwargs)
+    pipeline_with, session_with = make_pipeline(
+        **common_kwargs, supervised_scorer=FakeSupervisedScorer(anomaly_flags=[True], p_attack=0.99)
+    )
+
+    result_without = pipeline_without([make_flow("f:1")], make_meta())
+    result_with = pipeline_with([make_flow("f:2")], make_meta())
+
+    # Even though the FAKE supervised scorer screams "attack, 0.99
+    # confidence", is_anomaly/alerts/anomalies are identical to the run
+    # with no supervised channel at all.
+    assert result_with.anomalies == result_without.anomalies == 0
+    assert result_with.alerts_created == result_without.alerts_created
+    assert result_with.alerts_suppressed == result_without.alerts_suppressed
+
+    volumetric_row_with = next(
+        r for r in rows_of(stmts_for(session_with, "event_scores")[0]) if r["detector"] == DETECTOR_VOLUMETRIC
+    )
+    volumetric_row_without = next(
+        r for r in rows_of(stmts_for(session_without, "event_scores")[0]) if r["detector"] == DETECTOR_VOLUMETRIC
+    )
+    # The volumetric row's own confidence is unaffected by the supervised
+    # channel's presence.
+    assert volumetric_row_with["confidence"] == volumetric_row_without["confidence"]
+
+
+def test_supervised_scorer_called_once_per_batch_never_per_event():
+    supervised = FakeSupervisedScorer(anomaly_flags=[False, True, False])
+    pipeline, _ = make_pipeline(
+        scorer=FakeScorer(anomaly_flags=[False, False, False]),
+        supervised_scorer=supervised,
+    )
+    pipeline([make_flow("f:1"), make_flow("f:2"), make_flow("f:3")], make_meta())
+    assert supervised.score_batch_calls == 1
+
+
+def test_supervised_row_respects_deduplication():
+    """A deduplicated event (inserted_ids[i] is None) must not get a
+    supervised row either — mirrors the volumetric/tripwire rows' own
+    dedup handling."""
+    session = FakeSession(next_event_ids=[1000])  # only the first of 2 flows is "new"
+    pipeline, session = make_pipeline(
+        scorer=FakeScorer(anomaly_flags=[False, False]),
+        session=session,
+        supervised_scorer=FakeSupervisedScorer(anomaly_flags=[False, False]),
+    )
+    pipeline([make_flow("f:1"), make_flow("f:2")], make_meta())
+    rows = rows_of(stmts_for(session, "event_scores")[0])
+    supervised_rows = [r for r in rows if r["detector"] == DETECTOR_SUPERVISED]
+    assert len(supervised_rows) == 1
+    assert supervised_rows[0]["event_id"] == 1000
 
 
 # ---------------------------------------------------------------------------

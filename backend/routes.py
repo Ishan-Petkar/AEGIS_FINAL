@@ -70,10 +70,16 @@ from sqlalchemy.orm import Session
 from backend.config import BACKEND_SETTINGS
 from backend.db import session_scope
 from backend.inject import SCENARIOS, InjectionError, build_injection_flows
-from backend.ingest import build_criticality_map, compute_risk_index
-from backend.models import Alert, Event
+from backend.ingest import (
+    DETECTOR_TRIPWIRE,
+    DETECTOR_VOLUMETRIC,
+    build_criticality_map,
+    compute_risk_index,
+)
+from backend.models import Alert, Event, EventScore
 from backend.replay_engine import ReplayEngineError, ReplayStatus
 from backend.runtime import AppRuntime
+from backend.security import enforce_rate_limit, require_api_token
 from backend.schemas import (
     AlertCountersOut,
     AlertOut,
@@ -105,6 +111,15 @@ from graph_manager import build_graph
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+#: Applied to every state-changing route (Phase B improvement pass) —
+#: `require_api_token` alone is a no-op while `BACKEND_SETTINGS.api_token`
+#: is unset (the default), so this is inert for the loopback-bound local
+#: demo and only starts actually gating requests once an operator sets
+#: that env var. `enforce_rate_limit` is always active. See
+#: `backend/security.py`'s module docstring for the honest security-model
+#: caveat on the token check.
+_MUTATING_ROUTE_DEPS = [Depends(require_api_token), Depends(enforce_rate_limit)]
 
 #: A `ReplayStatus` snapshot for "no engine has ever existed in this
 #: process" (the scorer failed to load — see `backend.runtime.AppRuntime`).
@@ -361,6 +376,15 @@ def list_events(
     `has_more` is computed honestly by fetching `limit + 1` rows and
     trimming the extra one off, never guessed from `len(events) == limit`
     (which is also true, and wrongly so, on the exact last page).
+
+    Each row is enriched with its `event_scores` verdicts (`raw_score`,
+    `calibrated_score`, `is_anomaly`, `confidence`, `tripwire_fired`) — see
+    `EventOut`'s docstring — added so a WS client that missed live
+    envelopes during a disconnect (Phase A improvement pass, "Backfill
+    missed WebSocket events on reconnect") can call this route with
+    `since=<last event id it saw>` and render the backfilled rows with the
+    same fidelity as a live "event" envelope, instead of a degraded
+    partial one.
     """
     ascending = since is not None
     order = (Event.id.asc(),) if ascending else (Event.ts.desc(), Event.id.desc())
@@ -372,6 +396,32 @@ def list_events(
         rows = session.execute(stmt).scalars().all()
         has_more = len(rows) > limit
         events = [EventOut.model_validate(row) for row in rows[:limit]]
+
+        event_ids = [e.id for e in events]
+        if event_ids:
+            score_rows = (
+                session.execute(
+                    select(EventScore).where(EventScore.event_id.in_(event_ids))
+                )
+                .scalars()
+                .all()
+            )
+            volumetric_by_event_id: dict[int, EventScore] = {}
+            tripwire_event_ids: set[int] = set()
+            for score_row in score_rows:
+                if score_row.detector == DETECTOR_VOLUMETRIC:
+                    volumetric_by_event_id[score_row.event_id] = score_row
+                elif score_row.detector == DETECTOR_TRIPWIRE:
+                    tripwire_event_ids.add(score_row.event_id)
+            for event in events:
+                volumetric = volumetric_by_event_id.get(event.id)
+                if volumetric is not None:
+                    event.raw_score = volumetric.raw_score
+                    event.calibrated_score = volumetric.calibrated_score
+                    event.is_anomaly = volumetric.is_anomaly
+                    event.confidence = volumetric.confidence
+                event.tripwire_fired = event.id in tripwire_event_ids
+
     return EventsResponse(events=events, has_more=has_more)
 
 
@@ -413,7 +463,11 @@ def list_alerts(
 # ---------------------------------------------------------------------------
 
 
-@router.post("/api/alerts/{alert_id}/ack", response_model=AlertOut)
+@router.post(
+    "/api/alerts/{alert_id}/ack",
+    response_model=AlertOut,
+    dependencies=_MUTATING_ROUTE_DEPS,
+)
 def acknowledge_alert(
     alert_id: int,
     scope: Callable[[], ContextManager[Session]] = Depends(get_session_scope),
@@ -488,7 +542,11 @@ def get_cii(
 # ---------------------------------------------------------------------------
 
 
-@router.post("/api/replay/start", response_model=ReplayStatusResponse)
+@router.post(
+    "/api/replay/start",
+    response_model=ReplayStatusResponse,
+    dependencies=_MUTATING_ROUTE_DEPS,
+)
 def start_replay(
     body: ReplayStartRequest,
     runtime: AppRuntime = Depends(get_runtime),
@@ -519,7 +577,11 @@ def start_replay(
 # ---------------------------------------------------------------------------
 
 
-@router.post("/api/replay/stop", response_model=ReplayStatusResponse)
+@router.post(
+    "/api/replay/stop",
+    response_model=ReplayStatusResponse,
+    dependencies=_MUTATING_ROUTE_DEPS,
+)
 def stop_replay(runtime: AppRuntime = Depends(get_runtime)) -> ReplayStatusResponse:
     """Idempotent — 200 even when not running, and even when the scorer
     never loaded (there is nothing to stop either way, and reporting 503
@@ -536,7 +598,11 @@ def stop_replay(runtime: AppRuntime = Depends(get_runtime)) -> ReplayStatusRespo
 # ---------------------------------------------------------------------------
 
 
-@router.post("/api/replay/speed", response_model=ReplayStatusResponse)
+@router.post(
+    "/api/replay/speed",
+    response_model=ReplayStatusResponse,
+    dependencies=_MUTATING_ROUTE_DEPS,
+)
 def set_replay_speed(
     body: ReplaySpeedRequest,
     runtime: AppRuntime = Depends(get_runtime),
@@ -582,7 +648,11 @@ def list_inject_scenarios() -> ScenariosResponse:
     )
 
 
-@router.post("/api/inject", response_model=InjectResponse)
+@router.post(
+    "/api/inject",
+    response_model=InjectResponse,
+    dependencies=_MUTATING_ROUTE_DEPS,
+)
 def post_inject(
     body: InjectRequest,
     runtime: AppRuntime = Depends(get_runtime),

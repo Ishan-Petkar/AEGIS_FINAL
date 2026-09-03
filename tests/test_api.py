@@ -72,8 +72,21 @@ from backend.replay_engine import ReplayEngine  # noqa: E402
 from backend.replay_reader import ReplayFlow  # noqa: E402
 from backend.routes import get_runtime, get_session_scope  # noqa: E402
 from backend.runtime import AppRuntime  # noqa: E402
+from backend.security import reset_rate_limiter_for_tests  # noqa: E402
 
 BASE_TS = datetime(2017, 7, 7, 9, 0, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limiter():
+    """Phase B improvement pass: `backend.security`'s rate limiter is
+    process-global (like `backend.db`'s engine globals), so it would
+    otherwise accumulate hits across every test in this file and start
+    429ing tests that have nothing to do with rate limiting. Mirrors
+    `_reset_inject_pool_cache` below for the same class of problem."""
+    reset_rate_limiter_for_tests()
+    yield
+    reset_rate_limiter_for_tests()
 
 
 # ---------------------------------------------------------------------------

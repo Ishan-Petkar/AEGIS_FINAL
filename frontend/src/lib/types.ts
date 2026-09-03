@@ -82,6 +82,21 @@ export interface EventOut {
   replay_session_id: string;
   source_row_id: string;
   raw: Record<string, unknown> | null;
+  /**
+   * `event_scores` enrichment (Phase A improvement pass, "Backfill missed
+   * WebSocket events on reconnect") — the same detector verdicts a live
+   * WS "event" envelope carries, added here so a REST-fetched backfill
+   * row can render with identical fidelity. `null` on `raw_score` /
+   * `calibrated_score` / `is_anomaly` / `confidence` means no volumetric
+   * score row exists for this event (a real gap, never fabricated as
+   * 0/false) — `tripwire_fired` defaults `false` correctly, since the
+   * backend only ever writes a tripwire row where it actually fired.
+   */
+  raw_score: number | null;
+  calibrated_score: number | null;
+  is_anomaly: boolean | null;
+  confidence: number | null;
+  tripwire_fired: boolean;
 }
 
 export interface EventsResponse {
@@ -157,6 +172,41 @@ export interface ReplayStatusResponse {
   batches_emitted: number;
   consumer_error_count: number;
   consumer_failed_flow_count: number;
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/inject/scenarios | POST /api/inject (Ticket #13, wired into the
+// UI in the Phase A improvement pass — see AppHeader's InjectControl).
+// Field names copied verbatim from `backend/schemas.py`'s `ScenarioOut` /
+// `ScenariosResponse` / `InjectRequest` / `InjectResponse`.
+// ---------------------------------------------------------------------------
+
+export interface ScenarioOut {
+  name: string;
+  day: string;
+  label: string;
+  is_honeytoken: boolean;
+  description: string;
+}
+
+export interface ScenariosResponse {
+  scenarios: ScenarioOut[];
+}
+
+export interface InjectRequest {
+  scenario: string;
+  target_asset?: string | null;
+  count?: number;
+}
+
+export interface InjectResponse {
+  scenario: string;
+  target_asset: string;
+  flows_injected: number;
+  real_label: string;
+  is_honeytoken: boolean;
+  message: string;
+  replay_session_id: string | null;
 }
 
 // ---------------------------------------------------------------------------

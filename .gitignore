@@ -33,3 +33,6 @@ frontend/.next/
 frontend/out/
 .coverage
 coverage.xml
+
+# Dev scripts (scripts/dev-up.sh / dev-down.sh) — PID files and logs
+.dev/

@@ -39,6 +39,10 @@ from typing import Optional
 from backend.ingest import IngestPipeline
 from backend.replay_engine import ReplayEngine
 from backend.streaming import StreamingScorer, StreamingScorerError
+from backend.supervised_detector import (
+    SupervisedFlowScorer,
+    SupervisedFlowScorerError,
+)
 from backend.ws_broadcaster import WebSocketBroadcaster
 
 logger = logging.getLogger(__name__)
@@ -65,6 +69,13 @@ class AppRuntime:
     # exactly the "still starts, still readable" posture the rest of this
     # module already documents for a missing scorer.
     broadcaster: WebSocketBroadcaster = field(default_factory=WebSocketBroadcaster)
+    # Phase B improvement pass: the KNOWN-THREAT channel. Genuinely
+    # optional, unlike `scorer` — a missing/incompatible artifact here
+    # degrades to "two live channels" (Isolation Forest + tripwire), never
+    # a 503. See `build_runtime()` below and
+    # `SupervisedFlowScorerArtifactMissing`'s docstring.
+    supervised_scorer: Optional[SupervisedFlowScorer] = None
+    supervised_scorer_load_error: Optional[str] = None
 
 
 def build_runtime() -> AppRuntime:
@@ -106,7 +117,28 @@ def build_runtime() -> AppRuntime:
             broadcaster=broadcaster,
         )
 
-    pipeline = IngestPipeline(scorer=scorer, broadcaster=broadcaster)
+    # Phase B improvement pass: the KNOWN-THREAT channel. Genuinely
+    # optional (see AppRuntime.supervised_scorer's docstring) — a missing
+    # or incompatible artifact logs a warning and the API starts with two
+    # live channels instead of three, never a 503.
+    supervised_scorer: Optional[SupervisedFlowScorer] = None
+    supervised_scorer_load_error: Optional[str] = None
+    try:
+        supervised_scorer = SupervisedFlowScorer.load()
+    except SupervisedFlowScorerError as exc:
+        supervised_scorer_load_error = str(exc)
+        logger.warning(
+            "AppRuntime: SupervisedFlowScorer (known-threat channel) "
+            "failed to load (%s); continuing with two live detection "
+            "channels (Isolation Forest + tripwire). Build the artifact "
+            "with: PYTHONPATH=src venv/bin/python -m "
+            "backend.warmup_supervised",
+            exc,
+        )
+
+    pipeline = IngestPipeline(
+        scorer=scorer, broadcaster=broadcaster, supervised_scorer=supervised_scorer
+    )
     engine = ReplayEngine(consumer=pipeline)
     return AppRuntime(
         scorer=scorer,
@@ -115,4 +147,6 @@ def build_runtime() -> AppRuntime:
         scorer_load_error=None,
         started_at=started_at,
         broadcaster=broadcaster,
+        supervised_scorer=supervised_scorer,
+        supervised_scorer_load_error=supervised_scorer_load_error,
     )

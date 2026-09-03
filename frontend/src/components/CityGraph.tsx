@@ -280,9 +280,10 @@ function curatedNodeRadius(criticality: number): number {
 // real, unmodified topology — identical to the pre-redesign behavior.
 // Otherwise the default sector-aggregated view draws the hub, one
 // aggregate node per non-empty sector (sized by member count, D-R2), and —
-// if `focusedSector` names one — that sector's real members in place of
-// its single aggregate node ("clicking a sector expands that sector
-// inline", D-R2).
+// for every sector in `focusedSectors` — each one's real members in place
+// of its single aggregate node ("clicking a sector expands that sector
+// inline", D-R2). Stackable: any number of sectors may be focused at
+// once, not just one.
 // ---------------------------------------------------------------------------
 interface DisplayNode {
   name: string;
@@ -338,7 +339,7 @@ function realNodeToDisplay(n: TopologyResponse["nodes"][number]): DisplayNode {
 function buildDisplayTopology(
   topology: TopologyResponse,
   expanded: boolean,
-  focusedSector: string | null,
+  focusedSectors: ReadonlySet<string>,
   sectorMembers: Map<string, TopologyResponse["nodes"]>
 ): { nodes: DisplayNode[]; edges: DisplayEdge[] } {
   if (expanded) {
@@ -356,8 +357,8 @@ function buildDisplayTopology(
   }
 
   const expandedNames = new Set<string>([HUB_ASSET_NAME]);
-  if (focusedSector) {
-    for (const m of sectorMembers.get(focusedSector) ?? []) expandedNames.add(m.name);
+  for (const sector of focusedSectors) {
+    for (const m of sectorMembers.get(sector) ?? []) expandedNames.add(m.name);
   }
 
   const nodes: DisplayNode[] = [];
@@ -366,7 +367,7 @@ function buildDisplayTopology(
   }
   const maxMembers = Math.max(1, ...[...sectorMembers.values()].map((v) => v.length));
   for (const sector of SECTOR_ORDER) {
-    if (sector === focusedSector) continue;
+    if (focusedSectors.has(sector)) continue;
     const members = sectorMembers.get(sector);
     if (!members || members.length === 0) continue;
     nodes.push({
@@ -853,7 +854,8 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
   // Console redesign (D-R2): shared with `GraphPanel` (the maximise
   // control) and `SectorHealthStrip` (sector chips) via context — see
   // `@/lib/graph-focus-context` for why this can't be local state.
-  const { expanded, setExpanded, focusedSector, setFocusedSector } = useGraphFocus();
+  const { expanded, setExpanded, focusedSectors, toggleFocusedSector, focusSector, clearFocusedSectors } =
+    useGraphFocus();
 
   const knownAssets = useMemo(
     () => new Set(topology.nodes.map((n) => n.name)),
@@ -876,25 +878,25 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
   // `buildDisplayTopology`'s docstring for expanded vs. sector-aggregated
   // vs. one-sector-focused semantics.
   const displayTopology = useMemo(
-    () => buildDisplayTopology(topology, expanded, focusedSector, sectorMembers),
-    [topology, expanded, focusedSector, sectorMembers]
+    () => buildDisplayTopology(topology, expanded, focusedSectors, sectorMembers),
+    [topology, expanded, focusedSectors, sectorMembers]
   );
 
-  // Escape collapses the maximised view and clears any sector focus —
+  // Escape collapses the maximised view and clears every focused sector —
   // "Escape or the same control returns" (D-R2). Only attached while there
   // is something to collapse, so it never intercepts Escape elsewhere on
   // the page (a stray listener firing on every keypress regardless of
   // state would be its own kind of bug).
   useEffect(() => {
-    if (!expanded && !focusedSector) return;
+    if (!expanded && focusedSectors.size === 0) return;
     function onKeyDown(e: KeyboardEvent) {
       if (e.key !== "Escape") return;
       setExpanded(false);
-      setFocusedSector(null);
+      clearFocusedSectors();
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [expanded, focusedSector, setExpanded, setFocusedSector]);
+  }, [expanded, focusedSectors, setExpanded, clearFocusedSectors]);
 
   // Persistent, mutated-in-place stores — see module docstring on why
   // object identity must survive across ticks.
@@ -1338,14 +1340,18 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
     // the real origin node comes into view; other sectors still show
     // impacted membership via their aggregate node's severity/ring (see
     // the pulse-severity and cascade-ring logic elsewhere in this file).
-    // No-op if already expanded (everything is already visible) or the
-    // origin has no real sector (the hub, or a gateway/City_Grid — none
-    // of which are ever collapsed).
+    // Uses `focusSector` (ensure-focused), not the manual click path's
+    // `toggleFocusedSector` — this must never UNfocus a sector an operator
+    // already had open by hand, it only ever adds the origin's sector
+    // alongside whatever's already focused (focus is stackable). No-op if
+    // already expanded (everything is already visible) or the origin has
+    // no real sector (the hub, or a gateway/City_Grid — none of which are
+    // ever collapsed).
     if (!expanded) {
       const originSector = sectorByName.get(latestCii.origin_asset);
-      if (originSector) setFocusedSector(originSector);
+      if (originSector) focusSector(originSector);
     }
-  }, [latestCii, topology.edges, expanded, sectorByName, setFocusedSector]);
+  }, [latestCii, topology.edges, expanded, sectorByName, focusSector]);
 
   const nodeCanvasObject = useCallback(
     (node: CityNodeDatum, ctx: CanvasRenderingContext2D, globalScale: number) => {
@@ -1670,12 +1676,17 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
   ).length;
   // D-R3: legend/status line extended with sector count + aggregated vs.
   // expanded state, so the view mode is always legible without having to
-  // infer it from node count alone.
+  // infer it from node count alone. Focus is stackable, so this handles
+  // 0, 1, or many focused sectors — spelling out names only up to a point
+  // before the line would get unreasonably long.
+  const focusedSectorList = [...focusedSectors];
   const viewModeLabel = expanded
     ? "expanded · all assets"
-    : focusedSector
-      ? `sector view · ${sectorLabel(focusedSector)} focused`
-      : "sector view";
+    : focusedSectorList.length === 0
+      ? "sector view"
+      : focusedSectorList.length <= 2
+        ? `sector view · ${focusedSectorList.map(sectorLabel).join(", ")} focused`
+        : `sector view · ${focusedSectorList.length} sectors focused`;
 
   return (
     <div className="flex h-full min-h-0 w-full flex-col gap-2 overflow-hidden">
@@ -1760,9 +1771,11 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
                 if (programmaticZoomCountRef.current === 0) userFramedRef.current = true;
               }}
               // D-R2 "clicking a sector expands that sector inline":
-              // clicking a sector aggregate node focuses it (or unfocuses
-              // if it's already focused — a toggle); clicking the hub
-              // while a sector is focused returns to the fully aggregated
+              // clicking a sector aggregate node toggles it into/out of
+              // `focusedSectors` — stackable, so a second sector click
+              // adds alongside whatever's already focused rather than
+              // replacing it; clicking the hub while anything is focused
+              // clears all of them, returning to the fully aggregated
               // view. Only meaningful in the default (non-expanded) view —
               // in the expanded view every real asset is already shown, so
               // there is no aggregate node to click.
@@ -1771,9 +1784,9 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
                 const id = String(node.id);
                 if (node.isAggregate) {
                   const key = id.startsWith("sector:") ? id.slice("sector:".length) : null;
-                  if (key) setFocusedSector((prev) => (prev === key ? null : key));
-                } else if (id === HUB_ASSET_NAME && focusedSector) {
-                  setFocusedSector(null);
+                  if (key) toggleFocusedSector(key);
+                } else if (id === HUB_ASSET_NAME && focusedSectors.size > 0) {
+                  clearFocusedSectors();
                 }
               }}
             />
