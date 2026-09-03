@@ -253,6 +253,107 @@ class TestBackedUpByEdge(unittest.TestCase):
                            f"depends_on freq ({depends_d}) should be > backed_up_by freq ({backup_d})")
 
 
+class TestSharesProviderEdge(unittest.TestCase):
+    """shares_provider: edges sharing a provider_id must fire together
+    (correlated common-mode failure), not independently.
+
+    Setup: A -> B and A -> C, both shares_provider, same provider_id,
+    prob=0.6, equal criticality 0.5 each. graph_criticality_mass = 1.0
+    (B + C, A excluded as origin), so per-iteration cii (anomaly_score=1.0)
+    takes value 0.0 (neither compromised), 0.5 (exactly one), or 1.0
+    (both). Correlated sampling can only ever produce 0.0 or 1.0 — a
+    single-node outcome (0.5) would mean the shared draw was not actually
+    shared.
+    """
+
+    def test_same_provider_id_edges_never_split(self):
+        graph = [
+            {"src": "A", "tgt": "B", "edge_type": "shares_provider", "prob": 0.6,
+             "provider_id": "aws-us-east-1"},
+            {"src": "A", "tgt": "C", "edge_type": "shares_provider", "prob": 0.6,
+             "provider_id": "aws-us-east-1"},
+        ]
+        result = _run_cii_full(
+            graph, "A", 1.0, {"B": 0.5, "C": 0.5},
+            max_hops=3, mc_iterations=4000, random_seed=7,
+        )
+        split_outcomes = result.cii_scores[
+            (result.cii_scores > 0.3) & (result.cii_scores < 0.7)
+        ]
+        self.assertEqual(
+            len(split_outcomes), 0,
+            "shares_provider edges with the same provider_id must fire "
+            "together — found iterations where only one of B/C was "
+            "compromised, meaning the draw was independent, not shared.",
+        )
+        # Both bounding outcomes (neither / both) must still actually occur
+        # — otherwise the test would trivially pass on a broken "always
+        # fires" or "never fires" implementation too.
+        self.assertTrue((result.cii_scores < 0.1).any())
+        self.assertTrue((result.cii_scores > 0.9).any())
+
+    def test_same_provider_id_marginal_frequency_tracks_prob(self):
+        graph = [
+            {"src": "A", "tgt": "B", "edge_type": "shares_provider", "prob": 0.6,
+             "provider_id": "aws-us-east-1"},
+            {"src": "A", "tgt": "C", "edge_type": "shares_provider", "prob": 0.6,
+             "provider_id": "aws-us-east-1"},
+        ]
+        result = _run_cii_full(
+            graph, "A", 1.0, {"B": 0.5, "C": 0.5},
+            max_hops=3, mc_iterations=4000, random_seed=7,
+        )
+        b_freq = result.hop_details["B"]["compromise_freq"]
+        c_freq = result.hop_details["C"]["compromise_freq"]
+        self.assertAlmostEqual(b_freq, 0.6, delta=0.05)
+        self.assertAlmostEqual(c_freq, 0.6, delta=0.05)
+        # Correlated: B and C are compromised in lockstep, so their
+        # marginal frequencies must match each other almost exactly, not
+        # just both hover near 0.6 independently.
+        self.assertAlmostEqual(b_freq, c_freq, delta=0.01)
+
+    def test_different_provider_id_edges_are_independent(self):
+        """Control case: different provider_id -> no forced correlation,
+        so single-node outcomes (0.5) DO occur — confirms the correlated
+        test above isn't passing for an unrelated reason (e.g. a topology
+        that can never produce a split outcome regardless of sampling)."""
+        graph = [
+            {"src": "A", "tgt": "B", "edge_type": "shares_provider", "prob": 0.6,
+             "provider_id": "aws-us-east-1"},
+            {"src": "A", "tgt": "C", "edge_type": "shares_provider", "prob": 0.6,
+             "provider_id": "gcp-us-central1"},
+        ]
+        result = _run_cii_full(
+            graph, "A", 1.0, {"B": 0.5, "C": 0.5},
+            max_hops=3, mc_iterations=4000, random_seed=7,
+        )
+        split_outcomes = result.cii_scores[
+            (result.cii_scores > 0.3) & (result.cii_scores < 0.7)
+        ]
+        self.assertGreater(
+            len(split_outcomes), 0,
+            "different provider_ids should sample independently, "
+            "producing some single-node (split) outcomes",
+        )
+
+    def test_edges_without_provider_id_sample_independently(self):
+        """No provider_id at all (field omitted) must not crash and must
+        behave as plain independent sampling — same control shape as the
+        different-provider-id test above."""
+        graph = [
+            {"src": "A", "tgt": "B", "edge_type": "shares_provider", "prob": 0.6},
+            {"src": "A", "tgt": "C", "edge_type": "shares_provider", "prob": 0.6},
+        ]
+        result = _run_cii_full(
+            graph, "A", 1.0, {"B": 0.5, "C": 0.5},
+            max_hops=3, mc_iterations=4000, random_seed=7,
+        )
+        split_outcomes = result.cii_scores[
+            (result.cii_scores > 0.3) & (result.cii_scores < 0.7)
+        ]
+        self.assertGreater(len(split_outcomes), 0)
+
+
 class TestUncertaintyOutput(unittest.TestCase):
     """p5 <= median <= p95 for all outputs."""
 

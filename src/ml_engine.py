@@ -17,6 +17,7 @@ from detectors.statistical import MADDetector, ZScoreDetector  # noqa: F401 — 
 def preprocess_features(
     edges_df: pd.DataFrame,
     features: list[str] | None = None,
+    scaler: StandardScaler | None = None,
 ) -> tuple[np.ndarray, StandardScaler]:
     """Scale numerical features for anomaly detection.
 
@@ -27,13 +28,22 @@ def preprocess_features(
     features:
         Column names to use. Defaults to SETTINGS.ml.default_features.
         If canonical schema columns are present (`payload_size`), they are mapped automatically.
+    scaler:
+        Optional pre-fitted StandardScaler. When given, features are
+        `.transform()`-ed with it instead of fitting a new one — use this
+        to score a held-out split with statistics derived only from the
+        training split, avoiding train/eval leakage (a scaler fit on rows
+        the eval split will later be graded on lets those rows quietly
+        influence the eval split's own normalisation). When None
+        (the default), a new StandardScaler is fit via `.fit_transform()`,
+        unchanged from every existing caller's behavior.
 
     Returns
     -------
     X_scaled:
         Scaled numpy array ready for model training/inference.
     scaler:
-        Fitted StandardScaler.
+        The StandardScaler used (newly fit, or the one passed in).
     """
     df = edges_df.copy()
 
@@ -49,8 +59,11 @@ def preprocess_features(
         df["packets"] = 1
 
     X = df[features].astype(float).copy()
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    if scaler is None:
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+    else:
+        X_scaled = scaler.transform(X)
     return X_scaled, scaler
 
 

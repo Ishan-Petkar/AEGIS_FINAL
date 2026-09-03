@@ -271,12 +271,21 @@ Fix these if you touch the surrounding code; do not assume they are intentional.
   verification (`CERT_NONE`) and the `cic_ids2017_sample` URL points at an
   unrelated NSL-KDD file. The script is effectively dead; prefer manual dataset
   placement.
-- **`cii_calculator._simulate_one_iteration`** — the `shares_provider` branch
+~~**`cii_calculator._simulate_one_iteration`** — the `shares_provider` branch
   documents correlated common-mode failure but samples independently, identical
   to the default branch. The `provider_id` edge attribute is plumbed through but
-  unused. No edge in `config.DEPENDENCY_GRAPH` currently uses either
-  `shares_provider` or `backed_up_by`, so only the fixtures in
-  `tests/conftest.py` reach that code.
+  unused.~~ — fixed 2026-09-03 (Phase C methodology-rigor pass): edges sharing a
+  `provider_id` now draw one Bernoulli per provider per Monte Carlo iteration
+  and reuse that outcome for every edge in the group, instead of sampling each
+  edge independently; an edge with no `provider_id` still samples independently.
+  Pinned by `tests/test_cii_calculator.py::TestSharesProviderEdge` (4 tests:
+  same-provider-id edges never split into a single-node outcome, marginal
+  compromise frequency still tracks the configured probability, and two
+  control cases — different provider_id, no provider_id — confirm independent
+  sampling still occurs where it should). No edge in `config.DEPENDENCY_GRAPH`
+  currently uses `shares_provider` (or `backed_up_by`), so this has no effect
+  on any currently-published CII number — only on the correctness of the code
+  path if the graph grows to use it.
 - **`src/config.py` is partly dead.** `PAGE_TITLE`, `PAGE_ICON`, `PAGE_LAYOUT`,
   `CUSTOM_CSS`, and `HEADER_HTML` are duplicated inline in `aegis_demo.py`
   rather than imported. Only `FINANCIAL_TYPES`, `DEPENDENCY_GRAPH`,

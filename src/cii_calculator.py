@@ -116,6 +116,14 @@ def _simulate_one_iteration(
     compromised: dict[str, int] = {source_node: 0}  # node → hop at which compromised
     queue: list[tuple[str, int]] = [(source_node, 0)]
 
+    # Common-mode failure: every shares_provider edge sharing the same
+    # provider_id draws ONE Bernoulli per iteration and reuses it, so they
+    # fire together or not at all — the correlation the edge type is named
+    # for. Populated lazily (first edge for a given provider_id wins the
+    # draw); an edge with no provider_id has nothing to correlate with and
+    # falls back to independent sampling, same as any other edge type.
+    provider_outcomes: dict[str, bool] = {}
+
     while queue:
         current_node, hop = queue.pop(0)
 
@@ -144,13 +152,17 @@ def _simulate_one_iteration(
                     pass
                 continue
             elif edge_type == "shares_provider":
-                # Common-mode failure: edges sharing the same provider_id
-                # are correlated. For simplicity in this iteration, we sample
-                # once per provider_id per iteration and reuse the result.
-                # This is handled via the provider_failures dict passed from
-                # the outer function — but since we're in the inner function,
-                # we just use base_prob directly (the outer loop handles correlation).
-                if rng.random() < base_prob:
+                # Common-mode failure: draw once per provider_id per
+                # iteration and reuse that outcome for every edge sharing
+                # it, rather than sampling each edge independently.
+                provider_id = edge_data.get("provider_id")
+                if provider_id is None:
+                    fires = rng.random() < base_prob
+                else:
+                    if provider_id not in provider_outcomes:
+                        provider_outcomes[provider_id] = rng.random() < base_prob
+                    fires = provider_outcomes[provider_id]
+                if fires:
                     compromised[neighbor] = hop + 1
                     queue.append((neighbor, hop + 1))
             else:

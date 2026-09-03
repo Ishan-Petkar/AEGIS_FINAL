@@ -208,7 +208,8 @@ def run_evaluation(
     y_true = (df["action"] == ACTION_ALERT).astype(int).values  # 1 = anomaly
 
     # ------------------------------------------------------------------
-    # 3. Extract features
+    # 3. Feature columns (scaling deferred to step 4b — done per-split, not
+    #    on the full dataset, to avoid train/eval leakage)
     # ------------------------------------------------------------------
     from datasets.schema import CANONICAL_COLUMNS
     from ml_engine import preprocess_features
@@ -226,8 +227,6 @@ def run_evaluation(
             if col not in df.columns:
                 df[col] = 0.0
 
-    X_full, _ = preprocess_features(df, features=feature_cols)
-
     # ------------------------------------------------------------------
     # 4. Train/eval split — train on benign-only subset
     # ------------------------------------------------------------------
@@ -236,19 +235,22 @@ def run_evaluation(
     rng.shuffle(benign_idx)
     n_train = int(len(benign_idx) * train_fraction)
     train_idx = benign_idx[:n_train]
-    X_train = X_full[train_idx]
 
     # Evaluation covers the entire dataset (all attacks + remaining benign).
     # Kept in original chronological order (not shuffled) — point-wise
     # metrics are order-invariant, but segment-wise scoring (SWaT) requires
     # contiguity to mean anything, so this must never be shuffled.
     eval_idx = np.sort(np.concatenate([benign_idx[n_train:], np.where(y_true == 1)[0]]))
-    X_eval = X_full[eval_idx]
     y_eval = y_true[eval_idx]
 
     # ------------------------------------------------------------------
     # 4b. Degenerate-split guard — replaces the old silent
-    #     P=0.000 R=0.000 F1=0.000 AUC=nan failure mode.
+    #     P=0.000 R=0.000 F1=0.000 AUC=nan failure mode. Must run BEFORE
+    #     step 4c's scaling: an all-anomalous split makes train_idx empty
+    #     (benign_idx has nothing to take a training fraction from), and
+    #     StandardScaler.fit() on zero rows raises sklearn's own opaque
+    #     "Found array with 0 sample(s)" ValueError — the guard's actual,
+    #     informative DegenerateEvaluationError must win that race.
     # ------------------------------------------------------------------
     lo = min_positive_rate if min_positive_rate is not None else SETTINGS.evaluation.min_positive_rate
     hi = max_positive_rate if max_positive_rate is not None else SETTINGS.evaluation.max_positive_rate
@@ -268,6 +270,17 @@ def run_evaluation(
             "truth, or adjust the min/max_positive_rate bounds if this "
             "split is intentional."
         )
+
+    # ------------------------------------------------------------------
+    # 4c. Scale — fit StandardScaler on the TRAIN split ONLY, then
+    #     .transform() (never .fit_transform()) the eval split. The
+    #     previous code fit the scaler on the full dataset before
+    #     splitting, so the eval split's own attack rows influenced the
+    #     mean_/scale_ used to normalise it — a train/eval leak (Phase C
+    #     methodology-rigor pass, docs/EVALUATION.md).
+    # ------------------------------------------------------------------
+    X_train, scaler = preprocess_features(df.iloc[train_idx], features=feature_cols)
+    X_eval, _ = preprocess_features(df.iloc[eval_idx], features=feature_cols, scaler=scaler)
 
     if verbose:
         print(f"[evaluation] Train: {len(X_train)} benign rows | "

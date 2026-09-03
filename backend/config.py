@@ -453,6 +453,21 @@ class BackendSettings(BaseSettings):
             "itself are provided in Ticket #2."
         ),
     )
+    db_event_retention_max_age_days: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Optional age-based retention bound, applied alongside "
+            "db_event_retention_max_rows rather than instead of it — "
+            "prune_events() deletes any event caught by EITHER bound (the "
+            "oldest rows beyond the row cap, and every row older than this "
+            "many days). None (the default) disables the age bound "
+            "entirely, matching this setting's absence before Phase C — "
+            "row-count retention alone was sufficient at demo scale, but "
+            "the first question a real-deployment review asks is 'how long "
+            "is data kept', which a pure row cap can't answer on its own."
+        ),
+    )
 
     # ---- Ingest pipeline (Ticket #7) ------------------------------------
     cii_debounce_sec: float = Field(

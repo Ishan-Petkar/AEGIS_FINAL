@@ -31,7 +31,7 @@ from backend.models import (
     Event,
     EventScore,
 )
-from backend.retention import _rows_to_prune
+from backend.retention import _age_cutoff, _rows_to_prune
 from backend.seed import compute_seed_rows
 
 # ---------------------------------------------------------------------------
@@ -432,6 +432,16 @@ def test_rows_to_prune_never_negative():
     assert _rows_to_prune(total_count=10, max_rows=1_000_000) == 0
 
 
+def test_age_cutoff_is_now_minus_max_age_days():
+    now = datetime(2026, 9, 3, 12, 0, 0, tzinfo=timezone.utc)
+    assert _age_cutoff(now, max_age_days=30) == now - timedelta(days=30)
+
+
+def test_age_cutoff_one_day():
+    now = datetime(2026, 9, 3, 0, 0, 0, tzinfo=timezone.utc)
+    assert _age_cutoff(now, max_age_days=1) == datetime(2026, 9, 2, 0, 0, 0, tzinfo=timezone.utc)
+
+
 # ---------------------------------------------------------------------------
 # Live-DB tests — opt-in only (AEGIS_TEST_LIVE_DB=1), skipped by default.
 # ---------------------------------------------------------------------------
@@ -488,7 +498,12 @@ def test_live_create_tables_and_seed_assets(live_session):
     live_session.commit()
     assert result2["created"] == 0
     assert result2["updated"] == 0
-    assert live_session.query(Asset).count() == 16
+    # Same count as before the no-op re-seed (asserted 50 twice above) — this
+    # line read 16 until 2026-09-03, a leftover from the pre-scale-up 16-node
+    # topology that the two assertions above were updated for and this one was
+    # not. It only ever ran under AEGIS_TEST_LIVE_DB=1, so the default posture
+    # never surfaced it.
+    assert live_session.query(Asset).count() == 50
 
 
 @pytestmark_live
@@ -766,5 +781,82 @@ def test_live_prune_events_keeps_most_recent_n(live_session):
     assert not ({"prune-row-0", "prune-row-1", "prune-row-2", "prune-row-3"} & remaining_row_ids)
 
     # cleanup any leftovers from this batch
+    live_session.query(Event).filter(Event.replay_session_id == session_id).delete(synchronize_session=False)
+    live_session.commit()
+
+
+@pytestmark_live
+def test_live_prune_events_deletes_events_older_than_max_age_days(live_session):
+    """Age bound applies even when the row count is nowhere near the cap —
+    the two bounds are independent, not "age only matters once count is
+    also over the limit"."""
+    from backend.retention import prune_events
+
+    session_id = uuid.uuid4()
+    now = datetime.now(timezone.utc)
+    old_id = None
+    for label, ts in [("old", now - timedelta(days=10)), ("recent", now - timedelta(days=1))]:
+        event = Event(
+            ts=ts,
+            signal_type="network_flow",
+            timing_provenance=TIMING_PROVENANCE_CAPTURE_SECONDS,
+            replay_session_id=session_id,
+            source_row_id=f"age-prune-{label}",
+        )
+        live_session.add(event)
+        live_session.flush()
+        if label == "old":
+            old_id = event.id
+    live_session.commit()
+
+    # max_rows huge (row cap never fires) — only the age bound is in play.
+    deleted = prune_events(live_session, max_rows=1_000_000, max_age_days=5, now=now)
+    live_session.commit()
+    assert deleted >= 1
+
+    remaining_from_batch = {
+        r[0]
+        for r in live_session.query(Event.source_row_id)
+        .filter(Event.replay_session_id == session_id)
+        .all()
+    }
+    assert "age-prune-old" not in remaining_from_batch
+    assert "age-prune-recent" in remaining_from_batch
+    assert live_session.get(Event, old_id) is None
+
+    live_session.query(Event).filter(Event.replay_session_id == session_id).delete(synchronize_session=False)
+    live_session.commit()
+
+
+@pytestmark_live
+def test_live_prune_events_age_bound_disabled_by_default(live_session):
+    """max_age_days=None (the default) must never delete on age alone —
+    the row-count bound is unaffected and unchanged from before this
+    feature existed."""
+    from backend.retention import prune_events
+
+    session_id = uuid.uuid4()
+    ancient = datetime.now(timezone.utc) - timedelta(days=3650)
+    event = Event(
+        ts=ancient,
+        signal_type="network_flow",
+        timing_provenance=TIMING_PROVENANCE_CAPTURE_SECONDS,
+        replay_session_id=session_id,
+        source_row_id="ancient-row",
+    )
+    live_session.add(event)
+    live_session.commit()
+
+    deleted = prune_events(live_session, max_rows=1_000_000, max_age_days=None)
+    live_session.commit()
+    assert deleted == 0
+
+    remaining = (
+        live_session.query(Event.source_row_id)
+        .filter(Event.replay_session_id == session_id)
+        .all()
+    )
+    assert {r[0] for r in remaining} == {"ancient-row"}
+
     live_session.query(Event).filter(Event.replay_session_id == session_id).delete(synchronize_session=False)
     live_session.commit()

@@ -84,6 +84,47 @@ class TestPreprocessFeatures(unittest.TestCase):
         preprocess_features(df)
         self.assertEqual(set(df.columns), original_columns)
 
+    def test_given_scaler_is_returned_unchanged_not_refit(self):
+        """Passing a pre-fitted scaler must transform() with it, not fit a
+        new one — the mean_/scale_ must be byte-identical before and after,
+        the same invariant test_streaming_scorer.py pins for the streaming
+        path (Invariant B), now also true of this shared helper."""
+        train_df = _sample_edges_df(n=30, seed=1)
+        eval_df = _sample_edges_df(n=20, seed=2)
+
+        _, fitted_scaler = preprocess_features(train_df)
+        mean_before = fitted_scaler.mean_.copy()
+        scale_before = fitted_scaler.scale_.copy()
+
+        _, returned_scaler = preprocess_features(eval_df, scaler=fitted_scaler)
+
+        self.assertIs(returned_scaler, fitted_scaler)
+        np.testing.assert_array_equal(fitted_scaler.mean_, mean_before)
+        np.testing.assert_array_equal(fitted_scaler.scale_, scale_before)
+
+    def test_given_scaler_transforms_using_its_own_statistics(self):
+        """A row scaled with a pre-fitted scaler must match calling
+        scaler.transform() directly — proving preprocess_features actually
+        delegates rather than silently refitting."""
+        train_df = _sample_edges_df(n=30, seed=1)
+        eval_df = _sample_edges_df(n=20, seed=2)
+
+        _, fitted_scaler = preprocess_features(train_df)
+        X_eval_via_helper, _ = preprocess_features(eval_df, scaler=fitted_scaler)
+
+        raw = eval_df[list(SETTINGS.ml.default_features)].astype(float)
+        X_eval_direct = fitted_scaler.transform(raw)
+
+        np.testing.assert_array_almost_equal(X_eval_via_helper, X_eval_direct)
+
+    def test_omitting_scaler_still_fits_a_new_one(self):
+        """Default (scaler=None) behavior is unchanged — every existing
+        caller that never passes scaler= keeps fitting fresh."""
+        df = _sample_edges_df()
+        X_scaled, scaler = preprocess_features(df)
+        self.assertTrue(hasattr(scaler, "mean_"))
+        np.testing.assert_array_almost_equal(scaler.mean_, df[list(SETTINGS.ml.default_features)].astype(float).mean().values)
+
 
 class TestTrainIsolationForest(unittest.TestCase):
 

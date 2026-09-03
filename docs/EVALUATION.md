@@ -125,6 +125,10 @@ a hand-typed figure.
 
 ### 2.3 Actual output (CIC-IDS2017, this repo's local dataset copy)
 
+**Re-measured 2026-09-03** after the Phase C methodology-rigor fix below
+(§2.4) — republished rather than assumed unchanged, per that fix's own
+acceptance criterion.
+
 ```
 $ PYTHONPATH=src venv/bin/python -m evaluation --dataset cic_ids2017 --limit 20000 --no-ocsvm
 [evaluation] Train: 7126 benign rows | Eval: 15730 rows (54.7% anomalies)
@@ -137,7 +141,7 @@ AEGIS Phase 3 — Anomaly Detection Evaluation Results
 ========================================================================
 [Isolation Forest] P=0.718  R=0.170  F1=0.275  AUC=0.643  (pred 2042/8604 anomalies from 15730 samples, pointwise)
 [Z-Score (baseline)] P=0.203  R=0.016  F1=0.030  AUC=0.466  (pred 685/8604 anomalies from 15730 samples, pointwise)
-[MAD (baseline)] P=0.667  R=0.539  F1=0.596  AUC=0.676  (pred 6949/8604 anomalies from 15730 samples, pointwise)
+[MAD (baseline)] P=0.667  R=0.539  F1=0.596  AUC=0.677  (pred 6949/8604 anomalies from 15730 samples, pointwise)
 ========================================================================
 ```
 
@@ -147,6 +151,33 @@ three at this row limit; Z-Score barely beats random. This is expected —
 `duration_sec`/`packets`/`bytes` alone is a weak feature set, and the point
 of this harness is to report that plainly rather than cherry-pick a
 flattering slice.
+
+### 2.4 Train/eval scaler leakage fix (Phase C)
+
+Before 2026-09-03, `preprocess_features()` was called once on the **full**
+dataset (`X_full = preprocess_features(df, ...)`) and only split into
+`X_train`/`X_eval` afterward by slicing the already-scaled array. That
+means `StandardScaler.fit()` saw every row, eval split included — the
+eval split's own attack rows quietly influenced the `mean_`/`scale_` used
+to normalise it, a train/eval leak. Small in practice (see the re-measured
+numbers above, which move by ≤0.001 on every metric), but exactly the kind
+of thing a methodologically careful reviewer checks first, and the honest
+answer before this fix would have been "yes, there's a small leak."
+
+Fixed: `preprocess_features()` (`src/ml_engine.py`) now accepts an optional
+`scaler` parameter — when given, it `.transform()`s with it instead of
+fitting a new one. `run_evaluation()` computes the train/eval split
+**before** touching the scaler, fits on `X_train` only
+(`scaler=None`, the default — fits fresh), then transforms `X_eval` with
+that same fitted scaler (`scaler=scaler`). The degenerate-split guard
+(§3) was moved to run before this scaling step, since an all-anomalous
+split makes the train slice empty and `StandardScaler.fit()` on zero rows
+raises its own opaque error — the guard's informative
+`DegenerateEvaluationError` must win that race, not sklearn's.
+
+Every other caller of `preprocess_features()` (the live Research Console
+pipeline, `backend/streaming.py`'s warmup fit) never passes `scaler=`, so
+their behavior — fit fresh every time — is byte-for-byte unchanged.
 
 ---
 
@@ -320,6 +351,13 @@ in `evaluation/metrics.py`'s module docstring.
 ordinary point-wise scoring (`EvalResult.scoring` records which was used).
 
 ### 5.3 A real trap this caught while building the harness
+
+**Re-measured 2026-09-03** alongside §2.3/§2.4 — identical to the
+pre-fix numbers to 6 decimal places, confirming the scaler-leakage fix
+(§2.4) has no material effect on SWaT's segment-wise scoring at this
+scale (unsurprising: SWaT's feature set is much larger and its 693,549
+benign training rows dwarf the ~54,621-row eval-only attack segment that
+was the source of the leak's — small to begin with — influence).
 
 `datasets/SWaT/merged.csv` (this repo's local copy) is
 `normal.csv` + `attack.csv` concatenated: **1,387,098 consecutive Normal
