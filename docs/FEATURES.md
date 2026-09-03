@@ -2,8 +2,8 @@
 
 What's actually built and running, versus what's planned. Code is
 authoritative over this document — if the two disagree, trust the code
-(see `CLAUDE.md` §8). Compiled 2026-09-03 from the current tree, not
-carried forward from older planning docs.
+(see `CLAUDE.md` §8). Compiled 2026-09-03, updated same day after the
+Hybrid IDS landed — not carried forward from older planning docs.
 
 ---
 
@@ -44,7 +44,7 @@ carried forward from older planning docs.
 | Tool | Role |
 |---|---|
 | ruff | Python lint (`src/`, `backend/`) |
-| pytest + pytest-cov | 596+ tests, coverage |
+| pytest + pytest-cov | 662+ tests, coverage |
 | eslint (`eslint-config-next`) | Frontend lint |
 | Custom AST duplicate-def checker | CI — no function/class defined twice in `src/*.py` |
 | `scripts/dev-up.sh` / `dev-down.sh` / `dev-open.sh` | One-command local dev lifecycle |
@@ -62,6 +62,9 @@ carried forward from older planning docs.
 This three-channel split is the project's actual research contribution: an
 honest, measured demonstration of *why* each paradigm alone is
 insufficient, and why the deception layer exists (`docs/DETECTION_STUDY.md`).
+A fourth and fifth detector (signature rules, temporal beaconing) now
+correlate alongside these three rather than replacing the research
+narrative — see §3.
 
 ### Evaluation methodology (the part that survives a careful second look)
 - Segment-wise recall / row-wise precision for time-series (SWaT) — a
@@ -76,7 +79,78 @@ insufficient, and why the deception layer exists (`docs/DETECTION_STUDY.md`).
 
 ---
 
-## 3. Cascading Impact Index (CII) — blast-radius engine
+## 3. Hybrid IDS — correlating five detectors into one decision
+
+Added 2026-09-03. Sits alongside the three-channel research narrative in
+§2, not in place of it: every existing channel's own verdict feeds into
+this layer unchanged, adapted rather than recomputed.
+
+```
+ReplayFlow ──► FlowFeatures (ground-truth fields excluded by construction)
+                     │
+        ┌────────────┼─────────────┬──────────────┬───────────────┐
+        ▼            ▼             ▼              ▼               ▼
+   volumetric     tripwire     supervised     signature       beaconing
+  (adapted)      (adapted)     (adapted)      (new)            (new)
+        └────────────┴─────────────┴──────────────┴───────────────┘
+                              │
+                    HybridFusionEngine
+                              │
+                        FusedDecision
+                              │
+              existing risk / CII / alerts / persistence / WS
+```
+
+**Contracts** (`backend/detection/contracts.py`) — `FlowFeatures` is a
+label-free projection of a flow; it structurally cannot carry
+`ReplayFlow.label`/`.is_attack`, so no detector fed through this layer can
+leak ground truth even by accident. `Certainty.CONFIRMED` vs `HEURISTIC`
+on every verdict is what lets the honeytoken tripwire escalate a fused
+decision to `threat_score = 1.0` without being diluted by a
+0.02-precision volumetric signal firing alongside it.
+
+**Two new detectors**:
+- **Signature engine** (`backend/detection/signature.py`) — 4 declarative
+  rules over flow metadata only (this project has flow records, not
+  payloads, so it is explicitly not a Snort/Suricata-style payload IDS):
+  known-bad address, outbound small-payload-to-high-port (C2-shaped),
+  high-risk admin port, external-to-database-port. Measured **0.56%**
+  firing rate on 40,000 real friday-morning flows — tuned down from an
+  initial 20.0% after finding the predicate matched ordinary service-port
+  *responses*, not just client-initiated beacons.
+- **Beaconing detector** (`backend/detection/beaconing.py`) — per-`(src,
+  dst)` inter-arrival coefficient-of-variation, the direct answer to §2's
+  volumetric blind spot (a beacon's signal is timing regularity, which no
+  per-flow volumetric feature can carry). Stateful — one long-lived
+  instance per pipeline, LRU-bounded per-pair history.
+
+**Fusion** (`backend/detection/fusion.py`) — confirmed-signal precedence
+first (any fired `CONFIRMED` verdict wins outright, `threat_score = 1.0`,
+never averaged), otherwise weighted noisy-OR over fired heuristic
+verdicts (`1 - Π(1 - score×reliability)`), banded against configured
+thresholds. Reliability weights default to each channel's own *measured*
+precision from `docs/DETECTION_STUDY.md` (volumetric 0.02, supervised
+0.90, tripwire 1.0) — beaconing's weight (0.50) is explicitly flagged as
+an unmeasured placeholder, not evidence of quality.
+
+**Shipped posture — observable, not yet authoritative**:
+`hybrid_enabled=True` (the layer runs on every batch and persists a
+`hybrid` `event_scores` row + an additive `hybrid` key in the WebSocket
+envelope), but `hybrid_gates_alerts=False` — it cannot yet create an
+alert the existing tripwire/volumetric policy would not have created on
+its own. Turning that on is a deliberate future policy change requiring
+re-measurement, not a tuning knob. Live-verified: the existing tripwire
+alert path (title, severity, debounce, risk index) is byte-for-byte
+unchanged with the hybrid layer running underneath it.
+
+**Deferred for IPS**: `ResponseAction.THROTTLE`/`.BLOCK` are declared in
+the contract but never produced by the fusion engine and nothing consumes
+them yet — this is detection and advisory alerting only, no active
+prevention.
+
+---
+
+## 4. Cascading Impact Index (CII) — blast-radius engine
 
 - **Monte Carlo simulation** over a hand-curated 45-asset / 63-edge
   dependency graph (rendered as 50 nodes / 75 edges after gateway
@@ -98,7 +172,7 @@ insufficient, and why the deception layer exists (`docs/DETECTION_STUDY.md`).
 
 ---
 
-## 4. Real-time Operations Console (backend + frontend)
+## 5. Real-time Operations Console (backend + frontend)
 
 ### Data pipeline
 - **Real captured traffic replay** — CIC-IDS2017 (2017 network capture,
@@ -171,7 +245,7 @@ insufficient, and why the deception layer exists (`docs/DETECTION_STUDY.md`).
 
 ---
 
-## 5. Frontend UX details
+## 6. Frontend UX details
 
 - Freeze-on-hover/scroll telemetry feed with an honest "Paused · N new"
   badge — display only, the stream keeps receiving underneath
@@ -187,11 +261,12 @@ insufficient, and why the deception layer exists (`docs/DETECTION_STUDY.md`).
 
 ---
 
-## 6. Testing & CI discipline
+## 7. Testing & CI discipline
 
-- **596 tests passing** (with live Postgres), 581 passing / 15 skipped in
-  the default no-DB posture — skips are real-dataset / live-DB tests
-  gated on actual data/DB presence, not silent failures
+- **662 passing / 15 skipped** in the default no-DB posture (skips are
+  real-dataset / live-DB tests gated on actual data/DB presence, not
+  silent failures) — **677 passing / 0 skipped** with a real Postgres
+  present, see §10
 - ruff clean, zero duplicate top-level definitions across `src/*.py`
   (CI-enforced)
 - Every public function follows an optional-override signature
@@ -203,7 +278,7 @@ insufficient, and why the deception layer exists (`docs/DETECTION_STUDY.md`).
 
 ---
 
-## 7. Known, documented limitations (stated on purpose, not hidden)
+## 8. Known, documented limitations (stated on purpose, not hidden)
 
 - Unsupervised detector: ~0.02 precision on real traffic — a genuine,
   published finding, not a bug to be quietly patched over
@@ -220,29 +295,36 @@ insufficient, and why the deception layer exists (`docs/DETECTION_STUDY.md`).
 
 ---
 
-## 8. Planned / not yet implemented
+## 9. Planned / not yet implemented
 
 Ordered by how soon each would matter, not by difficulty.
 
 ### Near-term (would harden the current demo)
-- [ ] **Temporal/beaconing features** for the unsupervised channel — per
-  `(src, dst)` inter-arrival deltas, periodicity/jitter, FFT peak. The
-  current volumetric features are demonstrably the wrong signal for C2
-  beaconing (median 6 bytes vs 70 for benign); this is the cheapest fix
-  that targets the actual measured failure, needs no labels
+- [x] ~~Temporal/beaconing features for the unsupervised channel~~ —
+  **done 2026-09-03**, see §3 (`backend/detection/beaconing.py`)
+- [ ] Turn `hybrid_gates_alerts` on (currently `False` — the hybrid layer
+  observes and persists but cannot yet create an alert on its own
+  authority). Requires re-measuring precision/recall with the widened
+  gate before flipping the default, per that setting's own docstring
 - [ ] Fix the 2-of-4 scripted-attack gateway coverage gap (Camera
   Spoofing / Data Exfiltration currently recon against a gateway with no
   materialized protected asset)
 - [ ] Resolve/clarify the "three channels" framing everywhere it's
-  written, now that the supervised channel is documented as benchmarked
-  offline rather than scored live in the same loop as the other two
+  written — now sharper, not settled, now that §3 adds two more detector
+  inputs (signature, beaconing) feeding the same fused decision. "Three
+  channels, benchmarked" and "five detectors, fused" are both currently
+  true statements about different parts of the system and need one
+  consistent story in the pitch materials
 
 ### Research-grade upgrades (bigger lift, real differentiator)
 - [ ] **Graph neural network** for novel-threat detection (Anomal-E /
   E-GraphSAGE style) — self-supervised, edge-aware, no labels required;
   would also give the "observed traffic doesn't map onto curated assets"
   gap a principled learned-topology answer instead of two disconnected
-  layers
+  layers. Complementary to, not superseded by, §3's signature/beaconing
+  detectors: those catch specific known shapes (rules) and one specific
+  temporal pattern (periodicity); a GNN would learn structure a
+  hand-written rule or a single-pair statistic cannot express
 - [ ] **Learned edge probabilities** for the CII dependency graph (Bayesian
   attack graph posterior updates from observed telemetry) instead of the
   current hand-assigned static probabilities
@@ -266,8 +348,17 @@ Ordered by how soon each would matter, not by difficulty.
 
 ---
 
-## 9. Where each of these came from
+## 10. Where each of these came from
 
+- Hybrid IDS: `backend/detection/` module docstrings; signature engine
+  firing-rate measurements (20.0% -> 0.56%) run directly against real
+  friday-morning flows during this pass, not estimated; full-suite counts
+  (662 default posture / 677 with live Postgres) verified twice — the
+  first live-DB run surfaced one more pre-existing row-count assumption
+  (test_live_roundtrip_persists_events_and_scores, the same class of
+  issue as 4 default-posture tests fixed earlier in this pass) that the
+  default-posture run alone could not have caught, since that test is
+  gated on AEGIS_TEST_LIVE_DB=1
 - Detection numbers: `docs/DETECTION_STUDY.md`, `docs/EVALUATION.md`
 - CII engine details: `src/cii_calculator.py`, `CLAUDE.md` §4
 - Operations Console history: `docs/PHASE5_STATE.md` (per-ticket build log)

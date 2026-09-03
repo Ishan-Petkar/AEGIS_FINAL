@@ -1057,6 +1057,15 @@ def test_live_roundtrip_persists_events_and_scores(live_pipeline_session):
     pipeline = IngestPipeline(
         scorer=FakeScorer(anomaly_flags=[False, True, False]),
         session_factory=scoped,
+        # This test is about DB roundtrip integrity (real FK linkage, real
+        # timestamp population, real row counts against Postgres) -- not
+        # about the hybrid layer's own separately-tested row. Disabled so
+        # the exact-count assertion below stays meaningful; mirrors the
+        # same hybrid_enabled=False scoping already applied to this file's
+        # non-live row-count tests (test_tripwire_score_row_only_written_
+        # when_it_fires, test_no_supervised_row_when_channel_not_
+        # configured, test_deduplicated_rows_get_no_duplicate_scores).
+        hybrid_enabled=False,
     )
     flows = [make_flow(f"live:{i}", ts_offset=i) for i in range(3)]
     result = pipeline(flows, make_meta(session_id=session_id))
