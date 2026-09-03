@@ -722,6 +722,280 @@ class BackendSettings(BaseSettings):
         ),
     )
 
+    # ---- Hybrid IDS: fusion layer -----------------------------------------
+    hybrid_enabled: bool = Field(
+        default=True,
+        description=(
+            "Master switch for the Hybrid IDS layer (backend/detection/). "
+            "When True the signature and beaconing detectors run, their "
+            "verdicts are fused, and the fused decision is persisted as a "
+            "'hybrid' event_scores row and included in the live WebSocket "
+            "envelope. When False the pipeline behaves exactly as it did "
+            "before the hybrid layer existed — the switch is what makes "
+            "that claim testable rather than asserted."
+        ),
+    )
+    hybrid_gates_alerts: bool = Field(
+        default=False,
+        description=(
+            "Whether the fused decision may CREATE alerts the existing "
+            "policy would not have created. Default False deliberately: "
+            "P5-15's alert policy (tripwire always alerts, volumetric-only "
+            "is suppressed at ~0.02 precision) and every alert/risk figure "
+            "already published are derived from that policy, so the hybrid "
+            "layer ships observable-but-not-authoritative first. Turning "
+            "this on is a policy change that must be re-measured, not a "
+            "tuning knob. A CONFIRMED signal (honeytoken) alerts either "
+            "way — that path never depended on this flag."
+        ),
+    )
+    hybrid_band_suspicious: float = Field(
+        default=0.25,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Fused threat_score at or above which a decision is banded "
+            "SUSPICIOUS rather than BENIGN (ThreatBand, "
+            "backend/detection/contracts.py)."
+        ),
+    )
+    hybrid_band_likely: float = Field(
+        default=0.55,
+        ge=0.0,
+        le=1.0,
+        description="Fused threat_score at or above which a decision is banded LIKELY.",
+    )
+    hybrid_band_confirmed: float = Field(
+        default=0.85,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Fused threat_score at or above which a decision is banded "
+            "CONFIRMED. A Certainty.CONFIRMED verdict (honeytoken) reaches "
+            "this band by precedence regardless of the numeric score — see "
+            "HybridFusionEngine's precedence rule."
+        ),
+    )
+
+    # ---- Hybrid IDS: per-detector reliability weights ---------------------
+    # Every default below is a MEASURED figure from docs/DETECTION_STUDY.md,
+    # not a tuned guess. Fusion multiplies each detector's calibrated score
+    # by its weight, so these are the single place where "how much do we
+    # trust this channel" is stated, and they are stated honestly — the
+    # volumetric channel's 0.02 is its real precision, and keeping it that
+    # low is what stops ~800 junk signals per replay day from moving the
+    # fused score.
+    hybrid_weight_volumetric: float = Field(
+        default=0.02,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Reliability weight for the unsupervised volumetric channel "
+            "(StreamingScorer). 0.02 IS its measured precision on real "
+            "friday-morning traffic (5 TP / 811 FP). Deliberately not "
+            "rounded up: a detector this imprecise must not be able to "
+            "raise the fused score on its own."
+        ),
+    )
+    hybrid_weight_supervised: float = Field(
+        default=0.90,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Reliability weight for the supervised known-threat channel "
+            "(SupervisedFlowScorer). Its measured in-distribution "
+            "precision is 0.998 (temporal split), but the SAME study "
+            "measured precision 0.000 on a novel attack family, so the "
+            "weight is discounted below the in-distribution figure rather "
+            "than taking the flattering number at face value."
+        ),
+    )
+    hybrid_weight_tripwire: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Reliability weight for the honeytoken tripwire. 1.0 because a "
+            "credential with zero legitimate use cannot produce a false "
+            "positive. Note the weight is not what makes the tripwire "
+            "decisive — Certainty.CONFIRMED precedence is."
+        ),
+    )
+    hybrid_weight_signature: float = Field(
+        default=0.85,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Reliability weight for the rule/signature engine. High "
+            "because a matched rule is an exact statement about observable "
+            "flow metadata, not an inference — but below 1.0 because the "
+            "rules match on metadata only (CIC-IDS2017 carries no "
+            "payloads), so a benign flow can legitimately look like a "
+            "rule's target."
+        ),
+    )
+    hybrid_weight_beaconing: float = Field(
+        default=0.50,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Reliability weight for the temporal/beaconing detector. "
+            "Deliberately mid-range and explicitly UNMEASURED on this "
+            "corpus at time of writing — unlike the other four weights "
+            "there is no precision figure behind it yet. Treat it as a "
+            "placeholder to be replaced by a measurement, and do not cite "
+            "it as evidence of the channel's quality."
+        ),
+    )
+
+    # ---- Hybrid IDS: beaconing (temporal) detector ------------------------
+    beaconing_enabled: bool = Field(
+        default=True,
+        description=(
+            "Whether the temporal/periodicity detector runs. It addresses "
+            "the volumetric channel's documented structural blind spot: "
+            "Bot C2 beacons are SMALLER than benign traffic (median 6 "
+            "bytes vs 70), so an outlier detector over volume looks in the "
+            "wrong direction, while the beacon's regular inter-arrival "
+            "rhythm is a signal no per-flow volumetric feature can carry."
+        ),
+    )
+    beaconing_min_samples: int = Field(
+        default=5,
+        ge=3,
+        le=1000,
+        description=(
+            "Minimum flows observed for one (src_ip, dst_ip) pair before "
+            "the beaconing detector will render any verdict on it. Below "
+            "this the interval sample is too small for a coefficient of "
+            "variation to mean anything, and the detector abstains "
+            "(fired=False, calibrated_score=0.0) rather than guessing. "
+            "Minimum 3 because n intervals needs n+1 observations."
+        ),
+    )
+    beaconing_history_per_pair: int = Field(
+        default=32,
+        ge=4,
+        le=4096,
+        description=(
+            "Timestamps retained per tracked pair (ring buffer). Bounds "
+            "per-pair memory and keeps the CV window recent — a beacon that "
+            "started an hour ago should be judged on its current rhythm."
+        ),
+    )
+    beaconing_max_tracked_pairs: int = Field(
+        default=20_000,
+        ge=100,
+        le=2_000_000,
+        description=(
+            "LRU cap on tracked (src_ip, dst_ip) pairs. Unbounded state is "
+            "a real risk here, not a theoretical one: risk T5 records that "
+            "one auto-registered node appears per unique unresolved IP, and "
+            "a replay day carries hundreds of distinct /24s. Mirrors the "
+            "bounded-OrderedDict approach already used for cii_cache and "
+            "the per-asset alert debounce map."
+        ),
+    )
+    beaconing_max_cv: float = Field(
+        default=0.25,
+        ge=0.0,
+        le=10.0,
+        description=(
+            "Coefficient of variation (stddev/mean of inter-arrival "
+            "intervals) at or below which a pair's traffic counts as "
+            "regular enough to be a beacon. Low CV means metronomic "
+            "timing; human-driven traffic is bursty and scores far higher. "
+            "0.25 tolerates the jitter real C2 frameworks add on purpose."
+        ),
+    )
+    beaconing_min_interval_sec: float = Field(
+        default=0.5,
+        gt=0.0,
+        description=(
+            "Intervals shorter than this are excluded from the CV "
+            "computation. Without the floor, a burst of flows sharing one "
+            "minute-granularity timestamp (friday-morning peaks at 4,017 "
+            "such rows, see P5-11) yields near-zero intervals with "
+            "near-zero variance — a perfect fake beacon manufactured "
+            "entirely by timestamp resolution."
+        ),
+    )
+    beaconing_max_interval_sec: float = Field(
+        default=3600.0,
+        gt=0.0,
+        description=(
+            "Intervals longer than this are excluded from the CV "
+            "computation — a gap that large means the channel went away and "
+            "came back, not that it beaconed slowly."
+        ),
+    )
+
+    # ---- Hybrid IDS: signature/rule engine --------------------------------
+    signature_enabled: bool = Field(
+        default=True,
+        description=(
+            "Whether the rule/signature detector runs. Rules match on flow "
+            "METADATA only (ports, protocol, byte/packet shape, known-bad "
+            "addresses) because CIC-IDS2017 TrafficLabelling carries flow "
+            "records, not payloads — so this is not a payload-inspecting "
+            "IDS like Snort/Suricata, and its rules must not be described "
+            "as signatures over packet contents."
+        ),
+    )
+    signature_small_payload_bytes: int = Field(
+        default=64,
+        ge=0,
+        description=(
+            "Byte ceiling below which a flow to an external address counts "
+            "as 'small payload' for the C2-shaped rule. Anchored to the "
+            "measured Bot C2 median of 6 bytes (vs 70 for benign) with "
+            "headroom, per docs/DETECTION_STUDY.md."
+        ),
+    )
+    signature_scan_max_bytes: int = Field(
+        default=8,
+        ge=0,
+        description=(
+            "Byte ceiling at or below which a flow carrying packets but "
+            "effectively no data counts as scan-shaped (a probe that "
+            "completed a handshake and sent nothing)."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_hybrid_bands_ordered(self) -> "BackendSettings":
+        """Band thresholds must be strictly increasing.
+
+        Out-of-order bands do not raise anywhere downstream — they just
+        make one band unreachable and silently reclassify traffic, which
+        is the kind of misconfiguration that looks like a detector bug.
+        Caught here instead, at construction.
+        """
+        if not (
+            self.hybrid_band_suspicious
+            < self.hybrid_band_likely
+            < self.hybrid_band_confirmed
+        ):
+            raise ValueError(
+                "hybrid band thresholds must be strictly increasing: "
+                f"suspicious ({self.hybrid_band_suspicious}) < likely "
+                f"({self.hybrid_band_likely}) < confirmed "
+                f"({self.hybrid_band_confirmed})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_beaconing_interval_window_ordered(self) -> "BackendSettings":
+        """The interval floor must sit below the ceiling, or every
+        interval is excluded and the detector silently never fires."""
+        if self.beaconing_min_interval_sec >= self.beaconing_max_interval_sec:
+            raise ValueError(
+                "beaconing_min_interval_sec "
+                f"({self.beaconing_min_interval_sec}) must be < "
+                f"beaconing_max_interval_sec ({self.beaconing_max_interval_sec})"
+            )
+        return self
+
     @model_validator(mode="after")
     def _check_api_default_limits_within_cap(self) -> "BackendSettings":
         """Both default-limit fields must not exceed api_events_max_limit
