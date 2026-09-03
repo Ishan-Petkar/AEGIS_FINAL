@@ -94,9 +94,13 @@ def test_rule_001_fires_on_known_bad_address():
     assert "AEGIS-SIG-001" in matched_ids
 
 
-def test_rule_002_fires_on_small_payload_high_port():
+def test_rule_002_fires_on_small_payload_outbound_to_external():
+    """The C2 shape: ephemeral source port, external destination, tiny
+    payload."""
     flow = _flow(
-        destination_port=BACKEND_SETTINGS.signature_small_payload_bytes + 40_000,
+        source_port=51234,
+        destination_ip="13.78.188.147",  # real external address from the capture
+        destination_port=8080,
         bytes=BACKEND_SETTINGS.signature_small_payload_bytes,
         packets=2,
     )
@@ -106,12 +110,69 @@ def test_rule_002_fires_on_small_payload_high_port():
     assert "AEGIS-SIG-002" in matched_ids
 
 
-def test_rule_003_fires_on_scan_shaped_flow():
-    flow = _flow(packets=3, bytes=BACKEND_SETTINGS.signature_scan_max_bytes)
+def test_rule_002_ignores_service_port_answering_an_ephemeral_client():
+    """Regression guard for the false-positive class that drove this rule
+    to fire on 14.7% of real friday-morning traffic.
+
+    Measured shape: `192.168.10.3:88 -> 192.168.10.9:1031`, 6 bytes —
+    ordinary Kerberos service chatter replying to an ephemeral client
+    port. It is small AND its destination port is >= 1024, so the
+    pre-fix predicate matched it. A beacon is the CLIENT, so requiring an
+    ephemeral SOURCE port plus an external destination excludes this
+    entire class.
+    """
+    flow = _flow(
+        source_ip="192.168.10.3",
+        source_port=88,               # service port, i.e. this is a response
+        destination_ip="192.168.10.9",  # internal, i.e. not outbound
+        destination_port=1031,        # the client's ephemeral port
+        bytes=6,
+        packets=1,
+    )
     engine = SignatureEngine()
     [verdict] = engine.examine([flow])
     matched_ids = {m["rule_id"] for m in verdict.evidence["matched_rules"]}
-    assert "AEGIS-SIG-003" in matched_ids
+    assert "AEGIS-SIG-002" not in matched_ids
+
+
+def test_rule_002_ignores_ordinary_short_web_connection():
+    """Regression guard for the SECOND false-positive class found:
+    dropping the destination-high-port check (while fixing direction)
+    made the rule fire on 11.1% of real traffic — ordinary short-lived
+    HTTP/HTTPS connections to ports 80/443/465.
+
+    Measured shape: `192.168.10.14:49433 -> 131.253.61.80:80`, 12 bytes,
+    2 packets — an entirely unremarkable web request. The destination
+    port must stay >= WELL_KNOWN_PORT_BOUNDARY alongside the direction
+    checks, or this whole common class re-enters.
+    """
+    flow = _flow(
+        source_port=49433,
+        destination_ip="131.253.61.80",
+        destination_port=80,
+        bytes=12,
+        packets=2,
+    )
+    engine = SignatureEngine()
+    [verdict] = engine.examine([flow])
+    matched_ids = {m["rule_id"] for m in verdict.evidence["matched_rules"]}
+    assert "AEGIS-SIG-002" not in matched_ids
+
+
+def test_rule_002_ignores_small_payload_staying_internal():
+    """Outbound is part of the rule: the same tiny client-initiated flow
+    to an INTERNAL destination is service chatter, not a beacon."""
+    flow = _flow(
+        source_port=51234,
+        destination_ip="192.168.10.9",
+        destination_port=8080,
+        bytes=6,
+        packets=1,
+    )
+    engine = SignatureEngine()
+    [verdict] = engine.examine([flow])
+    matched_ids = {m["rule_id"] for m in verdict.evidence["matched_rules"]}
+    assert "AEGIS-SIG-002" not in matched_ids
 
 
 def test_rule_004_fires_on_high_risk_admin_port():

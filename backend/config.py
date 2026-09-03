@@ -952,15 +952,6 @@ class BackendSettings(BaseSettings):
             "headroom, per docs/DETECTION_STUDY.md."
         ),
     )
-    signature_scan_max_bytes: int = Field(
-        default=8,
-        ge=0,
-        description=(
-            "Byte ceiling at or below which a flow carrying packets but "
-            "effectively no data counts as scan-shaped (a probe that "
-            "completed a handshake and sent nothing)."
-        ),
-    )
 
     @model_validator(mode="after")
     def _check_hybrid_bands_ordered(self) -> "BackendSettings":

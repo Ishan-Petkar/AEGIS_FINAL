@@ -91,6 +91,22 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from backend.config import BACKEND_SETTINGS, BackendSettings
 from backend.db import session_scope
+from backend.detection.beaconing import BeaconingDetector
+from backend.detection.contracts import (
+    DETECTOR_BEACONING,
+    DETECTOR_HYBRID,
+    DETECTOR_SIGNATURE,
+    DetectorVerdict,
+    FlowFeatures,
+    FusedDecision,
+    ResponseAction,
+    ThreatBand,
+    verdict_from_scored_flow,
+    verdict_from_supervised,
+    verdict_from_tripwire,
+)
+from backend.detection.fusion import HybridFusionEngine
+from backend.detection.signature import SignatureEngine
 from backend.models import Alert, CiiSnapshot, Event, EventScore
 from backend.replay_engine import BatchMeta
 from backend.replay_reader import ReplayFlow
@@ -128,6 +144,15 @@ DETECTOR_TRIPWIRE = "tripwire"
 #: referencing another module's registry.
 DETECTOR_SUPERVISED = "random_forest"
 
+#: `event_scores.detector` values for the Hybrid IDS layer
+#: (backend/detection/). Re-exported here (not redefined) from
+#: backend.detection.contracts, which is where the hybrid layer's own
+#: detector names actually live — this module is a consumer of that
+#: package, not its source of truth. DETECTOR_VOLUMETRIC / _TRIPWIRE /
+#: _SUPERVISED above stay defined in THIS module because they predate the
+#: hybrid layer and other code already imports them from here.
+_HYBRID_DETECTOR_NAMES = (DETECTOR_SIGNATURE, DETECTOR_BEACONING, DETECTOR_HYBRID)
+
 #: WebSocket envelope types (docs/PHASE5_BUILD_PLAN.md section 7). Ticket
 #: #9 owns the transport; this module owns the payloads it carries.
 ENVELOPE_EVENT = "event"
@@ -141,6 +166,10 @@ SEVERITY_WARNING = "warning"
 #: frontend can group/filter on them without parsing prose.
 TITLE_TRIPWIRE = "Honeytoken credential used"
 TITLE_VOLUMETRIC = "Anomalous traffic volume"
+#: Title for an alert that exists ONLY because the hybrid layer's fused
+#: decision cleared the alert band while neither tripwire nor volumetric
+#: alone did -- see `_hybrid_alert_decision` and `hybrid_gates_alerts`.
+TITLE_HYBRID = "Hybrid detection: correlated signal"
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +247,10 @@ class BatchResult:
     cii_reused: int
     alerts_created: int
     alerts_suppressed: int
+    hybrid_signature_hits: int = 0
+    hybrid_beaconing_hits: int = 0
+    hybrid_likely_or_above: int = 0
+    hybrid_gated_alerts: int = 0
 
 
 @dataclass
@@ -241,6 +274,14 @@ class IngestStats:
     alerts_suppressed: int = 0
     broadcast_failures: int = 0
     events_pruned: int = 0
+    #: Hybrid IDS (backend/detection/) cumulative counters. All zero when
+    #: hybrid_enabled=False, or on a pipeline built before this field
+    #: existed replaying into a fresh IngestStats() -- these are purely
+    #: additive telemetry, never read by the existing alert/CII path.
+    hybrid_signature_hits: int = 0
+    hybrid_beaconing_hits: int = 0
+    hybrid_likely_or_above: int = 0
+    hybrid_gated_alerts: int = 0
 
     def absorb(self, result: BatchResult) -> None:
         self.batches += 1
@@ -253,6 +294,10 @@ class IngestStats:
         self.cii_reused += result.cii_reused
         self.alerts_created += result.alerts_created
         self.alerts_suppressed += result.alerts_suppressed
+        self.hybrid_signature_hits += result.hybrid_signature_hits
+        self.hybrid_beaconing_hits += result.hybrid_beaconing_hits
+        self.hybrid_likely_or_above += result.hybrid_likely_or_above
+        self.hybrid_gated_alerts += result.hybrid_gated_alerts
 
 
 @dataclass
@@ -450,6 +495,11 @@ class IngestPipeline:
         retention_check_every_n_batches: Optional[int] = None,
         session_factory: Optional[Callable[[], Any]] = None,
         clock: Optional[Callable[[], float]] = None,
+        hybrid_enabled: Optional[bool] = None,
+        hybrid_gates_alerts: Optional[bool] = None,
+        signature_engine: Optional[SignatureEngine] = None,
+        beaconing_detector: Optional[BeaconingDetector] = None,
+        fusion_engine: Optional[HybridFusionEngine] = None,
     ) -> None:
         if scorer is None:
             raise ValueError("IngestPipeline requires a fitted StreamingScorer")
@@ -503,6 +553,37 @@ class IngestPipeline:
         self._session_factory = session_factory or session_scope
         self._clock = clock or time.monotonic
 
+        # ---- Hybrid IDS (backend/detection/) ---------------------------
+        # `hybrid_enabled` gates whether the three extra detectors run at
+        # all -- False reproduces pre-hybrid behaviour exactly (no signature
+        # or beaconing verdicts, no "hybrid" event_scores row, no hybrid
+        # field in the broadcast envelope). `hybrid_gates_alerts` is a
+        # SEPARATE, narrower switch: even with the layer enabled and
+        # observing every batch, it may not create an alert the existing
+        # tripwire/volumetric policy would not have created until this is
+        # also true -- see `_hybrid_alert_decision`'s docstring. Both
+        # default from BACKEND_SETTINGS (hybrid_enabled=True,
+        # hybrid_gates_alerts=False), so the layer ships OBSERVABLE by
+        # default but not yet authoritative over alerting.
+        self._hybrid_enabled = (
+            settings.hybrid_enabled if hybrid_enabled is None else hybrid_enabled
+        )
+        self._hybrid_gates_alerts = (
+            settings.hybrid_gates_alerts if hybrid_gates_alerts is None else hybrid_gates_alerts
+        )
+        # `BeaconingDetector` is STATEFUL (per-pair inter-arrival history
+        # spanning batches), so it must be one long-lived instance held on
+        # `self`, never rebuilt per batch -- rebuilding it would silently
+        # reset every pair's history every batch and the detector would
+        # never accumulate enough samples to leave its abstain state.
+        # `SignatureEngine` and `HybridFusionEngine` are stateless/pure, so
+        # a fresh instance vs. an injected one behaves identically; they are
+        # still held on `self` so a caller can inject a test double for
+        # either the same way `scorer`/`supervised_scorer` are injected.
+        self._signature_engine = signature_engine or SignatureEngine()
+        self._beaconing_detector = beaconing_detector or BeaconingDetector()
+        self._fusion_engine = fusion_engine or HybridFusionEngine()
+
         # The engine drives the consumer from its own replay thread, while
         # Ticket #16's /api/stats reads counters from a request thread.
         self._lock = threading.Lock()
@@ -547,6 +628,20 @@ class IngestPipeline:
             else None
         )
 
+        # ---- 3b. Hybrid IDS (backend/detection/) -----------------------
+        # Fully additive and independently switchable (hybrid_enabled):
+        # runs the signature + beaconing detectors, adapts every existing
+        # channel's own verdict via contracts.verdict_from_*, and fuses
+        # all of it into one FusedDecision per flow. `fused_decisions` is
+        # None when the layer is off, and every downstream method below
+        # treats None as "behave exactly as before this layer existed" --
+        # see each method's own hybrid-related parameter docstring.
+        fused_decisions = (
+            self._compute_hybrid_decisions(flows, scored, tripwire_fired, supervised_scored)
+            if self._hybrid_enabled
+            else None
+        )
+
         # ---- 4. resolve identities ------------------------------------
         resolutions = [
             (
@@ -564,18 +659,34 @@ class IngestPipeline:
             self._persist_scores(
                 session, scored, inserted_ids, tripwire_fired, is_anomaly, confidence,
                 supervised_scored=supervised_scored,
+                fused_decisions=fused_decisions,
             )
             cii_outcomes, alert_outcomes = self._handle_anomalies(
-                session, scored, inserted_ids, resolutions, tripwire_fired, is_anomaly
+                session, scored, inserted_ids, resolutions, tripwire_fired, is_anomaly,
+                fused_decisions=fused_decisions,
             )
             pruned = self._maybe_prune(session)
 
         # ---- 8. broadcast (AFTER commit) ------------------------------
         self._broadcast_batch(
-            scored, inserted_ids, resolutions, tripwire_fired, is_anomaly, confidence, meta
+            scored, inserted_ids, resolutions, tripwire_fired, is_anomaly, confidence, meta,
+            fused_decisions=fused_decisions,
         )
         for envelope in cii_outcomes.envelopes + alert_outcomes.envelopes:
             self._safe_publish(envelope)
+
+        hybrid_signature_hits = 0
+        hybrid_beaconing_hits = 0
+        hybrid_likely_or_above = 0
+        if fused_decisions is not None:
+            for decision in fused_decisions:
+                for verdict in decision.verdicts:
+                    if verdict.fired and verdict.detector == DETECTOR_SIGNATURE:
+                        hybrid_signature_hits += 1
+                    elif verdict.fired and verdict.detector == DETECTOR_BEACONING:
+                        hybrid_beaconing_hits += 1
+                if decision.action == ResponseAction.ALERT:
+                    hybrid_likely_or_above += 1
 
         result = BatchResult(
             flows_received=len(flows),
@@ -587,6 +698,10 @@ class IngestPipeline:
             cii_reused=cii_outcomes.reused,
             alerts_created=alert_outcomes.created,
             alerts_suppressed=alert_outcomes.suppressed,
+            hybrid_signature_hits=hybrid_signature_hits,
+            hybrid_beaconing_hits=hybrid_beaconing_hits,
+            hybrid_likely_or_above=hybrid_likely_or_above,
+            hybrid_gated_alerts=alert_outcomes.hybrid_gated,
         )
         with self._lock:
             self._stats.absorb(result)
@@ -611,6 +726,129 @@ class IngestPipeline:
         )
         X = TripwireDetector.features_from_df(df)
         return self._tripwire.predict(X) == -1
+
+    # ------------------------------------------------------------------
+    # Stage 3b — Hybrid IDS (backend/detection/)
+    # ------------------------------------------------------------------
+
+    def _compute_hybrid_decisions(
+        self,
+        flows: Sequence[ReplayFlow],
+        scored: Sequence[ScoredFlow],
+        tripwire_fired: np.ndarray,
+        supervised_scored: Optional[Sequence[SupervisedScoredFlow]],
+    ) -> list[FusedDecision]:
+        """Run every hybrid-layer detector and fuse their verdicts, one
+        `FusedDecision` per flow, in batch order.
+
+        This is the ONLY place `ReplayFlow` is projected into
+        `FlowFeatures` -- every detector downstream of this method sees
+        only the label-free view (see `contracts.py`'s module docstring
+        for why that projection exists and what it deliberately omits).
+
+        Every existing channel's own verdict is included via the
+        `contracts.verdict_from_*` adapters, NOT recomputed: the
+        volumetric and tripwire channels already ran in stages 1-2 above,
+        and the supervised channel (if loaded) already ran alongside them.
+        Reusing their output rather than re-deriving it means the hybrid
+        layer can never disagree with the very numbers it is fusing.
+        """
+        features = [FlowFeatures.from_replay_flow(flow) for flow in flows]
+
+        signature_verdicts = (
+            self._signature_engine.examine(features)
+            if BACKEND_SETTINGS.signature_enabled
+            else [None] * len(features)
+        )
+        beaconing_verdicts = (
+            self._beaconing_detector.examine(features)
+            if BACKEND_SETTINGS.beaconing_enabled
+            else [None] * len(features)
+        )
+
+        settings = BACKEND_SETTINGS
+        decisions: list[FusedDecision] = []
+        for i, scored_flow in enumerate(scored):
+            verdicts: list[DetectorVerdict] = [
+                verdict_from_scored_flow(
+                    scored_flow, settings.hybrid_weight_volumetric, DETECTOR_VOLUMETRIC
+                ),
+                verdict_from_tripwire(
+                    bool(tripwire_fired[i]),
+                    self._tripwire.tripwire_score,
+                    settings.hybrid_weight_tripwire,
+                    DETECTOR_TRIPWIRE,
+                ),
+            ]
+            if supervised_scored is not None:
+                verdicts.append(
+                    verdict_from_supervised(
+                        supervised_scored[i], settings.hybrid_weight_supervised, DETECTOR_SUPERVISED
+                    )
+                )
+            if signature_verdicts[i] is not None:
+                verdicts.append(signature_verdicts[i])
+            if beaconing_verdicts[i] is not None:
+                verdicts.append(beaconing_verdicts[i])
+
+            decisions.append(self._fusion_engine.fuse(verdicts))
+        return decisions
+
+    def _hybrid_alert_decision(
+        self,
+        fused: FusedDecision,
+        origin_asset: str,
+    ) -> tuple[bool, str]:
+        """Should the HYBRID layer, on its own authority, trigger an
+        alert this flow's existing tripwire/volumetric verdict did not?
+
+        Deliberately a SEPARATE decision from `_alert_decision` rather
+        than folded into it: `_alert_decision` gates on the volumetric
+        channel's OWN `calibrated_score` against
+        `alert_volumetric_min_calibrated_score`, a threshold calibrated
+        for that channel's score distribution. The fused `threat_score`
+        lives on a different, band-thresholded scale (noisy-OR over
+        multiple weighted detectors) -- reusing the volumetric floor
+        against it would compare two numbers that are not the same kind
+        of quantity.
+
+        Callable ONLY for a flow the existing tripwire/volumetric path
+        did NOT already alert on -- `_handle_anomalies`'s `if
+        is_anomaly[i]: ... else: self._hybrid_alert_decision(...)` split
+        is what guarantees that, and is therefore this method's real
+        double-alert guard, not a check inside this method. (An earlier
+        revision carried a redundant `already_anomaly` parameter here
+        that could never actually be True given that single call site --
+        removed rather than left as unreachable code that implied a
+        check this method does not itself need to make. Pinned by
+        tests/test_ingest_hybrid.py::
+        test_hybrid_never_double_alerts_when_tripwire_already_fired,
+        which asserts against the ACTUAL double-alert outcome, not
+        against this method's internals.) This also means a CONFIRMED
+        tripwire signal -- which always sets `is_anomaly[i]` via
+        `fuse_tripwire_confidence` -- can never reach this method at all:
+        the hybrid layer structurally cannot duplicate that alert.
+
+        Gated behind `hybrid_gates_alerts` (default False) -- see that
+        setting's docstring in `backend/config.py` for why this ships
+        off by default: turning it on changes which flows can create an
+        alert at all, and every alert/risk figure already published in
+        this project was measured under the pre-hybrid policy.
+
+        `origin_asset` is used ONLY for the shared debounce check
+        (`_debounce_ok`), applied last so it is never touched by a
+        decision this method is about to reject on other grounds.
+        """
+        if not self._hybrid_gates_alerts:
+            return False, "hybrid_gates_alerts disabled"
+        if fused.action != ResponseAction.ALERT:
+            return False, f"fused band {fused.band.value} below alert threshold"
+        # Shared debounce state with `_alert_decision` (see
+        # `_debounce_ok`'s docstring) -- checked LAST, matching
+        # `_alert_decision`'s own ordering, since it has the side effect
+        # of recording a touch and must only do so once every other
+        # check has already passed.
+        return self._debounce_ok(origin_asset)
 
     # ------------------------------------------------------------------
     # Stage 5 — persistence
@@ -711,6 +949,7 @@ class IngestPipeline:
         is_anomaly: np.ndarray,
         confidence: np.ndarray,
         supervised_scored: Optional[Sequence[SupervisedScoredFlow]] = None,
+        fused_decisions: Optional[Sequence[FusedDecision]] = None,
     ) -> None:
         """Insert one volumetric score row per event, plus a tripwire row
         only where the tripwire actually fired, plus (Phase B improvement
@@ -729,6 +968,19 @@ class IngestPipeline:
         was never part of that fusion (see `ingest_batch`'s comment) and
         must not borrow a confidence value that reflects a different
         detector's verdict.
+
+        `fused_decisions[i]` (Hybrid IDS), when supplied, writes ONE
+        `event_scores` row per event under `DETECTOR_HYBRID` -- always,
+        like the volumetric row, not only when it fired, because it is
+        the pipeline's one HEADLINE per-event verdict across every
+        channel and an operator filtering/sorting `event_scores` should
+        be able to rely on it existing for every event. `raw_score` is
+        left `None` (there is no single native unit for a fused figure);
+        `calibrated_score` and `confidence` both carry
+        `fused_decisions[i].threat_score` -- deliberately the SAME value
+        in both columns, so a caller reading either gets the fused
+        figure rather than accidentally reading a different channel's
+        `confidence[i]` under the `hybrid` detector name.
         """
         rows: list[dict[str, Any]] = []
         for i, scored_flow in enumerate(scored):
@@ -771,6 +1023,18 @@ class IngestPipeline:
                         "confidence": sup.calibrated_score,
                     }
                 )
+            if fused_decisions is not None:
+                decision = fused_decisions[i]
+                rows.append(
+                    {
+                        "event_id": event_id,
+                        "detector": DETECTOR_HYBRID,
+                        "raw_score": None,
+                        "calibrated_score": decision.threat_score,
+                        "is_anomaly": decision.band != ThreatBand.BENIGN,
+                        "confidence": decision.threat_score,
+                    }
+                )
         if rows:
             session.execute(pg_insert(EventScore).values(rows))
 
@@ -786,12 +1050,30 @@ class IngestPipeline:
         resolutions: list[tuple[Any, Any]],
         tripwire_fired: np.ndarray,
         is_anomaly: np.ndarray,
+        fused_decisions: Optional[Sequence[FusedDecision]] = None,
     ) -> tuple["_CiiOutcome", "_AlertOutcome"]:
+        """See the module docstring for the existing tripwire/volumetric
+        policy. `fused_decisions`, when supplied, additionally widens
+        this loop to flows the EXISTING channels did not flag
+        (`is_anomaly[i]` is False) but whose fused decision independently
+        cleared the alert band -- gated behind `hybrid_gates_alerts`
+        (checked inside `_hybrid_alert_decision`, not here) and behind a
+        cheap `fused.action == ALERT` pre-check so CII is never computed
+        for the common case of an ordinary quiet flow (see P5-17: running
+        Monte Carlo for a known-in-advance non-event is pure waste).
+        Flows already covered by `is_anomaly[i]` are completely
+        unaffected -- they take the exact branch this method always has.
+        """
         cii_outcome = _CiiOutcome()
         alert_outcome = _AlertOutcome()
 
         for i, scored_flow in enumerate(scored):
-            if not is_anomaly[i]:
+            hybrid_candidate = (
+                fused_decisions is not None
+                and not is_anomaly[i]
+                and fused_decisions[i].action == ResponseAction.ALERT
+            )
+            if not is_anomaly[i] and not hybrid_candidate:
                 continue
             event_id = inserted_ids[i]
             if event_id is None:
@@ -811,21 +1093,38 @@ class IngestPipeline:
                 session, origin_asset, scored_flow, event_id, cii_outcome
             )
 
-            should_alert, suppressed_reason = self._alert_decision(
-                scored_flow, is_tripwire, origin_asset
-            )
-            if not should_alert:
-                alert_outcome.suppressed += 1
-                logger.debug(
-                    "ingest: alert suppressed for %s (%s)",
-                    origin_asset,
-                    suppressed_reason,
+            if is_anomaly[i]:
+                should_alert, suppressed_reason = self._alert_decision(
+                    scored_flow, is_tripwire, origin_asset
                 )
-                continue
+                if not should_alert:
+                    alert_outcome.suppressed += 1
+                    logger.debug(
+                        "ingest: alert suppressed for %s (%s)",
+                        origin_asset,
+                        suppressed_reason,
+                    )
+                    continue
+                alert = self._create_alert(
+                    session, scored_flow, origin_asset, is_tripwire, snapshot_id
+                )
+            else:
+                # hybrid_candidate is True here by the loop guard above.
+                should_alert, hybrid_reason = self._hybrid_alert_decision(
+                    fused_decisions[i], origin_asset
+                )
+                if not should_alert:
+                    logger.debug(
+                        "ingest: hybrid alert not created for %s (%s)",
+                        origin_asset,
+                        hybrid_reason,
+                    )
+                    continue
+                alert = self._create_hybrid_alert(
+                    session, fused_decisions[i], origin_asset, snapshot_id
+                )
+                alert_outcome.hybrid_gated += 1
 
-            alert = self._create_alert(
-                session, scored_flow, origin_asset, is_tripwire, snapshot_id
-            )
             alert_outcome.created += 1
             alert_outcome.envelopes.append(
                 {
@@ -880,19 +1179,40 @@ class IngestPipeline:
         # Per-asset de-duplication, applied to EVERY channel including
         # tripwire: a honeytoken touched 400 times in one burst is one
         # incident, not 400 alerts.
-        if self._alert_asset_debounce_sec > 0:
-            now = self._clock()
-            last = self._last_alert_at.get(origin_asset)
-            if last is not None and (now - last) < self._alert_asset_debounce_sec:
-                return (
-                    False,
-                    f"asset debounce ({now - last:.1f}s < "
-                    f"{self._alert_asset_debounce_sec:.1f}s)",
-                )
-            self._last_alert_at[origin_asset] = now
-            self._last_alert_at.move_to_end(origin_asset)
-            while len(self._last_alert_at) > self._cii_cache_max_entries:
-                self._last_alert_at.popitem(last=False)
+        ok, reason = self._debounce_ok(origin_asset)
+        if not ok:
+            return False, reason
+        return True, ""
+
+    def _debounce_ok(self, origin_asset: str) -> tuple[bool, str]:
+        """Shared per-asset alert debounce, extracted out of
+        `_alert_decision` so `_hybrid_alert_decision` can apply the
+        EXACT SAME cooldown state rather than a second independent
+        OrderedDict -- both existing-channel alerts and hybrid-gated
+        alerts on the same asset share one `_last_alert_at` clock, so a
+        volumetric alert debounced this cycle cannot be immediately
+        followed by a hybrid alert for the same asset two seconds later.
+
+        Records a touch (mutates `_last_alert_at`) only when returning
+        `(True, "")` -- i.e. only when the caller is actually about to
+        create an alert, matching `_alert_decision`'s original behaviour
+        of recording the touch as part of the same check that approves
+        it.
+        """
+        if self._alert_asset_debounce_sec <= 0:
+            return True, ""
+        now = self._clock()
+        last = self._last_alert_at.get(origin_asset)
+        if last is not None and (now - last) < self._alert_asset_debounce_sec:
+            return (
+                False,
+                f"asset debounce ({now - last:.1f}s < "
+                f"{self._alert_asset_debounce_sec:.1f}s)",
+            )
+        self._last_alert_at[origin_asset] = now
+        self._last_alert_at.move_to_end(origin_asset)
+        while len(self._last_alert_at) > self._cii_cache_max_entries:
+            self._last_alert_at.popitem(last=False)
         return True, ""
 
     def _cii_for(
@@ -1018,6 +1338,71 @@ class IngestPipeline:
         session.flush()  # need alert.id for the broadcast envelope
         return alert
 
+    def _create_hybrid_alert(
+        self,
+        session: Any,
+        fused: FusedDecision,
+        origin_asset: str,
+        snapshot_id: Optional[int],
+    ) -> Alert:
+        """Alert record for a hybrid-layer-gated escalation (see
+        `_hybrid_alert_decision`).
+
+        Deliberately NOT a third branch inside `_create_alert`: that
+        method's `is_tripwire=False` branch writes "Anomalous traffic
+        volume ... calibrated score X", which would misrepresent an
+        alert that may have nothing to do with the volumetric channel --
+        e.g. signature + beaconing both firing while the volumetric
+        channel stayed quiet. This method names the actual detectors
+        that drove the decision instead, straight from `fused.rationale`
+        and `fused.fired_detectors`.
+
+        Severity is WARNING, never CRITICAL: `Certainty.CONFIRMED`
+        signals (the tripwire) already alert through the existing path
+        with `already_anomaly=True`, so `_hybrid_alert_decision` can only
+        reach this method for a HEURISTIC-only fused decision -- by
+        definition never a confirmed compromise, so it must never be
+        dressed up as one severity-wise either.
+        """
+        alert = Alert(
+            ts=datetime.now(timezone.utc),
+            severity=SEVERITY_WARNING,
+            asset=origin_asset,
+            title=TITLE_HYBRID,
+            detail=(
+                f"Hybrid fusion escalated {origin_asset} to band "
+                f"{fused.band.value} (threat_score {fused.threat_score:.3f}) "
+                f"on evidence from: {', '.join(fused.fired_detectors) or 'none'}. "
+                f"{fused.rationale} Neither the tripwire nor the volumetric "
+                f"channel alone reached the alert threshold for this flow -- "
+                f"this alert exists because their combination did."
+            ),
+            explanation=_jsonable(
+                {
+                    "threat_score": fused.threat_score,
+                    "band": fused.band.value,
+                    "action": fused.action.value,
+                    "rationale": fused.rationale,
+                    "verdicts": [
+                        {
+                            "detector": v.detector,
+                            "fired": v.fired,
+                            "calibrated_score": v.calibrated_score,
+                            "reliability": v.reliability,
+                            "certainty": v.certainty.value,
+                            "evidence": _jsonable(dict(v.evidence)),
+                        }
+                        for v in fused.verdicts
+                    ],
+                }
+            ),
+            cii_snapshot_id=snapshot_id,
+            acknowledged=False,
+        )
+        session.add(alert)
+        session.flush()
+        return alert
+
     # ------------------------------------------------------------------
     # Retention
     # ------------------------------------------------------------------
@@ -1053,12 +1438,24 @@ class IngestPipeline:
         is_anomaly: np.ndarray,
         confidence: np.ndarray,
         meta: BatchMeta,
+        fused_decisions: Optional[Sequence[FusedDecision]] = None,
     ) -> None:
         """Publish one `event` envelope per newly-inserted flow.
 
         Deduplicated flows are skipped: they were already broadcast on
         their first delivery, and re-pushing them would make the live feed
         show a burst of repeats after any ingest retry.
+
+        `fused_decisions`, when supplied, adds an ADDITIVE `hybrid` key
+        to each envelope's `data` -- every key that existed before this
+        layer is unchanged, so an older frontend build ignoring an
+        unknown key keeps working exactly as it did. Deliberately a
+        compact summary (`threat_score`/`band`/`action`/
+        `fired_detectors`/`rationale`), not the full per-verdict evidence
+        blob `_create_hybrid_alert` writes into an alert's `explanation`
+        -- this envelope is broadcast for EVERY event at up to ~2000/s
+        (measured, Ticket #10), so it stays small; the full breakdown is
+        one click away via the alert it may have produced.
         """
         for i, scored_flow in enumerate(scored):
             event_id = inserted_ids[i]
@@ -1107,6 +1504,17 @@ class IngestPipeline:
                         # WebSocket client cannot tell an injected
                         # scenario from real traffic in real time.
                         "batch_origin": meta.origin,
+                        "hybrid": (
+                            {
+                                "threat_score": fused_decisions[i].threat_score,
+                                "band": fused_decisions[i].band.value,
+                                "action": fused_decisions[i].action.value,
+                                "fired_detectors": list(fused_decisions[i].fired_detectors),
+                                "rationale": fused_decisions[i].rationale,
+                            }
+                            if fused_decisions is not None
+                            else None
+                        ),
                     },
                 }
             )
@@ -1155,4 +1563,9 @@ class _CiiOutcome:
 class _AlertOutcome:
     created: int = 0
     suppressed: int = 0
+    #: Of `created`, how many exist ONLY because the hybrid layer's
+    #: `_hybrid_alert_decision` widened the gate -- i.e. neither the
+    #: tripwire nor the volumetric channel would have alerted on that
+    #: flow by itself. Always 0 when hybrid_gates_alerts is False.
+    hybrid_gated: int = 0
     envelopes: list[dict[str, Any]] = field(default_factory=list)

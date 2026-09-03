@@ -413,11 +413,17 @@ def test_tripwire_signal_hook_drives_the_real_detector():
 
 
 def test_fusion_confidence_written_to_event_scores():
+    """Unrelated to the Hybrid IDS layer -- specifically pins
+    fuse_tripwire_confidence's own confidence_both constant, which the
+    hybrid row's fused threat_score (a different scale entirely) would
+    not share, so hybrid_enabled=False keeps this test's loop assertion
+    ("every row shares this one confidence value") meaningful."""
     from settings import SETTINGS
 
     pipeline, session = make_pipeline(
         scorer=FakeScorer(anomaly_flags=[True]),
         tripwire_signal=lambda f: True,
+        hybrid_enabled=False,
     )
     pipeline([make_flow("f:1")], make_meta())
     score_stmt = stmts_for(session, "event_scores")
@@ -431,8 +437,13 @@ def test_fusion_confidence_written_to_event_scores():
 
 def test_tripwire_score_row_only_written_when_it_fires():
     """A tripwire row per event would double event_scores volume to record
-    'no honeytoken was touched' — the default state of every flow."""
-    pipeline, session = make_pipeline(scorer=FakeScorer(anomaly_flags=[False, False]))
+    'no honeytoken was touched' — the default state of every flow.
+    hybrid_enabled=False: this test is about the pre-existing tripwire
+    row-economy invariant, not the hybrid layer's own (separately tested)
+    row."""
+    pipeline, session = make_pipeline(
+        scorer=FakeScorer(anomaly_flags=[False, False]), hybrid_enabled=False
+    )
     pipeline([make_flow("f:1"), make_flow("f:2")], make_meta())
     rows = rows_of(stmts_for(session, "event_scores")[0])
     assert all(r["detector"] == DETECTOR_VOLUMETRIC for r in rows)
@@ -450,11 +461,15 @@ def test_tripwire_score_row_only_written_when_it_fires():
 def test_no_supervised_row_when_channel_not_configured():
     """Default posture (no artifact built / not passed to IngestPipeline):
     behaviour is byte-for-byte what it was before this channel existed."""
-    pipeline, session = make_pipeline(scorer=FakeScorer(anomaly_flags=[True]))
+    pipeline, session = make_pipeline(
+        scorer=FakeScorer(anomaly_flags=[True]), hybrid_enabled=False
+    )
     pipeline([make_flow("f:1")], make_meta())
     rows = rows_of(stmts_for(session, "event_scores")[0])
     assert DETECTOR_SUPERVISED not in {r["detector"] for r in rows}
-    assert len(rows) == 1  # volumetric only
+    assert len(rows) == 1  # volumetric only (hybrid_enabled=False: this test
+    # is about the supervised-channel row being conditional, not the
+    # hybrid layer's own separately-tested row)
 
 
 def test_supervised_row_written_when_channel_configured():
@@ -776,7 +791,11 @@ def test_deduplicated_rows_get_no_duplicate_scores():
     writing its scores again would orphan duplicates on the original."""
     session = FakeSession(next_event_ids=[1])  # only the first row inserted
     pipeline, session = make_pipeline(
-        scorer=FakeScorer(anomaly_flags=[False, False]), session=session
+        scorer=FakeScorer(anomaly_flags=[False, False]),
+        session=session,
+        hybrid_enabled=False,  # this test is about dedup, not the hybrid
+        # layer's own row -- see test_hybrid_row_survives_deduplication_too
+        # in tests/test_ingest_hybrid.py for the hybrid-enabled equivalent
     )
     result = pipeline([make_flow("f:1"), make_flow("f:2")], make_meta())
     assert result.events_inserted == 1

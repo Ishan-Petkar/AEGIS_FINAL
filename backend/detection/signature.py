@@ -138,6 +138,26 @@ DATABASE_SERVICE_PORTS: frozenset[int] = frozenset(
 WELL_KNOWN_PORT_BOUNDARY = 1024
 
 
+def _is_external_address(ip: str) -> bool:
+    """True when `ip` parses and is NOT an internal/reserved address.
+
+    Shared by the direction-sensitive rules below. Malformed or
+    non-IPv4/IPv6 strings (synthetic fixtures, an `Unresolved_<id>`
+    placeholder) are treated as NOT external: these are best-effort
+    metadata rules, and a rule that fired because an address failed to
+    parse would be firing on a parsing artefact, not on traffic.
+
+    Note `ipaddress.is_private` covers more than RFC 1918/4193 — it also
+    returns True for reserved and documentation ranges such as TEST-NET-3
+    (203.0.113.0/24), which is why a fixture using one of those addresses
+    is correctly seen as non-external.
+    """
+    try:
+        return not ipaddress.ip_address(ip).is_private
+    except ValueError:
+        return False
+
+
 def _is_known_bad_address(flow: FlowFeatures) -> bool:
     return (
         flow.source_ip in KNOWN_BAD_ADDRESSES
@@ -146,7 +166,8 @@ def _is_known_bad_address(flow: FlowFeatures) -> bool:
 
 
 def _is_small_payload_high_port(flow: FlowFeatures) -> bool:
-    """C2-shaped: little data, moving to a non-standard port.
+    """C2-shaped: little data, client-initiated, to a non-standard
+    external port.
 
     Anchored to `docs/DETECTION_STUDY.md`'s measured finding that Bot C2
     beacons in this corpus carry a median of 6 bytes versus ~70 for benign
@@ -155,23 +176,38 @@ def _is_small_payload_high_port(flow: FlowFeatures) -> bool:
     with headroom above that 6-byte median and below the benign median, so
     it catches the C2 shape without also catching every ordinary short
     connection.
+
+    All three of the non-payload conditions below were added after
+    measuring this predicate against 40,000 real friday-morning flows and
+    finding it too permissive twice in a row — each is a specific,
+    measured false-positive class, not speculative hardening:
+
+      1. `destination_port >= WELL_KNOWN_PORT_BOUNDARY` — the ORIGINAL
+         "high port" requirement. Without it the rule fired on 11.1% of
+         real traffic, dominated by ordinary short HTTP/HTTPS/SMTPS
+         connections to ports 80/443/465 (measured:
+         `192.168.10.14:49433 -> 131.253.61.80:80`, 12 bytes, 2 packets —
+         a ordinary short-lived web request, ubiquitous in any capture).
+         A beacon calling home over a standard web port would evade this,
+         but that is a known, accepted limitation of a metadata-only
+         rule, not a reason to drop the check — it exists in the
+         signature-engine's own docstring's honesty section.
+      2. `source_port >= WELL_KNOWN_PORT_BOUNDARY` — client-initiated
+         direction. Without it the rule matched RESPONSE traffic — a
+         service port answering an ephemeral client port (measured:
+         `192.168.10.3:88 -> 192.168.10.9:1031`, 6 bytes, ordinary
+         Kerberos chatter). A beacon is the client: its own port is
+         ephemeral, not a service port.
+      3. `_is_external_address(flow.destination_ip)` — outbound. C2
+         beaconing leaves the network toward attacker-controlled
+         infrastructure; a small internal-to-internal flow is service
+         chatter, not a beacon.
     """
     return (
         flow.bytes <= BACKEND_SETTINGS.signature_small_payload_bytes
         and flow.destination_port >= WELL_KNOWN_PORT_BOUNDARY
-    )
-
-
-def _is_scan_shaped(flow: FlowFeatures) -> bool:
-    """Packets moved, but effectively no data — a completed handshake (or
-    a probe that got a RST) with nothing behind it. `packets > 0` excludes
-    the degenerate all-zero row; `signature_scan_max_bytes` (default 8) is
-    intentionally tighter than the small-payload rule's 64-byte ceiling so
-    this rule targets true zero-content probes rather than overlapping it
-    entirely.
-    """
-    return (
-        flow.packets > 0 and flow.bytes <= BACKEND_SETTINGS.signature_scan_max_bytes
+        and flow.source_port >= WELL_KNOWN_PORT_BOUNDARY
+        and _is_external_address(flow.destination_ip)
     )
 
 
@@ -281,31 +317,21 @@ DEFAULT_RULES: tuple[SignatureRule, ...] = (
         rule_id="AEGIS-SIG-002",
         title="Small-payload flow to a high port (C2-shaped)",
         description=(
-            "Flow carries at most signature_small_payload_bytes of data "
-            "to a destination port >= 1024. Shape-matches the measured "
-            "Bot C2 median of 6 bytes (docs/DETECTION_STUDY.md) versus "
-            "~70 for benign traffic. Confidence 0.50: this is a common "
-            "shape for entirely benign short-lived connections too "
-            "(keepalives, health checks, DNS-adjacent lookups on high "
-            "ports), so on metadata alone this is a real but modest "
-            "signal, not proof."
+            "Client-initiated OUTBOUND flow (ephemeral source port, "
+            "non-private destination address) carrying at most "
+            "signature_small_payload_bytes of data. Shape-matches the "
+            "measured Bot C2 median of 6 bytes "
+            "(docs/DETECTION_STUDY.md) versus ~70 for benign traffic. "
+            "The direction requirements are load-bearing, not "
+            "decoration: without them this rule matched service ports "
+            "answering ephemeral client ports and fired on 14.7% of "
+            "real friday-morning flows. Confidence 0.50: an outbound "
+            "keepalive or health check to a cloud endpoint has this "
+            "same shape, so on metadata alone this is a real but "
+            "modest signal, not proof."
         ),
         confidence=0.50,
         predicate=_is_small_payload_high_port,
-    ),
-    SignatureRule(
-        rule_id="AEGIS-SIG-003",
-        title="Scan-shaped flow (packets, no data)",
-        description=(
-            "Flow has packets > 0 but at most signature_scan_max_bytes of "
-            "data — a connection attempt that completed a handshake (or "
-            "drew a reset) and moved nothing. Confidence 0.55: tighter "
-            "byte ceiling than rule 002 makes this a sharper shape, but "
-            "it is still just as consistent with a benign client aborting "
-            "a connection early as with a port probe."
-        ),
-        confidence=0.55,
-        predicate=_is_scan_shaped,
     ),
     SignatureRule(
         rule_id="AEGIS-SIG-004",
