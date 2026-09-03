@@ -5,7 +5,13 @@ import { ConnectionState } from "./ConnectionState";
 import { StreamState } from "./StreamState";
 import { StatChip } from "./StatChip";
 import { InjectControl } from "./InjectControl";
-import { ApiError, ApiNetworkError, setReplaySpeed } from "@/lib/api";
+import {
+  ApiError,
+  ApiNetworkError,
+  setReplaySpeed,
+  startReplay,
+  stopReplay,
+} from "@/lib/api";
 import { useConnection } from "@/lib/connection-context";
 import { useStream } from "@/lib/stream-context";
 import type { HelloEnvelopeData } from "@/lib/types";
@@ -130,6 +136,11 @@ export function AppHeader() {
 
       <div className="ml-auto flex items-center gap-3">
         <SpeedControl currentSpeed={hello?.speed ?? null} running={running} />
+        <RestartReplayButton
+          day={hello?.day ?? null}
+          speed={hello?.speed ?? null}
+          forceReconnect={forceReconnect}
+        />
         <InjectControl running={running} />
       </div>
     </header>
@@ -177,6 +188,140 @@ function RestartStreamButton({ forceReconnect }: { forceReconnect: () => void })
       >
         ↻
       </span>
+    </button>
+  );
+}
+
+type RestartReplayState =
+  | { kind: "idle" }
+  | { kind: "confirming" }
+  | { kind: "pending" }
+  | { kind: "error"; message: string };
+
+/**
+ * RestartReplayButton — rewinds the REPLAY DATA to the top of the day.
+ *
+ * Deliberately a different control from `RestartStreamButton` above, and
+ * the distinction is the whole point: `↻` restarts this browser tab's
+ * *connection* to the stream (and backfills what it missed), while this
+ * restarts the *data* the backend is playing. The failure they fix are
+ * opposites — a socket that has gone quiet vs. a capture day that has run
+ * to completion (`emitted_count == total_for_day`, engine stops itself and
+ * every subsequent `POST /api/inject` 409s because nothing is running).
+ * Only the second one is fixable from the backend, so it needs its own
+ * button rather than overloading the reconnect icon.
+ *
+ * Sequence, and why it is three calls and not one:
+ *   1. `stopReplay()`  — `start` returns 409 when a replay is already
+ *                        running (never a silent no-op), so a restart
+ *                        that skipped this would fail from the common
+ *                        case of "still running, just want a rewind".
+ *                        Safe when nothing is running.
+ *   2. `startReplay()` — reuses the CURRENT `day`/`speed` off the last
+ *                        `hello` rather than hardcoding a default, so a
+ *                        restart preserves whatever the operator had set;
+ *                        `null` for either falls back to the backend's own
+ *                        `BACKEND_SETTINGS` default.
+ *   3. `forceReconnect()` — `hello` is a one-time snapshot taken at
+ *                        connect, carrying `replay_session_id`,
+ *                        `emitted_count` and `total_for_day`. After a
+ *                        restart the client's copy describes the OLD
+ *                        session, so the header's progress readout would
+ *                        keep rendering stale figures against a session
+ *                        that no longer exists. Reconnecting is what makes
+ *                        the UI agree with the backend again.
+ *
+ * Guarded by an arm-then-confirm click (auto-disarms after 3s) because
+ * this is destructive to demo state — it wipes replay progress — and the
+ * button sits one gap away from `Inject` in a header an operator clicks
+ * under time pressure. Two deliberate clicks, no modal.
+ */
+function RestartReplayButton({
+  day,
+  speed,
+  forceReconnect,
+}: {
+  day: string | null;
+  speed: number | null;
+  forceReconnect: () => void;
+}) {
+  const [state, setState] = useState<RestartReplayState>({ kind: "idle" });
+
+  async function handleClick() {
+    if (state.kind === "pending") return;
+
+    if (state.kind !== "confirming") {
+      setState({ kind: "confirming" });
+      setTimeout(
+        () => setState((s) => (s.kind === "confirming" ? { kind: "idle" } : s)),
+        3000
+      );
+      return;
+    }
+
+    setState({ kind: "pending" });
+    try {
+      await stopReplay();
+      await startReplay({ dataset: day, speed });
+      // Only now is the old `hello` known-stale — reconnect to get a fresh
+      // one describing the session that actually exists (see docstring).
+      forceReconnect();
+      setState({ kind: "idle" });
+    } catch (err) {
+      const message =
+        err instanceof ApiNetworkError
+          ? "Could not reach the backend — replay unchanged."
+          : err instanceof ApiError
+            ? err.status === 503
+              ? "Replay engine unavailable (the scorer never loaded)."
+              : err.status === 401
+                ? "Unauthorized — this backend requires an API token (set NEXT_PUBLIC_API_TOKEN)."
+                : err.status === 429
+                  ? "Rate limited — wait a moment and try again."
+                  : `Restart failed (HTTP ${err.status}): ${err.message}`
+            : "Unknown error restarting the replay.";
+      setState({ kind: "error", message });
+      setTimeout(
+        () => setState((s) => (s.kind === "error" ? { kind: "idle" } : s)),
+        6000
+      );
+    }
+  }
+
+  const label =
+    state.kind === "pending"
+      ? "Restarting…"
+      : state.kind === "confirming"
+        ? "Confirm?"
+        : state.kind === "error"
+          ? "Failed"
+          : "Restart";
+
+  const tone =
+    state.kind === "confirming"
+      ? "border-accent text-accent"
+      : state.kind === "error"
+        ? "border-sev-critical text-sev-critical"
+        : "border-glass-border text-text-dim hover:border-accent hover:text-accent";
+
+  return (
+    <button
+      type="button"
+      onClick={handleClick}
+      disabled={state.kind === "pending"}
+      aria-label={
+        state.kind === "confirming"
+          ? "Confirm restarting the replay from the beginning of the day"
+          : "Restart the replay from the beginning of the day"
+      }
+      title={
+        state.kind === "error"
+          ? state.message
+          : "Rewind the replay data to the start of the capture day. Use this when the day has run out (Inject starts returning 409). Click twice to confirm — this resets replay progress. Not the same as the ↻ next to STREAM, which only reconnects this tab."
+      }
+      className={`rounded-[var(--radius-panel)] border px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.08em] transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${tone}`}
+    >
+      {label}
     </button>
   );
 }

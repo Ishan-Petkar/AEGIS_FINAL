@@ -230,6 +230,42 @@ export function setReplaySpeed(multiplier: number): Promise<ReplayStatusResponse
 }
 
 /**
+ * POST /api/replay/stop — halt the running replay.
+ *
+ * Safe to call when nothing is running: the route reports authoritative
+ * engine state rather than erroring on a no-op stop. That is what makes
+ * the stop-then-start restart in `AppHeader`'s `RestartReplayButton`
+ * reliable from *any* starting state, including "the day already ran to
+ * completion and the engine stopped itself".
+ */
+export function stopReplay(): Promise<ReplayStatusResponse> {
+  return apiFetch<ReplayStatusResponse>("/api/replay/stop", { method: "POST" });
+}
+
+/**
+ * POST /api/replay/start — begin replaying a capture day.
+ *
+ * Both fields are optional; omitting one falls back to the backend's own
+ * `BACKEND_SETTINGS` default for that parameter. Returns **409** (an
+ * `ApiError` with `status === 409`) when a replay is ALREADY running —
+ * deliberately not a silent no-op, so a caller that wanted a different
+ * day or speed can never mistake an ignored call for one that took
+ * effect (see `ReplayEngine.start()`'s docstring). Any caller that means
+ * "restart regardless of current state" must therefore call
+ * `stopReplay()` first, which is exactly what `RestartReplayButton` does.
+ */
+export function startReplay(body?: {
+  dataset?: string | null;
+  speed?: number | null;
+}): Promise<ReplayStatusResponse> {
+  return apiFetch<ReplayStatusResponse>("/api/replay/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body ?? {}),
+  });
+}
+
+/**
  * GET /api/inject/scenarios (Ticket #13) — the real-attack scenario
  * registry, so the UI lists scenarios rather than hardcoding them.
  */
