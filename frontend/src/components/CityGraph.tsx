@@ -13,8 +13,10 @@ import {
 import { AssetActivityTracker } from "@/lib/asset-activity";
 import { useGraphFocus } from "@/lib/graph-focus-context";
 import {
+  CORE_SECTOR,
   HUB_ASSET_NAME,
   SECTOR_ORDER,
+  buildSectorByName,
   groupNodesBySector,
   sectorLabel,
   sectorNodeId,
@@ -266,12 +268,13 @@ function curatedNodeRadius(criticality: number): number {
 // permitted backend touch this plan allows) — this replaces the Ticket #16
 // frontend-only `SECTOR_OF` lookup table entirely; sector membership is
 // derived from real data, never guessed here. A `null` sector (gateways,
-// the synthesized `City_Grid` node) falls back to "core": those nodes are
-// not owned by any one sector, so — unlike Ticket #16's expanded-only
-// layout, where they ringed the hub — the aggregated (default) view omits
-// them entirely (see `buildDisplayTopology`) to hit the ~11-node target in
-// docs/PHASE5_CONSOLE_REDESIGN_PLAN.md §1; they still appear, ungrouped, in
-// the expanded (all-50-assets) view exactly as before.
+// the synthesized `City_Grid` node) resolves to `CORE_SECTOR` (see that
+// constant's docstring in `@/lib/sectors`) rather than being omitted: an
+// earlier revision dropped these ~5 nodes from the aggregated (default)
+// view entirely, along with every edge touching them, which hid the
+// actual access-control layer a cascade routes through even after
+// expanding every real sector by hand. They now get their own
+// "Infrastructure" chip/bubble, exactly like Finance or Energy.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -388,7 +391,12 @@ function buildDisplayTopology(
     });
   }
 
-  const sectorByName = new Map<string, string | null>(topology.nodes.map((n) => [n.name, n.sector]));
+  // Shared with `buildSectorByName`'s other caller (the main component's
+  // own `sectorByName` below) rather than a second inline duplicate — both
+  // now resolve gateways/City_Grid to CORE_SECTOR instead of `null`, which
+  // is what lets an edge touching one of them get a real aggregate
+  // endpoint (`sectorNodeId(CORE_SECTOR)`) instead of being dropped.
+  const sectorByName = buildSectorByName(topology.nodes);
   const remap = (name: string): string | null => {
     if (expandedNames.has(name)) return name;
     const sector = sectorByName.get(name);
@@ -505,8 +513,8 @@ function computeCuratedLayout(
     // `TopologyNode.sector` passthrough for a real asset, or the sector a
     // synthetic aggregate node itself represents — see
     // `buildDisplayTopology`), replacing the old name-lookup `sectorOf()`.
-    const sector = n.sector ?? "core";
-    if (sector === "core") {
+    const sector = n.sector ?? CORE_SECTOR;
+    if (sector === CORE_SECTOR) {
       core.push(n);
       continue;
     }
@@ -570,7 +578,7 @@ function computeCuratedLayout(
 
   // Defensive fallback: every display node is the hub, a core node, or a
   // sector member above, but a future asset added to config.py without a
-  // `sector` value still falls into "core" via the `n.sector ?? "core"`
+  // `sector` value still falls into CORE_SECTOR via the `n.sector ?? CORE_SECTOR`
   // check above, so this should never actually trigger — kept so a
   // missing lookup degrades to "drawn at the hub" rather than crashing
   // the layout pass.
@@ -869,10 +877,7 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
   // `latestCii` effect further down) and by `SectorHealthStrip` indirectly
   // through the same `topology` it reads from `useTopology()`.
   const sectorMembers = useMemo(() => groupNodesBySector(topology.nodes), [topology]);
-  const sectorByName = useMemo(
-    () => new Map(topology.nodes.map((n) => [n.name, n.sector] as const)),
-    [topology]
-  );
+  const sectorByName = useMemo(() => buildSectorByName(topology.nodes), [topology]);
 
   // The node/edge set this render actually lays out and draws — see
   // `buildDisplayTopology`'s docstring for expanded vs. sector-aggregated
@@ -1344,9 +1349,13 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
     // `toggleFocusedSector` — this must never UNfocus a sector an operator
     // already had open by hand, it only ever adds the origin's sector
     // alongside whatever's already focused (focus is stackable). No-op if
-    // already expanded (everything is already visible) or the origin has
-    // no real sector (the hub, or a gateway/City_Grid — none of which are
-    // ever collapsed).
+    // already expanded (everything is already visible). A gateway/City_Grid
+    // origin now correctly auto-focuses `CORE_SECTOR` too, since
+    // `sectorByName` (buildSectorByName) resolves them there instead of to
+    // `null` — a honeytoken breach on a gateway used to leave the operator
+    // staring at a compact view with no visible reason anything happened;
+    // it now opens the Infrastructure bubble the same way a curated-asset
+    // origin opens its own sector.
     if (!expanded) {
       const originSector = sectorByName.get(latestCii.origin_asset);
       if (originSector) focusSector(originSector);
