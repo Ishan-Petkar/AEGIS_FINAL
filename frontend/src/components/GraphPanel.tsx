@@ -2,6 +2,7 @@
 
 import dynamic from "next/dynamic";
 import { Panel } from "./Panel";
+import { useState } from "react";
 import { useConnection } from "@/lib/connection-context";
 import { useGraphFocus } from "@/lib/graph-focus-context";
 import { useTopology } from "@/lib/topology-context";
@@ -51,6 +52,7 @@ export function GraphPanel() {
   const { status } = useConnection();
   const { state, retry } = useTopology();
   const { expanded, setExpanded } = useGraphFocus();
+  const [viewMode, setViewMode] = useState<"city" | "finance">("city");
 
   const isUnreachable = status === "unreachable";
   const isLoaded = !isUnreachable && state.kind === "loaded";
@@ -71,18 +73,44 @@ export function GraphPanel() {
           own `z-50`. */}
       {expanded && <div className="fixed inset-0 z-40 bg-ground" aria-hidden="true" />}
       <Panel
-      label="City Infrastructure"
+      label={viewMode === "city" ? "City Infrastructure" : "FINANCIAL INFRASTRUCTURE MAP"}
       action={
-        <button
-          type="button"
-          onClick={() => setExpanded((v) => !v)}
-          aria-label={expanded ? "Collapse graph to normal size" : "Maximise graph to full window"}
-          aria-pressed={expanded}
-          title={expanded ? "Collapse (Esc)" : "Maximise — all 50 curated assets"}
-          className="rounded-[var(--radius-dense)] border border-glass-border px-2 py-1 text-xs text-text-dim transition-colors duration-150 ease-out hover:bg-glass-raised hover:text-text focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
-        >
-          {expanded ? "⤡" : "⤢"}
-        </button>
+        <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1 rounded-[var(--radius-dense)] bg-glass-raised p-0.5">
+            <button
+              type="button"
+              onClick={() => setViewMode("city")}
+              className={`rounded-[var(--radius-dense)] px-3 py-1 text-xs font-semibold transition-colors duration-150 ease-out ${
+                viewMode === "city"
+                  ? "bg-white text-black shadow-sm"
+                  : "text-text-dim hover:text-text"
+              }`}
+            >
+              City View
+            </button>
+            <button
+              type="button"
+              onClick={() => setViewMode("finance")}
+              className={`rounded-[var(--radius-dense)] px-3 py-1 text-xs font-semibold transition-colors duration-150 ease-out ${
+                viewMode === "finance"
+                  ? "bg-sev-normal text-white shadow-sm"
+                  : "text-text-dim hover:text-text"
+              }`}
+            >
+              Finance View
+            </button>
+          </div>
+          <button
+            type="button"
+            onClick={() => setExpanded((v) => !v)}
+            aria-label={expanded ? "Collapse graph to normal size" : "Maximise graph to full window"}
+            aria-pressed={expanded}
+            title={expanded ? "Collapse (Esc)" : "Maximise — all 50 curated assets"}
+            className="rounded-[var(--radius-dense)] border border-glass-border px-2 py-1 text-xs text-text-dim transition-colors duration-150 ease-out hover:bg-glass-raised hover:text-text focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+          >
+            {expanded ? "⤡" : "⤢"}
+          </button>
+        </div>
       }
       // Below `xl` the page no longer clamps to a fixed viewport height
       // (see page.tsx), so this panel needs its own definite height for
@@ -139,7 +167,7 @@ export function GraphPanel() {
       )}
 
       {isLoaded && state.kind === "loaded" && state.data.nodes.length > 0 && (
-        <CityGraph topology={state.data} />
+        <CityGraph topology={state.data} viewMode={viewMode} />
       )}
 
       {isLoaded && state.kind === "loaded" && state.data.nodes.length === 0 && (

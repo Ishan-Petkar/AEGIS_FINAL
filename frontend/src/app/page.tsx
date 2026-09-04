@@ -7,7 +7,6 @@ import { DetectionPreventionPanel } from "@/components/DetectionPreventionPanel"
 import { ImpactSummaryCard, DetectorSignalsCard } from "@/components/ImpactAndDetectors";
 import { RiskTrendChart } from "@/components/RiskTrendChart";
 import { SectorHealthStrip } from "@/components/SectorHealthStrip";
-import { IncidentPathStrip } from "@/components/IncidentPathStrip";
 
 // Console redesign — light-theme dashboard pass. Restructured from the
 // prior single-row (Telemetry | Graph | Alerts | IPS) layout into a
@@ -34,7 +33,6 @@ export default function Home() {
             <GraphPanel />
             <AlertsRail />
           </div>
-          <IncidentPathStrip />
           <DetectionPreventionPanel />
           <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
             <ImpactSummaryCard />

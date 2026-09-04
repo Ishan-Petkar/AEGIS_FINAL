@@ -11,6 +11,7 @@ import {
   type ClusterSnapshotNode,
 } from "@/lib/cluster-graph";
 import { AssetActivityTracker } from "@/lib/asset-activity";
+import { iconKeyFor, drawIcon, ICON_PATHS } from "@/lib/asset-icons";
 import { useGraphFocus } from "@/lib/graph-focus-context";
 import {
   CORE_SECTOR,
@@ -254,7 +255,16 @@ function clamp(v: number, lo: number, hi: number): number {
 
 /** Shared by layout (approximate, pre-measurement) and rendering (exact) so the two never disagree about how much room a node's marker needs. */
 function curatedNodeRadius(criticality: number): number {
-  return 3 + criticality * 7;
+  // Phase 2.1: unified base radius 11–18px.
+  return 11 + criticality * 7;
+}
+
+export function curatedMarkerRadius(props: { id: string; criticality: number; isAggregate: boolean; isGateway: boolean }): number {
+  const base = curatedNodeRadius(props.criticality);
+  if (props.id === HUB_ASSET_NAME) return Math.max(base * 1.45, 24);
+  if (props.isAggregate) return base * 1.2;
+  if (props.isGateway) return Math.max(base, 13);
+  return base;
 }
 
 // ---------------------------------------------------------------------------
@@ -343,8 +353,58 @@ function buildDisplayTopology(
   topology: TopologyResponse,
   expanded: boolean,
   focusedSectors: ReadonlySet<string>,
-  sectorMembers: Map<string, TopologyResponse["nodes"]>
+  sectorMembers: Map<string, TopologyResponse["nodes"]>,
+  viewMode: "city" | "finance" = "city"
 ): { nodes: DisplayNode[]; edges: DisplayEdge[] } {
+  if (viewMode === "finance") {
+    // Finance View: external network -> Gateway L4 -> Finance sector nodes.
+    const nodes: DisplayNode[] = [];
+    nodes.push({
+      name: "__external__",
+      label: "External Network",
+      type: "External IP",
+      criticality: 0.1,
+      purdue_level: null,
+      sector: "external",
+      is_gateway: false,
+      isFinancial: false,
+      isAggregate: false,
+      memberCount: 1,
+    });
+    for (const n of topology.nodes) {
+      if (n.name === "Gateway_L4" || n.sector === "finance") {
+        nodes.push(realNodeToDisplay(n));
+      }
+    }
+
+    const nodeNames = new Set(nodes.map(n => n.name));
+    const edges: DisplayEdge[] = [];
+    // Synthetic edge from External to Gateway_L4
+    if (nodeNames.has("Gateway_L4")) {
+      edges.push({
+        source: "__external__",
+        target: "Gateway_L4",
+        edge_type: "communicates_with",
+        is_gateway_edge: true,
+        isAggregate: false,
+        count: 1,
+      });
+    }
+    for (const e of topology.edges) {
+      if (nodeNames.has(e.source) && nodeNames.has(e.target)) {
+        edges.push({
+          source: e.source,
+          target: e.target,
+          edge_type: e.edge_type,
+          is_gateway_edge: e.is_gateway_edge,
+          isAggregate: false,
+          count: 1,
+        });
+      }
+    }
+    return { nodes, edges };
+  }
+
   if (expanded) {
     return {
       nodes: topology.nodes.map(realNodeToDisplay),
@@ -501,8 +561,8 @@ function computeCuratedLayout(
     y: cy + Math.sin(angle) * frac * radiusY,
   });
 
-  const coreFrac = 0.15;
-  const minSectorFrac = coreFrac * 1.8;
+  const coreFrac = 0.22;
+  const minSectorFrac = coreFrac * 1.55;
 
   const hub = nodes.find((n) => n.name === HUB_ASSET_NAME);
   const core: DisplayNode[] = [];
@@ -630,7 +690,12 @@ function computeCuratedLayout(
   const positions = new Map<string, { x: number; y: number; labelDx: number; labelDy: number }>();
   for (const n of order) {
     const pos = basePositions.get(n.name)!;
-    const r = curatedNodeRadius(n.criticality);
+    const r = curatedMarkerRadius({
+      id: n.name,
+      criticality: n.criticality,
+      isAggregate: n.isAggregate,
+      isGateway: n.is_gateway
+    });
     // `n.label`, not `n.name`: for a sector aggregate node these differ
     // (id `sector:energy` vs. rendered label `"Energy · 5"`) and this
     // estimate must track whatever `fitLabel`/`ctx.measureText` actually
@@ -863,7 +928,7 @@ function computeCascadeGeometry(
   return { hopOf, pathEdgeIds, edgeHopOf, fallbackHop: maxKnownHop + 1 };
 }
 
-export function CityGraph({ topology }: { topology: TopologyResponse }) {
+export function CityGraph({ topology, viewMode = "city" }: { topology: TopologyResponse, viewMode?: "city" | "finance" }) {
   // D14-2 constraint: consume the shared `useStream()` context only —
   // never call `useEventStream()` directly (that reintroduces the
   // duplicate-socket defect Ticket #10 fixed).
@@ -896,8 +961,8 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
   // `buildDisplayTopology`'s docstring for expanded vs. sector-aggregated
   // vs. one-sector-focused semantics.
   const displayTopology = useMemo(
-    () => buildDisplayTopology(topology, expanded, focusedSectors, sectorMembers),
-    [topology, expanded, focusedSectors, sectorMembers]
+    () => buildDisplayTopology(topology, expanded, focusedSectors, sectorMembers, viewMode),
+    [topology, expanded, focusedSectors, sectorMembers, viewMode]
   );
 
   // Escape collapses the maximised view and clears every focused sector —
@@ -1440,7 +1505,19 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
       const originSector = sectorByName.get(latestCii.origin_asset);
       if (originSector) focusSector(originSector);
     }
-  }, [latestCii, topology.edges, topology.nodes, expanded, focusedSectors, sectorByName, focusSector]);
+  }, [
+    latestCii,
+    topology.edges,
+    topology.nodes,
+    expanded,
+    focusedSectors,
+    sectorByName,
+    focusSector,
+    colors,
+    monoFont,
+    reducedMotion,
+    viewMode
+  ]);
 
   const nodeCanvasObject = useCallback(
     (node: CityNodeDatum, ctx: CanvasRenderingContext2D, globalScale: number) => {
@@ -1466,17 +1543,13 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
             : null;
 
       if (node.layer === "curated") {
-        const baseR = curatedNodeRadius(node.criticality);
-        // Ticket #16 FIX round (HIGH-1d): the hub must be unmistakably
-        // the visual centre, not just another dot with a bigger radius —
-        // a distinct double-ring "sun" marker (soft outer halo, solid
-        // filled ring, dark core) drawn before the gateway/financial
-        // branches so it takes priority regardless of those flags.
-        // `markerR` (not `baseR`) is what the pulse/cascade rings below
-        // are sized off of, so those overlays scale with what's actually
-        // drawn rather than the pre-enlargement criticality radius.
+        const markerR = curatedMarkerRadius({
+          id: node.id,
+          criticality: node.criticality,
+          isAggregate: !!node.isAggregate,
+          isGateway: !!node.isGateway
+        });
         const isHub = node.id === HUB_ASSET_NAME;
-        const markerR = isHub ? Math.max(baseR, 16) : baseR;
         if (isHub) {
           const haloR = markerR + 8 + (reducedMotion ? 3 : pulseT * 5);
           ctx.beginPath();
@@ -1486,63 +1559,62 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
           ctx.globalAlpha = 0.4;
           ctx.stroke();
           ctx.globalAlpha = 1;
+        }
 
-          ctx.beginPath();
-          ctx.arc(x, y, markerR, 0, 2 * Math.PI);
-          ctx.fillStyle = colors.accentHi;
-          ctx.fill();
-          ctx.lineWidth = 2;
-          ctx.strokeStyle = colors.text;
-          ctx.stroke();
+        // Phase 3.2: role → hue → iconKey
+        // Resolving the tone/hue is a direct mapping from role priority.
+        let hueColor = colors.accent;
+        if (viewMode === "finance") {
+          hueColor = node.pulseSeverity === "critical"
+            ? colors.sevCritical
+            : node.pulseSeverity === "warning"
+              ? colors.sevWarning
+              : node.pulseSeverity === "normal"
+                ? colors.sevNormal
+                : colors.textMute;
+        } else {
+          if (node.isFinancial) hueColor = colors.financial;
+          if (node.isGateway) hueColor = colors.accentHi; // Stronger accent for gateways
+          if (isHub) hueColor = colors.accentHi;
+        }
 
-          ctx.beginPath();
-          ctx.arc(x, y, markerR * 0.42, 0, 2 * Math.PI);
+        const iconKey = iconKeyFor({
+          type: node.nodeType,
+          isGateway: !!node.isGateway,
+          isAggregate: !!node.isAggregate,
+          id: node.id
+        });
+
+        const ICON_MIN_SCALE = 0.55;
+        const showIcon = globalScale >= ICON_MIN_SCALE;
+
+        // Phase 3.2: three-layer paint
+        // Layer 1: soft tint wash
+        ctx.beginPath();
+        ctx.arc(x, y, markerR, 0, 2 * Math.PI);
+        if (viewMode === "finance") {
           ctx.fillStyle = colors.ground;
-          ctx.fill();
-        } else if (node.isGateway) {
-          const r = Math.max(baseR, 9);
-          ctx.beginPath();
-          ctx.arc(x, y, r, 0, 2 * Math.PI);
-          ctx.lineWidth = 1.6;
-          ctx.strokeStyle = colors.accentHi;
-          ctx.stroke();
-          ctx.beginPath();
-          ctx.arc(x, y, r * 0.55, 0, 2 * Math.PI);
-          ctx.fillStyle = colors.accent;
-          ctx.globalAlpha = 0.55;
-          ctx.fill();
-          ctx.globalAlpha = 1;
-        } else if (node.isFinancial) {
-          const r = baseR;
-          ctx.beginPath();
-          ctx.moveTo(x, y - r);
-          ctx.lineTo(x + r, y);
-          ctx.lineTo(x, y + r);
-          ctx.lineTo(x - r, y);
-          ctx.closePath();
-          ctx.fillStyle = colors.financial;
-          ctx.fill();
-        } else if (node.isAggregate) {
-          // Console redesign (D-R2): a sector aggregate node — visually
-          // distinct from a single real asset (a hairline outer ring, like
-          // the gateway marker but filled solid) so an operator can tell
-          // at a glance "this is a rolled-up sector" without reading the
-          // label first.
-          ctx.beginPath();
-          ctx.arc(x, y, baseR, 0, 2 * Math.PI);
-          ctx.fillStyle = colors.accent;
-          ctx.fill();
-          ctx.beginPath();
-          ctx.arc(x, y, baseR + 3, 0, 2 * Math.PI);
-          ctx.lineWidth = 1.4;
-          ctx.strokeStyle = colors.accentHi;
-          ctx.globalAlpha = 0.6;
-          ctx.stroke();
           ctx.globalAlpha = 1;
         } else {
+          ctx.fillStyle = hueColor;
+          ctx.globalAlpha = 0.12;
+        }
+        ctx.fill();
+
+        // Layer 2: full-strength hairline ring
+        ctx.globalAlpha = 1;
+        ctx.lineWidth = isHub ? 2 : 1.4;
+        ctx.strokeStyle = hueColor;
+        ctx.stroke();
+
+        // Layer 3: inner glyph
+        if (showIcon) {
+          drawIcon(ctx, x, y, markerR, iconKey, viewMode === "finance" ? hueColor : (isHub ? colors.text : hueColor));
+        } else {
+          // Degrade to plain disc if zoomed out too far
           ctx.beginPath();
-          ctx.arc(x, y, baseR, 0, 2 * Math.PI);
-          ctx.fillStyle = colors.accent;
+          ctx.arc(x, y, markerR * 0.4, 0, 2 * Math.PI);
+          ctx.fillStyle = hueColor;
           ctx.fill();
         }
 
@@ -1634,30 +1706,6 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
           }
         }
 
-        // Ticket #14 FIX round (HIGH-1), re-tuned Ticket #16 FIX round:
-        // a deterministic width-based truncation (`fitLabel`, applied to
-        // `shortenLabel`'s output so a generic suffix drops before any
-        // mid-word character truncation is needed), a token-colored
-        // backing plate for legibility against edges/other nodes, and an
-        // anchor placed *radially* outward from the node per
-        // `labelDx`/`labelDy` — the offset pair `computeCuratedLayout`'s
-        // greedy placer picked by checking each label's box against
-        // every other curated label, which is what actually guarantees
-        // no two curated labels overlap (see that function's docstring
-        // for why a static above/below rule reads wrong once wedges are
-        // angularly separated instead of stacked in columns).
-        //
-        // Ticket #16 (D-C5): at ~44 curated nodes, always-on labels for
-        // everything reads as a wall of text — but the plan is explicit
-        // that the hub, every financial asset, and any cascade-involved
-        // node must stay permanently labelled regardless. Everything
-        // else (low-criticality periphery — sensors, advisory feeds) is
-        // hover-only, same mechanism the observed `/24` layer already
-        // uses below. `labelDx`/`labelDy`/the collision-free box are
-        // still computed for every node above (whether or not it ends up
-        // drawn), so a node that only shows on hover still lands in its
-        // pre-reserved, non-overlapping slot rather than fighting for
-        // space live.
         const cascadeInvolved =
           !!cascade && (node.id === cascade.originAsset || cascade.impactedSet.has(node.id));
         const alwaysLabel =
@@ -1679,31 +1727,69 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
           // as the hub rather than just another always-on label.
           const fontSize = isHub ? Math.max(13 / globalScale, 4) : Math.max(10 / globalScale, 3);
           ctx.font = `${fontSize}px ${monoFont}`;
-          const label = fitLabel(ctx, shortenLabel(node.label), curatedLabelMaxWidthRef.current);
+          const label = viewMode === "finance" 
+            ? shortenLabel(node.label) 
+            : fitLabel(ctx, shortenLabel(node.label), curatedLabelMaxWidthRef.current);
           const textWidth = ctx.measureText(label).width;
-          const labelDx = node.labelDx ?? 0;
-          const labelDy = node.labelDy ?? baseR + 3;
+          
+          const isRightSideNode = viewMode === "finance" && !["__external__", "Gateway_L4", "City_Payment_Gateway"].includes(node.id);
+          
+          const labelDx = viewMode === "finance" ? (isRightSideNode ? markerR + 14 / globalScale : 0) : (node.labelDx ?? 0);
+          const labelDy = viewMode === "finance" ? (isRightSideNode ? 0 : markerR + 10 / globalScale) : (node.labelDy ?? markerR + 3);
           const above = labelDy < 0;
           const anchorX = x + labelDx;
           const anchorY = y + labelDy;
-          const platePadX = 3;
-          const plateHeight = fontSize + 4;
-          const plateTop = above ? anchorY - plateHeight : anchorY;
 
-          // Phase 1.2: fully opaque fill (was 0.85 — at 0.85 on a white
-          // background the plate is still white but semi-transparent, which
-          // lets edges bleed through the label area on light displays).
-          ctx.fillStyle = colors.groundRaised;
-          ctx.globalAlpha = 1;
-          ctx.fillRect(anchorX - textWidth / 2 - platePadX, plateTop, textWidth + platePadX * 2, plateHeight);
-          ctx.lineWidth = 1 / globalScale;
-          ctx.strokeStyle = isHub ? colors.accentHi : colors.glassBorderStrong;
-          ctx.strokeRect(anchorX - textWidth / 2 - platePadX, plateTop, textWidth + platePadX * 2, plateHeight);
+          if (viewMode !== "finance") {
+            const platePadX = 4 / globalScale;
+            const plateHeight = fontSize * 1.4;
+            const plateTop = above ? anchorY - plateHeight : anchorY;
+            const plateRadius = 3 / globalScale;
 
-          ctx.textAlign = "center";
-          ctx.textBaseline = above ? "bottom" : "top";
-          ctx.fillStyle = isHub ? colors.text : colors.textDim;
-          ctx.fillText(label, anchorX, anchorY);
+            // Phase 1.2: fully opaque fill with rounded corners and constant-screen-size padding
+            ctx.fillStyle = colors.groundRaised;
+            ctx.beginPath();
+            if (ctx.roundRect) {
+              ctx.roundRect(anchorX - textWidth / 2 - platePadX, plateTop, textWidth + platePadX * 2, plateHeight, plateRadius);
+            } else {
+              ctx.rect(anchorX - textWidth / 2 - platePadX, plateTop, textWidth + platePadX * 2, plateHeight);
+            }
+            ctx.fill();
+
+            // Hairline border over the opaque plate — stops labels from bleeding
+            // into same-colored edges (the city web is dense).
+            ctx.lineWidth = 1 / globalScale;
+            ctx.strokeStyle = colors.glassBorderStrong;
+            ctx.stroke();
+          }
+
+          if (viewMode === "finance") {
+            ctx.textAlign = isRightSideNode ? "left" : "center";
+            ctx.textBaseline = isRightSideNode ? "middle" : "top";
+            ctx.fillStyle = colors.text; // Text is darker in finance view
+            
+            const words = label.split(" ");
+            let lineY = isRightSideNode ? anchorY - ((words.length - 1) * fontSize * 1.4) / 2 : anchorY;
+            const lineHeight = fontSize * 1.4;
+            
+            if (node.id === "Gateway_L4") {
+              ctx.fillText("Gateway L4", anchorX, lineY);
+              ctx.fillText("(Finance Zone)", anchorX, lineY + lineHeight);
+            } else if (words.length > 1 && words.length <= 3) {
+              for (const word of words) {
+                ctx.fillText(word, anchorX, lineY);
+                lineY += lineHeight;
+              }
+            } else {
+              ctx.fillText(label, anchorX, lineY);
+            }
+          } else {
+            // Text aligns to the exact same anchor
+            ctx.textAlign = "center";
+            ctx.textBaseline = above ? "alphabetic" : "hanging";
+            ctx.fillStyle = isHub ? colors.text : colors.textDim;
+            ctx.fillText(label, anchorX, anchorY);
+          }
         }
       } else {
         // Observed `/24` cluster — hollow, dashed, muted. Must never
@@ -1871,11 +1957,38 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
             <ForceGraph2D<CityNodeDatum, CityLinkDatum>
               ref={fgRef}
               graphData={graphData}
+              dagMode={viewMode === "finance" ? "lr" : undefined}
+              dagLevelDistance={viewMode === "finance" ? 80 : undefined}
               width={size.width}
               height={size.height}
               backgroundColor="transparent"
               nodeCanvasObject={nodeCanvasObject}
               nodeCanvasObjectMode={() => "replace"}
+              nodeRelSize={4}
+              nodeVal={(node: CityNodeDatum) => {
+                if (node.layer !== "curated") return 1;
+                const r = curatedMarkerRadius({
+                  id: node.id,
+                  criticality: node.criticality,
+                  isAggregate: !!node.isAggregate,
+                  isGateway: !!node.isGateway
+                });
+                return Math.pow(r / 4, 2);
+              }}
+              nodePointerAreaPaint={(node: CityNodeDatum, color, ctx) => {
+                const r = node.layer === "curated"
+                  ? curatedMarkerRadius({
+                      id: node.id,
+                      criticality: node.criticality,
+                      isAggregate: !!node.isAggregate,
+                      isGateway: !!node.isGateway
+                    })
+                  : 4;
+                ctx.beginPath();
+                ctx.arc(node.x ?? 0, node.y ?? 0, r + 4, 0, 2 * Math.PI);
+                ctx.fillStyle = color;
+                ctx.fill();
+              }}
               nodeLabel={nodeLabel}
               linkColor={linkColor}
               linkWidth={linkWidth}
@@ -1949,36 +2062,51 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
 }
 
 function Legend({ colors }: { colors: ReturnType<typeof useThemeColors> }) {
+  const IconSvg = ({ pathKey, color, size = 12 }: { pathKey: string, color: string, size?: number }) => (
+    <svg viewBox="0 0 24 24" width={size} height={size} fill="none" style={{ color }}>
+      <path d={ICON_PATHS[pathKey]} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+
   return (
     <div className="flex flex-wrap items-center gap-3">
       <LegendItem
         swatch={
-          <span className="relative inline-flex h-3.5 w-3.5 items-center justify-center rounded-full" style={{ background: colors.accentHi, boxShadow: `0 0 0 1.5px ${colors.text}` }}>
-            <span className="h-1.5 w-1.5 rounded-full" style={{ background: colors.ground }} />
+          <span className="relative flex items-center justify-center h-4 w-4 rounded-full border-[1.5px]" style={{ borderColor: colors.accentHi, backgroundColor: `${colors.accentHi}20` }}>
+            <IconSvg pathKey="mesh" color={colors.text} size={10} />
           </span>
         }
         label="Hub"
       />
-      <LegendItem swatch={<span className="inline-block h-2.5 w-2.5 rounded-full" style={{ background: colors.accent }} />} label="Infra" />
       <LegendItem
         swatch={
-          <span
-            className="inline-block h-2.5 w-2.5"
-            style={{ background: colors.financial, clipPath: "polygon(50% 0, 100% 50%, 50% 100%, 0 50%)" }}
-          />
+          <span className="relative flex items-center justify-center h-3.5 w-3.5 rounded-full border-[1.5px]" style={{ borderColor: colors.accent, backgroundColor: `${colors.accent}20` }}>
+            <IconSvg pathKey="sensor" color={colors.accent} size={9} />
+          </span>
+        }
+        label="Infra"
+      />
+      <LegendItem
+        swatch={
+          <span className="relative flex items-center justify-center h-3.5 w-3.5 rounded-full border-[1.5px]" style={{ borderColor: colors.financial, backgroundColor: `${colors.financial}20` }}>
+            <IconSvg pathKey="bank" color={colors.financial} size={9} />
+          </span>
         }
         label="Financial"
       />
       <LegendItem
-        swatch={<span className="inline-block h-3 w-3 rounded-full border-[1.5px]" style={{ borderColor: colors.accentHi }} />}
+        swatch={
+          <span className="relative flex items-center justify-center h-3.5 w-3.5 rounded-full border-[1.5px]" style={{ borderColor: colors.accentHi, backgroundColor: `${colors.accentHi}20` }}>
+            <IconSvg pathKey="shield" color={colors.accentHi} size={9} />
+          </span>
+        }
         label="Gateway"
       />
       <LegendItem
         swatch={
-          <span
-            className="inline-block h-3 w-3 rounded-full"
-            style={{ background: colors.accent, boxShadow: `0 0 0 1.5px ${colors.accentHi}` }}
-          />
+          <span className="relative flex items-center justify-center h-3.5 w-3.5 rounded-full border-[1.5px]" style={{ borderColor: colors.accent, backgroundColor: `${colors.accent}20` }}>
+            <IconSvg pathKey="layers" color={colors.accent} size={9} />
+          </span>
         }
         label="Sector (click to expand)"
       />

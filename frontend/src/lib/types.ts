@@ -340,6 +340,7 @@ export interface EventEnvelopeData {
     band: string;
     action: string;
     fired_detectors: string[];
+    matched_rules?: string[]; // Phase 6 addition
     rationale: string;
   } | null;
 }
