@@ -87,7 +87,7 @@ from __future__ import annotations
 
 import statistics
 from collections import OrderedDict, deque
-from typing import Deque, Optional, Sequence
+from typing import Any, Deque, Optional, Sequence
 
 from backend.config import BACKEND_SETTINGS
 from backend.detection.contracts import (
@@ -183,7 +183,7 @@ class BeaconingDetector:
         for flow in flows:
             history = self._touch(flow.pair_key)
             history.append(flow.ts)
-            verdicts.append(self._verdict_for(history))
+            verdicts.append(self._verdict_for(history, flow))
         return verdicts
 
     def reset(self) -> None:
@@ -216,12 +216,17 @@ class BeaconingDetector:
                 self._history.popitem(last=False)
         return self._history[pair_key]
 
-    def _verdict_for(self, history: Deque) -> DetectorVerdict:
+    def _verdict_for(self, history: Deque, flow: FlowFeatures) -> DetectorVerdict:
         """Compute this pair's verdict from its current timestamp history.
 
         `history` already includes the flow being scored (appended by the
         caller before this runs), matching the module docstring's stated
         order: append, then compute intervals from the stored history.
+
+        `flow` is used only to name the destination in `evidence["summary"]`
+        — the human-readable one-liner an analyst reads first. The VERDICT
+        itself is still a pure function of `history`: no field of `flow`
+        enters the score, the threshold, or the fire decision.
         """
         timestamps = list(history)
         # abs() guards against out-of-order timestamps within a batch
@@ -271,6 +276,27 @@ class BeaconingDetector:
         # decreasing map of cv onto [0, 1], clamped at both ends.
         calibrated_score = max(0.0, min(1.0, 1.0 - (cv / self._max_cv)))
 
+        evidence: dict[str, Any] = {
+            "usable_intervals": usable_count,
+            "total_intervals_observed": len(raw_intervals),
+            "mean_interval_sec": mean_interval,
+            "stdev_interval_sec": stdev_interval,
+            "cv": cv,
+            "max_cv_threshold": self._max_cv,
+            "comparison": f"cv={cv:.4f} {'<=' if fired else '>'} max_cv={self._max_cv:.4f}",
+        }
+        if fired:
+            # Plain-English one-liner for triage. Added alongside — never
+            # instead of — the raw figures above: an analyst opening an
+            # alert should not have to know what "cv" means to see what
+            # was claimed, and an analyst who DOES should still be able to
+            # check the arithmetic.
+            evidence["summary"] = (
+                f"Periodic connection detected to {flow.destination_ip}:"
+                f"{flow.destination_port} (mean interval {mean_interval:.2f}s, "
+                f"jitter/CV {cv:.2f} over {usable_count} intervals)."
+            )
+
         return DetectorVerdict(
             detector=self.name,
             fired=fired,
@@ -278,13 +304,5 @@ class BeaconingDetector:
             reliability=self._reliability,
             certainty=Certainty.HEURISTIC,
             raw_score=cv,
-            evidence={
-                "usable_intervals": usable_count,
-                "total_intervals_observed": len(raw_intervals),
-                "mean_interval_sec": mean_interval,
-                "stdev_interval_sec": stdev_interval,
-                "cv": cv,
-                "max_cv_threshold": self._max_cv,
-                "comparison": f"cv={cv:.4f} {'<=' if fired else '>'} max_cv={self._max_cv:.4f}",
-            },
+            evidence=evidence,
         )

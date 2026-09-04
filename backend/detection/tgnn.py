@@ -159,7 +159,7 @@ from __future__ import annotations
 import logging
 from collections import OrderedDict, deque
 from datetime import datetime, timedelta
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 import networkx as nx
 import numpy as np
@@ -752,6 +752,64 @@ class TGNNDetector:
         is_outlier = decision < 0.0
         fired = bool(is_outlier and calibrated >= self._fire_threshold)
 
+        evidence: dict[str, Any] = {
+            "node": src,
+            "out_degree": int(self._graph.out_degree(src)),
+            "unseen_peer_ratio": float(feat[0]),
+            "degree_expansion": float(feat[1]),
+            "neighbor_drift": float(feat[2]),
+            "traffic_entropy_delta": float(feat[3]),
+            "cold_start": is_cold_start,
+            "decision_function": float(decision),
+            "is_outlier": is_outlier,
+            "calibrated_score": calibrated,
+            "fire_threshold": self._fire_threshold,
+            "comparison": f"calibrated={calibrated:.4f} {'≥' if fired else '<'} threshold={self._fire_threshold:.4f}",
+        }
+        if fired:
+            # Plain-English one-liner for triage, added alongside — never
+            # instead of — the raw features above. "degree_expansion=7.5"
+            # is checkable but not readable; an analyst should not need to
+            # know what this detector's feature space is to see what it
+            # claims happened. The novel-peer COUNT is recomputed exactly
+            # here rather than derived from the stored ratio, so the
+            # sentence never disagrees with the graph by a rounding step.
+            current_peers = frozenset(self._graph.successors(src))
+            baseline_map = self._history_out_peers.get(src)
+            reference = (
+                frozenset(baseline_map)
+                if baseline_map
+                else frozenset(self._history_global_destinations)
+            )
+            novel_peers = current_peers.difference(reference)
+            if is_cold_start:
+                evidence["summary"] = (
+                    f"Cold-start host {src} initiated "
+                    f"{len(novel_peers)} novel external connection(s) "
+                    f"to destinations unseen anywhere in the baseline "
+                    f"(no prior history for this host)."
+                )
+            elif novel_peers:
+                evidence["summary"] = (
+                    f"Host {src} contacted {len(novel_peers)} novel peer(s) "
+                    f"({float(feat[0]):.0%} of this window's peers unseen in its "
+                    f"own history); fan-out {float(feat[1]):.1f}x its baseline."
+                )
+            else:
+                # The forest can flag a node for being unusually STILL as
+                # readily as for fanning out — a contracting or frozen
+                # peer set is an outlier against a training population of
+                # ordinarily-churning nodes. Saying "expanded" here would
+                # assert a direction the numbers contradict, so this
+                # branch reports what was measured and leaves the cause to
+                # the analyst.
+                evidence["summary"] = (
+                    f"Host {src} contacted no new peers, but its structural "
+                    f"profile is an outlier against its own history "
+                    f"(fan-out {float(feat[1]):.1f}x baseline, peer-set drift "
+                    f"{float(feat[2]):.2f})."
+                )
+
         return DetectorVerdict(
             detector=self.name,
             fired=fired,
@@ -759,18 +817,5 @@ class TGNNDetector:
             reliability=self._reliability,
             certainty=Certainty.HEURISTIC,
             raw_score=decision,
-            evidence={
-                "node": src,
-                "out_degree": int(self._graph.out_degree(src)),
-                "unseen_peer_ratio": float(feat[0]),
-                "degree_expansion": float(feat[1]),
-                "neighbor_drift": float(feat[2]),
-                "traffic_entropy_delta": float(feat[3]),
-                "cold_start": is_cold_start,
-                "decision_function": float(decision),
-                "is_outlier": is_outlier,
-                "calibrated_score": calibrated,
-                "fire_threshold": self._fire_threshold,
-                "comparison": f"calibrated={calibrated:.4f} {'≥' if fired else '<'} threshold={self._fire_threshold:.4f}",
-            },
+            evidence=evidence,
         )

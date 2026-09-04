@@ -588,3 +588,65 @@ def test_evidence_payload_shape():
     assert "fire_threshold" in v.evidence
     assert "decision_function" in v.evidence
     assert "is_outlier" in v.evidence
+
+
+# ---------------------------------------------------------------------------
+# Analyst-readable summary (SOC triage)
+# ---------------------------------------------------------------------------
+
+
+def test_fired_verdict_carries_plain_english_summary():
+    """A fired verdict must explain itself in a sentence, not only in
+    feature floats. `degree_expansion=7.5` is checkable but not readable;
+    an analyst should not need to know this detector's feature space to
+    see what it claims happened."""
+    detector = TGNNDetector(baseline_batches=6, min_edges_to_score=2, fire_threshold=0.7)
+    _fit_baseline(detector, batches=6)
+
+    anomalous_flows = [
+        _flow(_T0 + timedelta(seconds=2000 + i), src="10.0.0.0", dst=f"10.9.9.{i}")
+        for i in range(30)
+    ]
+    fired = [v for v in detector.examine(anomalous_flows) if v.fired]
+    assert fired
+
+    summary = fired[0].evidence["summary"]
+    assert "10.0.0.0" in summary
+    assert "novel peer" in summary
+    # The sentence must agree with the structured features beside it.
+    assert f"{fired[0].evidence['degree_expansion']:.1f}x" in summary
+
+
+def test_non_fired_verdict_has_no_summary():
+    """`summary` is an alert-time artifact. Emitting one for every quiet
+    flow would put a sentence claiming nothing happened on ~98% of
+    traffic, which is noise in the evidence payload and in the DB."""
+    detector = TGNNDetector(baseline_batches=6, min_edges_to_score=2, fire_threshold=0.7)
+    _fit_baseline(detector, batches=6)
+
+    for v in detector.examine(_stable_batch(9)):
+        if not v.fired:
+            assert "summary" not in v.evidence
+
+
+def test_cold_start_fired_verdict_summary_says_cold_start():
+    """The cold-start path has its own sentence: with no per-node history
+    there is no 'expanded Nx baseline' to report, and claiming one would
+    be inventing a baseline that does not exist."""
+    detector = TGNNDetector(baseline_batches=6, min_edges_to_score=2, fire_threshold=0.7)
+    _fit_baseline(detector, batches=6)
+
+    # A never-before-seen host fanning out to globally-novel destinations.
+    novel = [
+        _flow(_T0 + timedelta(seconds=4000 + i), src="10.0.0.77", dst=f"203.0.113.{i}")
+        for i in range(25)
+    ]
+    fired = [v for v in detector.examine(novel) if v.fired and v.evidence.get("cold_start")]
+    assert fired, "expected the cold-start path to fire on 25 globally-novel destinations"
+
+    summary = fired[0].evidence["summary"]
+    assert "Cold-start host 10.0.0.77" in summary
+    assert "novel external connection" in summary
+    # No fan-out multiplier is claimed: with no prior history there is no
+    # baseline to have expanded from, and inventing one would be a lie.
+    assert "x baseline" not in summary and "x its baseline" not in summary

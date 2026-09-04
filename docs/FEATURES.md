@@ -50,6 +50,7 @@ from older planning docs.
 | eslint (`eslint-config-next`) | Frontend lint |
 | Custom AST duplicate-def checker | CI — no function/class defined twice in `src/*.py` |
 | `scripts/dev-up.sh` / `dev-down.sh` / `dev-open.sh` | One-command local dev lifecycle |
+| `scripts/demo.py` | Terminal-only showcase of all 6 detectors in ~1.5s — no Postgres, no frontend, no model artifact (2026-09-05) |
 
 ---
 
@@ -124,7 +125,11 @@ decision to `threat_score = 1.0` without being diluted by a
   dst)` inter-arrival coefficient-of-variation, the direct answer to §2's
   volumetric blind spot (a beacon's signal is timing regularity, which no
   per-flow volumetric feature can carry). Stateful — one long-lived
-  instance per pipeline, LRU-bounded per-pair history.
+  instance per pipeline, LRU-bounded per-pair history. A fired verdict's
+  `evidence["summary"]` (added 2026-09-05, alongside T-GNN's own) states
+  the destination and rhythm in one sentence — e.g. *"Periodic connection
+  detected to 203.0.113.7:443 (mean interval 60.00s, jitter/CV 0.03)"* —
+  next to the raw `cv`/`mean_interval_sec` figures, not instead of them.
 
 **A third new detector, added 2026-09-04**: **T-GNN**
 (`backend/detection/tgnn.py`) — graph-structural anomaly detection,
@@ -150,7 +155,11 @@ by an Isolation Forest fit on a rolling buffer of these feature rows
 collected every batch (`tgnn_max_training_rows`). A node with no history
 at all (first-ever appearance) falls back to *edge novelty* against a
 global "every destination ever seen" set, rather than trivially reading
-maximal drift against nothing.
+maximal drift against nothing. A fired verdict's `evidence["summary"]`
+(added 2026-09-05) states the finding in one sentence — novel-peer
+count and fan-out multiplier, or the cold-start phrasing when there is
+no per-node baseline to expand from — next to the raw feature floats,
+not instead of them.
 
 This replaced an earlier version (through 2026-09-03) that scored
 *pooled global centrality* — weighted in/out-degree, PageRank, clustering
@@ -518,8 +527,17 @@ Ordered by how soon each would matter, not by difficulty.
 - [ ] Multi-tenant / multi-city support (keyed registry of replay engines,
   pub/sub broadcaster instead of in-process)
 - [ ] Alembic migrations (currently `Base.metadata.create_all()`)
-- [ ] Structured (JSON) logging + a Prometheus-format `/metrics` endpoint
-  exposing the counters that already exist internally
+- [x] ~~A Prometheus-format `/metrics` endpoint exposing the counters
+  that already exist internally~~ — **done 2026-09-05**
+  (`GET /metrics`, `backend/routes.py`). Hand-rolled text exposition
+  (no `prometheus_client` dependency — the format is three lines per
+  metric family) over `IngestPipeline.stats()` and `event_scores`
+  aggregates; per-detector fire counts are DB-sourced rather than from
+  `IngestStats` so all six channels are covered, not only the three
+  that counter tracks. Structured JSON logging is still open — the
+  natural correlation key (`replay_session_id`) already exists in the
+  domain model, so this is a formatter + a `logging.Filter`, not new
+  instrumentation.
 - [ ] Containerization (`docker-compose.yml` for Postgres + backend +
   frontend) — currently a multi-step manual setup
 

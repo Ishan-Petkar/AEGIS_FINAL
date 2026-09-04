@@ -226,3 +226,38 @@ def test_calibrated_score_always_in_unit_interval():
     verdicts = detector.examine(flows)
     for v in verdicts:
         assert 0.0 <= v.calibrated_score <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# Analyst-readable summary (SOC triage)
+# ---------------------------------------------------------------------------
+
+
+def test_fired_verdict_carries_plain_english_summary():
+    """A fired verdict must name the destination and state the rhythm in
+    a sentence. `cv=0.0031` is checkable but not readable, and "what is
+    this host talking to, how often" is the first question triage asks."""
+    detector = BeaconingDetector()
+    verdicts = detector.examine(_periodic_flows(12, 60.0, dst="10.9.9.9"))
+
+    fired = [v for v in verdicts if v.fired]
+    assert fired
+
+    summary = fired[-1].evidence["summary"]
+    assert "10.9.9.9:443" in summary
+    assert "mean interval 60.00s" in summary
+    # The sentence must agree with the structured figures beside it.
+    assert f"{fired[-1].evidence['cv']:.2f}" in summary
+
+
+def test_non_fired_verdict_has_no_summary():
+    """`summary` is an alert-time artifact — a sentence on every quiet
+    flow is noise in the evidence payload and in the DB."""
+    detector = BeaconingDetector()
+    # Wildly irregular intervals: high CV, nothing to report.
+    offsets = [0, 3, 90, 91, 400, 402, 1500]
+    verdicts = detector.examine([_flow(_T0 + timedelta(seconds=o)) for o in offsets])
+
+    for v in verdicts:
+        if not v.fired:
+            assert "summary" not in v.evidence

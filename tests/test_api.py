@@ -66,6 +66,7 @@ from backend.models import (  # noqa: E402
     Alert,
     Base,
     Event,
+    EventScore,
 )
 from backend.ingest import IngestStats  # noqa: E402
 from backend.replay_engine import ReplayEngine  # noqa: E402
@@ -1284,3 +1285,107 @@ def test_real_lifespan_builds_working_runtime_or_reports_degraded():
         body = r.json()
         assert isinstance(body["scorer_loaded"], bool)
         assert isinstance(body["database"], bool)
+
+
+# ---------------------------------------------------------------------------
+# GET /metrics — Prometheus text exposition
+# ---------------------------------------------------------------------------
+
+
+def test_metrics_returns_prometheus_text_with_help_and_type(sqlite_session_scope):
+    runtime = make_stats_runtime()
+    client = make_client(runtime=runtime, session_scope=sqlite_session_scope)
+
+    r = client.get("/metrics")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/plain")
+    assert "version=0.0.4" in r.headers["content-type"]
+
+    body = r.text
+    assert "# HELP aegis_up" in body
+    assert "# TYPE aegis_up gauge" in body
+    assert "# HELP aegis_flows_received_total" in body
+    assert "# TYPE aegis_flows_received_total counter" in body
+
+
+def test_metrics_counters_come_from_pipeline_stats_not_fabricated(sqlite_session_scope):
+    seeded = IngestStats(flows_received=150, anomalies=11, events_inserted=148, alerts_created=2)
+    runtime = make_stats_runtime(ingest_stats=seeded)
+    client = make_client(runtime=runtime, session_scope=sqlite_session_scope)
+
+    body = client.get("/metrics").text
+    assert "aegis_flows_received_total 150" in body
+    assert "aegis_anomalies_detected_total 11" in body
+    assert "aegis_events_inserted_total 148" in body
+    assert "aegis_alerts_created_total 2" in body
+
+
+def test_metrics_is_200_even_with_no_scorer_loaded():
+    """A scrape failure is indistinguishable from a dead target in
+    Prometheus, so unlike /api/stats (which 503s here) this endpoint must
+    still answer — reporting aegis_up 0 rather than refusing."""
+    runtime = make_no_scorer_runtime()
+    client = make_client(runtime=runtime)
+
+    r = client.get("/metrics")
+    assert r.status_code == 200
+    assert "aegis_up 0" in r.text
+
+
+def test_metrics_omits_db_families_when_database_is_unreachable():
+    """Honesty rule: a metric family that cannot be computed is OMITTED,
+    never emitted as a fabricated zero — a real 0 and "no basis to answer"
+    are different claims, and Prometheus stores both as a datapoint."""
+
+    def broken_scope():
+        raise RuntimeError("database unreachable")
+
+    runtime = make_stats_runtime()
+    client = make_client(runtime=runtime, session_scope=lambda: broken_scope)
+
+    r = client.get("/metrics")
+    assert r.status_code == 200
+    assert "aegis_detector_fires_total" not in r.text
+    assert "aegis_threat_score_avg" not in r.text
+    # In-memory families are unaffected by the DB being down.
+    assert "aegis_flows_received_total" in r.text
+
+
+def test_metrics_per_detector_fires_come_from_persisted_event_scores(sqlite_session_scope):
+    """The per-detector family is DB-sourced, not from IngestStats — which
+    only tracks three of the six channels. `event_scores` carries one row
+    per detector per event for all six (the 2026-09-05 _persist_scores
+    fix), so this is the only source that can answer for all of them, and
+    it survives a restart."""
+    with sqlite_session_scope() as session:
+        session.add(make_event("r1", ts=BASE_TS))
+        session.flush()
+        for detector, fired in [
+            ("tgnn", True),
+            ("tgnn", True),
+            ("signature", True),
+            ("beaconing", False),  # ran, did not fire — must not be counted
+            ("hybrid", True),
+        ]:
+            session.add(
+                EventScore(
+                    event_id=1,
+                    detector=detector,
+                    raw_score=None,
+                    calibrated_score=0.8,
+                    is_anomaly=fired,
+                    confidence=0.8,
+                )
+            )
+
+    client = make_client(runtime=make_stats_runtime(), session_scope=sqlite_session_scope)
+    body = client.get("/metrics").text
+
+    assert "# TYPE aegis_detector_fires_total counter" in body
+    assert 'aegis_detector_fires_total{detector="tgnn"} 2' in body
+    assert 'aegis_detector_fires_total{detector="signature"} 1' in body
+    # Ran-but-did-not-fire is not a fire.
+    assert 'aegis_detector_fires_total{detector="beaconing"}' not in body
+    # Mean fused score across persisted hybrid rows.
+    assert "# TYPE aegis_threat_score_avg gauge" in body
+    assert "aegis_threat_score_avg 0.8" in body

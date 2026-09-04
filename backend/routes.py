@@ -15,6 +15,7 @@ backend/routes.py — Phase 5 Ticket #8 (nine REST routes) + Ticket #13
     GET  /api/inject/scenarios  (Ticket #13)
     POST /api/inject            (Ticket #13)
     GET  /api/stats              (Ticket #16)
+    GET  /metrics                (Prometheus text exposition)
 
 Two overridable dependencies carry every route's external state, so the
 default test suite needs neither Postgres nor a real `AppRuntime`
@@ -52,7 +53,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Callable, ContextManager
+from typing import Callable, ContextManager, Optional
 
 from fastapi import (
     APIRouter,
@@ -1048,3 +1049,150 @@ async def ws_stream(
         logger.warning("ws_stream: client %d ended abnormally", client.client_id, exc_info=True)
     finally:
         await runtime.broadcaster.unregister(client)
+
+
+# ---------------------------------------------------------------------------
+# GET /metrics — Prometheus text exposition
+# ---------------------------------------------------------------------------
+
+
+def _prom_lines(name: str, help_text: str, metric_type: str, samples: list[tuple[str, float]]) -> list[str]:
+    """Render one metric family in Prometheus text exposition format
+    (`# HELP`, `# TYPE`, then one line per labelled sample).
+
+    `samples` is a list of `(label_block, value)` pairs, where
+    `label_block` is either `""` (unlabelled) or a pre-rendered
+    `{key="value"}` string. Rendering is done by hand rather than via
+    `prometheus_client` deliberately: the exposition format for counters
+    and gauges is three lines of text, and a scrape endpoint is not worth
+    a new runtime dependency to this project (see CLAUDE.md's dependency
+    posture — `requirements-backend.txt` is deliberately small).
+    """
+    lines = [f"# HELP {name} {help_text}", f"# TYPE {name} {metric_type}"]
+    lines.extend(f"{name}{label_block} {value}" for label_block, value in samples)
+    return lines
+
+
+@router.get("/metrics")
+def get_metrics(
+    runtime: AppRuntime = Depends(get_runtime),
+    scope: Callable[[], ContextManager[Session]] = Depends(get_session_scope),
+) -> Response:
+    """Prometheus scrape endpoint, exposing counters this process already
+    keeps rather than instrumenting anything new.
+
+    Deliberately NOT under `/api/` — `/metrics` is the conventional path
+    every Prometheus scrape config assumes by default, and this endpoint
+    speaks a different content type to a different consumer than the JSON
+    REST surface.
+
+    Always 200, never 503, unlike `/api/stats`: a scrape failure is
+    indistinguishable from a dead target in Prometheus, so a backend that
+    is up but has no model artifact loaded must still report what it does
+    know. The honesty rule the rest of this module follows still applies —
+    a metric family that cannot be computed (no pipeline yet, database
+    unreachable) is OMITTED rather than emitted as a fabricated zero,
+    because a real `0` and "no basis to answer" are different claims and
+    Prometheus records both as a datapoint. `aegis_up` is the flag a
+    dashboard should alert on.
+    """
+    lines: list[str] = []
+
+    pipeline = getattr(runtime, "pipeline", None)
+    stats = pipeline.stats() if pipeline is not None else None
+
+    lines.extend(
+        _prom_lines(
+            "aegis_up",
+            "1 if the backend process is serving and its ingest pipeline exists, else 0.",
+            "gauge",
+            [("", 1 if stats is not None else 0)],
+        )
+    )
+
+    if stats is not None:
+        lines.extend(
+            _prom_lines(
+                "aegis_flows_received_total",
+                "Flows handed to the ingest pipeline since process start.",
+                "counter",
+                [("", stats.flows_received)],
+            )
+        )
+        lines.extend(
+            _prom_lines(
+                "aegis_anomalies_detected_total",
+                "Flows the existing volumetric/tripwire policy marked anomalous since process start.",
+                "counter",
+                [("", stats.anomalies)],
+            )
+        )
+        lines.extend(
+            _prom_lines(
+                "aegis_events_inserted_total",
+                "Event rows persisted since process start (excludes deduplicated repeats).",
+                "counter",
+                [("", stats.events_inserted)],
+            )
+        )
+        lines.extend(
+            _prom_lines(
+                "aegis_alerts_created_total",
+                "Alerts raised since process start.",
+                "counter",
+                [("", stats.alerts_created)],
+            )
+        )
+
+    # Per-detector fire counts come from the DATABASE, not the in-memory
+    # counters: `IngestStats` only tracks three of the six channels
+    # (signature/beaconing/tgnn), while `event_scores` now carries one row
+    # per detector per event for all six — which is exactly what the
+    # 2026-09-05 `_persist_scores` fix made true. DB-sourced also means
+    # these survive a restart, matching `/api/stats`' alert counts.
+    detector_fires: list[tuple[str, float]] = []
+    threat_score_avg: Optional[float] = None
+    database_ok = True
+    try:
+        with scope() as session:
+            fire_rows = session.execute(
+                select(EventScore.detector, func.count())
+                .where(EventScore.is_anomaly.is_(True))
+                .group_by(EventScore.detector)
+                .limit(BACKEND_SETTINGS.api_events_max_limit)
+            ).all()
+            detector_fires = [
+                (f'{{detector="{detector}"}}', int(count)) for detector, count in fire_rows
+            ]
+            avg_row = session.execute(
+                select(func.avg(EventScore.calibrated_score)).where(
+                    EventScore.detector == DETECTOR_HYBRID
+                )
+            ).scalar()
+            threat_score_avg = float(avg_row) if avg_row is not None else None
+    except Exception:
+        database_ok = False
+
+    if database_ok and detector_fires:
+        lines.extend(
+            _prom_lines(
+                "aegis_detector_fires_total",
+                "Per-detector fired verdicts persisted to event_scores, by detector name.",
+                "counter",
+                sorted(detector_fires),
+            )
+        )
+    if database_ok and threat_score_avg is not None:
+        lines.extend(
+            _prom_lines(
+                "aegis_threat_score_avg",
+                "Mean fused Hybrid IDS threat score across all persisted events.",
+                "gauge",
+                [("", threat_score_avg)],
+            )
+        )
+
+    return Response(
+        content="\n".join(lines) + "\n",
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )

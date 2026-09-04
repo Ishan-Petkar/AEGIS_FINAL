@@ -63,7 +63,7 @@ aegis-project/
 │       ├── swat_adapter.py     #   SWaT ICS/OT sensor telemetry
 │       ├── download_datasets.py    # helper script (see Known issues)
 │       └── generate_paysim_sample.py  # helper script
-├── tests/                      # pytest, 739 passed / 15 skipped (see note below)
+├── tests/                      # pytest, 749 passed / 15 skipped (see note below)
 ├── datasets/                   # gitignored — real CSVs live here
 ├── docs/                       # ARCHITECTURE / DATA_SCHEMA / DESIGN / SETUP / …
 ├── graphify-out/               # generated knowledge-graph artifacts (not source)
@@ -257,7 +257,7 @@ Datasets are gitignored and must be placed manually under `datasets/`:
 Tests skip rather than fail when data is absent, so a green local run does not
 prove the adapter paths were exercised — check for `skipped` in the output.
 
-The suite currently reports **739 passed, 15 skipped**. The 15 skips are the
+The suite currently reports **749 passed, 15 skipped**. The 15 skips are the
 live-Postgres tests in `tests/test_backend_models.py`, which are gated on
 `AEGIS_TEST_LIVE_DB=1` and run only against a real database:
 
@@ -284,6 +284,19 @@ simply never read. Fixed by persisting those three from
 `fused_decisions[i].verdicts` directly, and by adding `hybrid_threat_score`
 / `fired_detectors` to `EventOut` so REST reconstructs what WS already
 broadcasts.
+
+**Operational refinements (2026-09-05).** Three top-ROI items from an
+engineering audit, implemented directly: (1) fired `tgnn`/`beaconing`
+verdicts now carry a plain-English `evidence["summary"]` sentence
+alongside the raw feature floats, for SOC triage without needing to know
+either detector's feature space; (2) `GET /metrics` (`backend/routes.py`)
+exposes a hand-rolled Prometheus text endpoint — no new dependency, the
+format is three lines per metric family — sourced from
+`IngestPipeline.stats()` and `event_scores` aggregates, with per-detector
+fire counts read from the database (all six channels) rather than the
+in-memory counter (three channels); (3) `scripts/demo.py`, a terminal-only
+showcase of all six detectors against synthetic traffic in ~1.5s, no
+Postgres/Next.js/model-artifact required.
 
 ## 7. Known issues (verified in the current tree)
 
