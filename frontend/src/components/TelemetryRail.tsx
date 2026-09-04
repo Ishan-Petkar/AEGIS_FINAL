@@ -114,6 +114,7 @@ function severityOf(e: EventEnvelopeData): Severity {
  */
 export function TelemetryRail() {
   const { status, events } = useStream();
+  const [isCollapsed, setIsCollapsed] = useState(false);
 
   // Mirrors `events` on every change without itself causing a re-render —
   // read by the throttled interval below.
@@ -188,6 +189,23 @@ export function TelemetryRail() {
         : "Disconnected — showing last received events"
       : null;
 
+  if (isCollapsed) {
+    return (
+      <button 
+        onClick={() => setIsCollapsed(false)}
+        className="h-[420px] xl:h-auto w-8 shrink-0 flex flex-col items-center border border-glass-border rounded-md bg-glass-panel hover:bg-glass-raised transition-colors text-text-mute py-4"
+        title="Expand Telemetry"
+      >
+         <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" className="mb-4">
+           <polyline points="9 18 15 12 9 6" />
+         </svg>
+         <span style={{ writingMode: 'vertical-rl' }} className="text-[10px] uppercase tracking-widest font-semibold mt-2">
+           Telemetry
+         </span>
+      </button>
+    );
+  }
+
   return (
     <Panel
       label="Telemetry"
@@ -223,16 +241,29 @@ export function TelemetryRail() {
       // back the 40px it actually needs and addresses render in full.
       className="h-[420px] w-full shrink-0 lg:w-[320px] lg:shrink-0 xl:h-auto"
       action={
-        frozen ? (
-          <button
+        <div className="flex items-center gap-2">
+          {frozen && (
+            <button
+              type="button"
+              onClick={resume}
+              aria-live="polite"
+              className="rounded-[var(--radius-dense)] border border-glass-border px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-sev-warning"
+            >
+              Paused &middot; {pendingCount} new
+            </button>
+          )}
+          <button 
             type="button"
-            onClick={resume}
-            aria-live="polite"
-            className="rounded-[var(--radius-dense)] border border-glass-border px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-sev-warning"
+            onClick={() => setIsCollapsed(true)}
+            className="flex items-center justify-center w-5 h-5 rounded hover:bg-glass-raised text-text-mute transition-colors"
+            title="Collapse"
+            aria-label="Collapse Telemetry"
           >
-            Paused &middot; {pendingCount} new
+            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="15 18 9 12 15 6" />
+            </svg>
           </button>
-        ) : undefined
+        </div>
       }
     >
       <div

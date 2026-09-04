@@ -4,10 +4,8 @@
 # (by default) a live replay of friday-morning traffic so the console
 # isn't sitting idle when it opens.
 #
-# Idempotent: safe to re-run. Already-running backend/frontend processes
-# are detected via PID file and left alone unless --restart is passed.
-# One-time setup steps (DB schema, seed data, model artifacts) are
-# skipped automatically once they've already been done.
+# Cross-platform: works on Linux, macOS, and Windows (Git Bash / MSYS2 / WSL).
+# On native Windows PowerShell, you can also use: scripts\dev-up.ps1
 #
 # Usage:
 #   scripts/dev-up.sh                 # start everything, start replay
@@ -79,7 +77,12 @@ is_pid_alive() {
   [[ -f "$pid_file" ]] || return 1
   local pid
   pid="$(cat "$pid_file" 2>/dev/null)"
-  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+  [[ -z "$pid" ]] && return 1
+
+  if command -v tasklist.exe >/dev/null 2>&1; then
+    tasklist.exe /FI "PID eq $pid" 2>/dev/null | grep -q "$pid" && return 0
+  fi
+  kill -0 "$pid" 2>/dev/null
 }
 
 wait_for_http() {
@@ -98,24 +101,79 @@ wait_for_http() {
 
 # ---------------------------------------------------------------------------
 # 0. Prerequisite check — venv and frontend deps must already exist.
-#    This script starts the project; it does not do first-time dependency
-#    installation (that's a slower, more consequential step left explicit —
-#    see QUICKSTART.md).
 # ---------------------------------------------------------------------------
 
 step "Checking prerequisites"
 
-MISSING=0
-if [[ ! -x "$REPO_ROOT/venv/bin/python" ]]; then
-  fail "No venv/ found. Run: python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt -r requirements-backend.txt"
-  MISSING=1
+# Locate Python in venv (Windows vs POSIX)
+PYTHON_BIN=""
+if [[ -x "$REPO_ROOT/venv/Scripts/python.exe" ]]; then
+  PYTHON_BIN="$REPO_ROOT/venv/Scripts/python.exe"
+elif [[ -x "$REPO_ROOT/venv/Scripts/python" ]]; then
+  PYTHON_BIN="$REPO_ROOT/venv/Scripts/python"
+elif [[ -x "$REPO_ROOT/venv/bin/python" ]]; then
+  PYTHON_BIN="$REPO_ROOT/venv/bin/python"
+elif [[ -x "$REPO_ROOT/venv/bin/python.exe" ]]; then
+  PYTHON_BIN="$REPO_ROOT/venv/bin/python.exe"
+fi
+
+# Locate uvicorn
+UVICORN_BIN=""
+if [[ -x "$REPO_ROOT/venv/Scripts/uvicorn.exe" ]]; then
+  UVICORN_BIN="$REPO_ROOT/venv/Scripts/uvicorn.exe"
+elif [[ -x "$REPO_ROOT/venv/Scripts/uvicorn" ]]; then
+  UVICORN_BIN="$REPO_ROOT/venv/Scripts/uvicorn"
+elif [[ -x "$REPO_ROOT/venv/bin/uvicorn" ]]; then
+  UVICORN_BIN="$REPO_ROOT/venv/bin/uvicorn"
+elif [[ -n "$PYTHON_BIN" ]]; then
+  UVICORN_BIN="$PYTHON_BIN -m uvicorn"
+fi
+
+if [[ -z "$PYTHON_BIN" ]]; then
+  info "No venv/ found. Creating virtual environment in venv/ ..."
+  SYS_PYTHON=""
+  if command -v python3 >/dev/null 2>&1; then SYS_PYTHON="python3"
+  elif command -v python >/dev/null 2>&1; then SYS_PYTHON="python"
+  fi
+
+  if [[ -z "$SYS_PYTHON" ]]; then
+    fail "Python not found on PATH. Please install Python 3.11+ first."
+    exit 1
+  fi
+
+  "$SYS_PYTHON" -m venv "$REPO_ROOT/venv" || { fail "Failed to create venv"; exit 1; }
+
+  if [[ -x "$REPO_ROOT/venv/Scripts/python.exe" ]]; then
+    PYTHON_BIN="$REPO_ROOT/venv/Scripts/python.exe"
+    PIP_BIN="$REPO_ROOT/venv/Scripts/pip.exe"
+  else
+    PYTHON_BIN="$REPO_ROOT/venv/bin/python"
+    PIP_BIN="$REPO_ROOT/venv/bin/pip"
+  fi
+
+  info "Installing Python dependencies (requirements.txt & requirements-backend.txt) ..."
+  "$PIP_BIN" install -r "$REPO_ROOT/requirements.txt" -r "$REPO_ROOT/requirements-backend.txt" || { fail "pip install failed"; exit 1; }
+  ok "Python dependencies installed successfully"
 else
-  ok "Python venv present"
+  ok "Python venv present ($PYTHON_BIN)"
+fi
+
+# Locate uvicorn after potential venv creation
+UVICORN_BIN=""
+if [[ -x "$REPO_ROOT/venv/Scripts/uvicorn.exe" ]]; then
+  UVICORN_BIN="$REPO_ROOT/venv/Scripts/uvicorn.exe"
+elif [[ -x "$REPO_ROOT/venv/Scripts/uvicorn" ]]; then
+  UVICORN_BIN="$REPO_ROOT/venv/Scripts/uvicorn"
+elif [[ -x "$REPO_ROOT/venv/bin/uvicorn" ]]; then
+  UVICORN_BIN="$REPO_ROOT/venv/bin/uvicorn"
+elif [[ -n "$PYTHON_BIN" ]]; then
+  UVICORN_BIN="$PYTHON_BIN -m uvicorn"
 fi
 
 if [[ ! -d "$REPO_ROOT/frontend/node_modules" ]]; then
-  fail "frontend/node_modules missing. Run: npm --prefix frontend install"
-  MISSING=1
+  info "frontend/node_modules missing. Installing frontend dependencies (npm install) ..."
+  npm --prefix "$REPO_ROOT/frontend" install || { fail "npm install failed"; exit 1; }
+  ok "Frontend dependencies installed successfully"
 else
   ok "Frontend dependencies present"
 fi
@@ -124,11 +182,6 @@ if [[ ! -d "$REPO_ROOT/datasets" ]]; then
   warn "datasets/ not found — replay and warmup will fail until it's placed at the repo root (see docs/DATASETS.md)"
 else
   ok "datasets/ present"
-fi
-
-if [[ $MISSING -eq 1 ]]; then
-  fail "Fix the above, then re-run this script."
-  exit 1
 fi
 
 # ---------------------------------------------------------------------------
@@ -151,9 +204,24 @@ fi
 step "Checking PostgreSQL"
 
 PG_BIN=""
-for candidate in /opt/homebrew/opt/postgresql@16/bin /opt/homebrew/opt/postgresql/bin /usr/local/opt/postgresql@16/bin; do
-  if [[ -x "$candidate/pg_isready" ]]; then PG_BIN="$candidate"; break; fi
+# Check Homebrew paths and standard Windows install paths
+for candidate in \
+  /opt/homebrew/opt/postgresql@16/bin \
+  /opt/homebrew/opt/postgresql/bin \
+  /usr/local/opt/postgresql@16/bin \
+  /d/Program\ Files/PostgreSQL/*/bin \
+  /c/Program\ Files/PostgreSQL/*/bin; do
+  if compgen -G "$candidate/pg_isready*" > /dev/null; then
+    # Expand glob if matches multiple
+    for matched in $candidate; do
+      if [[ -x "$matched/pg_isready" || -x "$matched/pg_isready.exe" ]]; then
+        PG_BIN="$matched"
+        break 2
+      fi
+    done
+  fi
 done
+
 PG_ISREADY="${PG_BIN:+$PG_BIN/}pg_isready"
 PSQL="${PG_BIN:+$PG_BIN/}psql"
 CREATEUSER="${PG_BIN:+$PG_BIN/}createuser"
@@ -167,36 +235,39 @@ if ! "$PG_ISREADY" -h 127.0.0.1 -p 5432 >/dev/null 2>&1; then
   info "Postgres not accepting connections yet — trying to start it"
   if command -v brew >/dev/null 2>&1; then
     brew services start postgresql@16 >/dev/null 2>&1 || brew services start postgresql >/dev/null 2>&1 || true
+  elif command -v net.exe >/dev/null 2>&1; then
+    net.exe start postgresql-x64-18 >/dev/null 2>&1 || net.exe start postgresql-x64-16 >/dev/null 2>&1 || true
+  elif command -v powershell.exe >/dev/null 2>&1; then
+    powershell.exe -NoProfile -Command "Get-Service *postgres* | Start-Service" >/dev/null 2>&1 || true
   fi
   waited=0
   until "$PG_ISREADY" -h 127.0.0.1 -p 5432 >/dev/null 2>&1; do
     sleep 1
     waited=$((waited + 1))
     if [[ $waited -ge 20 ]]; then
-      fail "Postgres still not reachable after 20s. Start it yourself (e.g. 'brew services start postgresql@16') and re-run."
+      fail "Postgres still not reachable after 20s. Please start PostgreSQL service and re-run."
       exit 1
     fi
   done
 fi
 ok "Postgres is accepting connections"
 
-# Role + database: ignore "already exists" errors (idempotent by design,
-# not by checking first — createuser/createdb's own exit code says enough).
+# Role + database: ignore "already exists" errors
 "$CREATEUSER" -h 127.0.0.1 aegis --pwprompt 2>/dev/null || true
 PGPASSWORD=aegis "$CREATEDB" -h 127.0.0.1 -U aegis aegis 2>/dev/null || true
-if "$PSQL" -h 127.0.0.1 -U aegis -d aegis -c '\q' >/dev/null 2>&1; then
+if PGPASSWORD=aegis "$PSQL" -h 127.0.0.1 -U aegis -d aegis -c '\q' >/dev/null 2>&1; then
   ok "Database 'aegis' reachable as user 'aegis'"
 else
   warn "Could not connect as aegis/aegis@aegis — if this is a fresh machine, see docs/SETUP.md for manual role/password setup"
 fi
 
 # Schema + seed — init_db is idempotent (create_all + upsert-by-name seed).
-if "$PSQL" -h 127.0.0.1 -U aegis -d aegis -c '\q' >/dev/null 2>&1; then
+if PGPASSWORD=aegis "$PSQL" -h 127.0.0.1 -U aegis -d aegis -c '\q' >/dev/null 2>&1; then
   TABLE_COUNT="$(PGPASSWORD=aegis "$PSQL" -h 127.0.0.1 -U aegis -d aegis -tAc \
     "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'" 2>/dev/null || echo 0)"
   if [[ "${TABLE_COUNT:-0}" -lt 5 ]]; then
     info "Schema missing or incomplete — running backend.init_db"
-    if PYTHONPATH=src "$REPO_ROOT/venv/bin/python" -m backend.init_db >>"$BACKEND_LOG" 2>&1; then
+    if PYTHONPATH=src "$PYTHON_BIN" -m backend.init_db >>"$BACKEND_LOG" 2>&1; then
       ok "Schema created and assets seeded"
     else
       fail "backend.init_db failed — see $BACKEND_LOG"
@@ -208,8 +279,7 @@ if "$PSQL" -h 127.0.0.1 -U aegis -d aegis -c '\q' >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Model artifacts — build only what's missing. Both are cheap (a few
-#    seconds); safe to do on every fresh machine automatically.
+# 3. Model artifacts — build only what's missing.
 # ---------------------------------------------------------------------------
 
 step "Checking model artifacts"
@@ -218,7 +288,7 @@ if [[ -f "$REPO_ROOT/artifacts/streaming_scorer.joblib" ]]; then
   ok "streaming_scorer.joblib present"
 else
   info "Building streaming_scorer.joblib (backend.warmup) — this fits on real Monday traffic, ~5s"
-  if PYTHONPATH=src "$REPO_ROOT/venv/bin/python" -m backend.warmup >>"$BACKEND_LOG" 2>&1; then
+  if PYTHONPATH=src "$PYTHON_BIN" -m backend.warmup >>"$BACKEND_LOG" 2>&1; then
     ok "Built streaming_scorer.joblib"
   else
     fail "backend.warmup failed — see $BACKEND_LOG (needs datasets/ present)"
@@ -230,7 +300,7 @@ if [[ -f "$REPO_ROOT/artifacts/supervised_flow_scorer.joblib" ]]; then
   ok "supervised_flow_scorer.joblib present"
 else
   info "Building supervised_flow_scorer.joblib (backend.warmup_supervised) — ~4s"
-  if PYTHONPATH=src "$REPO_ROOT/venv/bin/python" -m backend.warmup_supervised >>"$BACKEND_LOG" 2>&1; then
+  if PYTHONPATH=src "$PYTHON_BIN" -m backend.warmup_supervised >>"$BACKEND_LOG" 2>&1; then
     ok "Built supervised_flow_scorer.joblib"
   else
     warn "backend.warmup_supervised failed — the console will still start with two live channels instead of three. See $BACKEND_LOG"
@@ -245,7 +315,9 @@ step "Starting backend (uvicorn)"
 
 if [[ $RESTART -eq 1 ]] && is_pid_alive "$BACKEND_PID_FILE"; then
   info "Stopping existing backend (--restart)"
-  kill "$(cat "$BACKEND_PID_FILE")" 2>/dev/null || true
+  OLD_PID="$(cat "$BACKEND_PID_FILE")"
+  kill "$OLD_PID" 2>/dev/null || true
+  command -v taskkill.exe >/dev/null 2>&1 && taskkill.exe /F /PID "$OLD_PID" 2>/dev/null || true
   sleep 1
 fi
 
@@ -257,10 +329,10 @@ else
   : > "$BACKEND_LOG"
   (
     cd "$REPO_ROOT"
-    exec env PYTHONPATH=src "$REPO_ROOT/venv/bin/uvicorn" backend.main:app --host "$BACKEND_HOST" --port "$BACKEND_PORT"
+    exec env PYTHONPATH=src $UVICORN_BIN backend.main:app --host "$BACKEND_HOST" --port "$BACKEND_PORT"
   ) >>"$BACKEND_LOG" 2>&1 &
   echo $! > "$BACKEND_PID_FILE"
-  disown 2>/dev/null || true   # survive this shell exiting, not just the script
+  disown 2>/dev/null || true
   info "Launched (pid $!), waiting for $BACKEND_URL/api/health ..."
   if wait_for_http "$BACKEND_URL/api/health" 30 "Backend"; then
     ok "Backend is up at $BACKEND_URL"
@@ -281,7 +353,9 @@ step "Starting frontend (Next.js)"
 
 if [[ $RESTART -eq 1 ]] && is_pid_alive "$FRONTEND_PID_FILE"; then
   info "Stopping existing frontend (--restart)"
-  kill "$(cat "$FRONTEND_PID_FILE")" 2>/dev/null || true
+  OLD_PID="$(cat "$FRONTEND_PID_FILE")"
+  kill "$OLD_PID" 2>/dev/null || true
+  command -v taskkill.exe >/dev/null 2>&1 && taskkill.exe /F /PID "$OLD_PID" 2>/dev/null || true
   sleep 1
 fi
 
@@ -296,9 +370,9 @@ else
     exec npm --prefix frontend run dev -- --port "$FRONTEND_PORT"
   ) >>"$FRONTEND_LOG" 2>&1 &
   echo $! > "$FRONTEND_PID_FILE"
-  disown 2>/dev/null || true   # survive this shell exiting, not just the script
+  disown 2>/dev/null || true
   info "Launched (pid $!), waiting for $FRONTEND_URL ..."
-  if wait_for_http "$FRONTEND_URL" 30 "Frontend"; then
+  if wait_for_http "$FRONTEND_URL" 60 "Frontend"; then
     ok "Frontend is up at $FRONTEND_URL"
   else
     fail "Frontend failed to become healthy — tail $FRONTEND_LOG"

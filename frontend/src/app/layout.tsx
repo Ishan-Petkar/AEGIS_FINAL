@@ -4,6 +4,7 @@ import { ConnectionProvider } from "@/lib/connection-context";
 import { GraphFocusProvider } from "@/lib/graph-focus-context";
 import { StreamProvider } from "@/lib/stream-context";
 import { TopologyProvider } from "@/lib/topology-context";
+import { ViewModeProvider } from "@/lib/view-mode-context";
 import "./globals.css";
 
 // DESIGN_CONSOLE.md §3: Inter for UI/body, JetBrains Mono for numerics,
@@ -49,7 +50,9 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
         <ConnectionProvider>
           <StreamProvider>
             <TopologyProvider>
-              <GraphFocusProvider>{children}</GraphFocusProvider>
+              <GraphFocusProvider>
+                <ViewModeProvider>{children}</ViewModeProvider>
+              </GraphFocusProvider>
             </TopologyProvider>
           </StreamProvider>
         </ConnectionProvider>

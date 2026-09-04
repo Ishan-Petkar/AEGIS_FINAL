@@ -196,8 +196,21 @@ body {
     scroll-behavior: auto !important;
   }
 
-  .animate-aegis-pulse {
+.animate-aegis-pulse {
     animation: none !important;
     opacity: 1 !important;
   }
+}
+
+/* ---------------------------------------------------------------------
+ * Non-Technical View (NTV) utilities
+ * ------------------------------------------------------------------- */
+.ntv-toggle-button {
+  @apply rounded-full px-3 py-1.5 text-xs font-semibold transition-colors duration-150 ease-out focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent;
+}
+.ntv-toggle-button-active {
+  @apply bg-accent text-white shadow-sm;
+}
+.ntv-toggle-button-inactive {
+  @apply text-text-dim hover:text-text hover:bg-glass-raised;
 }
