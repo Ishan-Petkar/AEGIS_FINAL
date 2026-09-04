@@ -3,12 +3,10 @@
 import { useEffect, useState } from "react";
 import { Panel } from "../Panel";
 import { getAlerts } from "@/lib/api";
-import { useViewMode } from "@/lib/view-mode-context";
 import type { AlertOut } from "@/lib/types";
 
 export function NTVLastResolved() {
   const [lastResolved, setLastResolved] = useState<AlertOut | null>(null);
-  const { setViewMode } = useViewMode();
 
   useEffect(() => {
     let cancelled = false;
@@ -50,12 +48,6 @@ export function NTVLastResolved() {
 
         <div className="flex justify-between items-center mt-6 pt-4 border-t border-glass-border">
           <div className="text-[10px] font-mono text-text-mute">Continuous monitoring active</div>
-          <button 
-            onClick={() => setViewMode("technical")}
-            className="text-[10px] font-semibold text-accent hover:text-accent-hi uppercase tracking-wider"
-          >
-            View Details →
-          </button>
         </div>
       </div>
     </Panel>

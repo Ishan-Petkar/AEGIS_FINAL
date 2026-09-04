@@ -31,8 +31,12 @@ export default function Home() {
             <NTVStatusBanner />
           </div>
           
-          {/* Middle row: Sector Grid and Alert Trend */}
-          <div className="flex gap-3 flex-1 min-h-0">
+          {/* Middle row: Sector Grid and Alert Trend. Fixed, content-sized
+              height (not flex-1): the sector grid is now a compact 2-row
+              card layout (see NTVSectorGrid), so it no longer needs — or
+              should claim — a share of the flexible space. That space
+              goes to the graph below instead. */}
+          <div className="flex gap-3 shrink-0 h-[190px]">
             <div className="w-2/3 flex flex-col h-full min-h-0">
               <NTVSectorGrid />
             </div>
@@ -41,8 +45,11 @@ export default function Home() {
             </div>
           </div>
 
-          {/* Bottom row: Graph and Last Resolved */}
-          <div className="flex gap-3 shrink-0 h-[320px]">
+          {/* Bottom row: Graph and Last Resolved. `flex-1` (not a fixed
+              height) so the topology canvas gets whatever vertical space
+              the sector grid's shrink above freed up, instead of a fixed
+              320px regardless of viewport. */}
+          <div className="flex gap-3 flex-1 min-h-[420px]">
             <div className="w-2/3 flex flex-col h-full min-h-0">
               <GraphPanel />
             </div>

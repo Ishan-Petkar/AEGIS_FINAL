@@ -4,7 +4,6 @@ import { useMemo, useEffect, useRef, useState } from "react";
 import { Panel } from "../Panel";
 import { useStream } from "@/lib/stream-context";
 import { useTopology } from "@/lib/topology-context";
-import { useViewMode } from "@/lib/view-mode-context";
 import { useGraphFocus } from "@/lib/graph-focus-context";
 import { SECTOR_ORDER, buildSectorByName, groupNodesBySector, sectorLabel, CORE_SECTOR } from "@/lib/sectors";
 import { SectorActivityTracker, type Severity } from "@/lib/sector-activity";
@@ -38,7 +37,6 @@ interface SectorSnapshot {
 export function NTVSectorGrid() {
   const { state } = useTopology();
   const { events } = useStream();
-  const { setViewMode } = useViewMode();
   const { toggleFocusedSector, setExpanded } = useGraphFocus();
 
   const nodes: TopologyResponse["nodes"] = useMemo(
@@ -70,14 +68,18 @@ export function NTVSectorGrid() {
 
   const activeSectors = SECTOR_ORDER.filter((s) => (sectorMembers.get(s)?.length ?? 0) > 0);
 
+  // View-mode switching is reserved STRICTLY for the header's Non-Technical
+  // / Technical toggle (AppHeader). These are in-place actions on the
+  // GraphPanel that's already visible in this same view — never a tab
+  // switch, so a sector card is safe to click without leaving the
+  // dashboard an operator chose to be in.
   const handleSectorClick = (sector: string) => {
-    setViewMode("technical");
     setExpanded(false);
     toggleFocusedSector(sector);
   };
 
   const handleOpenAll = () => {
-    setViewMode("technical");
+    setExpanded(true);
   };
 
   if (state.kind !== "loaded") {
@@ -85,7 +87,14 @@ export function NTVSectorGrid() {
   }
 
   return (
-    <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-2 h-full w-full">
+    // `content-start` + `auto-rows-min` (not `h-full`'s implicit stretch)
+    // is the fix for Bug 2: with only ~2 rows of cards, a grid told to
+    // fill its parent's full height distributes that height evenly
+    // across those 2 rows, so each card grows to whatever vertical space
+    // the layout happens to give this panel — the "excessively tall
+    // cards with empty whitespace" defect. Sizing rows to their own
+    // content instead lets the page give that freed space to the graph.
+    <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 auto-rows-min content-start gap-2 w-full">
       {activeSectors.map((sector) => {
         const severity = snapshot.get(sector)?.severity ?? "normal";
         const isAnomalous = severity !== "normal";
@@ -94,16 +103,16 @@ export function NTVSectorGrid() {
           <button
             key={sector}
             onClick={() => handleSectorClick(sector)}
-            className={`glass-panel p-4 text-left flex flex-col gap-3 transition-all duration-150 hover:-translate-y-0.5 hover:shadow-card-lifted focus-visible:outline-2 focus-visible:outline-accent`}
+            className={`glass-panel px-3 py-2.5 text-left flex flex-col gap-1.5 min-h-[68px] transition-all duration-150 hover:-translate-y-0.5 hover:shadow-card-lifted focus-visible:outline-2 focus-visible:outline-accent`}
           >
-            <div className="flex justify-between items-start">
+            <div className="flex justify-between items-center">
               <div className="text-text-mute">
                 <SectorIcon sector={sector} />
               </div>
               <div className={`h-2 w-2 rounded-full ${isAnomalous ? (severity === "critical" ? "bg-sev-critical" : "bg-sev-warning") : "bg-sev-normal"}`} />
             </div>
             <div>
-              <div className="text-[11px] font-bold uppercase tracking-wider text-text mb-1 truncate">
+              <div className="text-[11px] font-bold uppercase tracking-wider text-text truncate">
                 {sectorLabel(sector)}
               </div>
               <div className="flex items-center gap-1.5">
@@ -120,16 +129,16 @@ export function NTVSectorGrid() {
       {/* OPEN ALL Card */}
       <button
         onClick={handleOpenAll}
-        className="glass-panel p-4 text-left flex flex-col gap-3 transition-all duration-150 hover:-translate-y-0.5 hover:shadow-card-lifted focus-visible:outline-2 focus-visible:outline-accent bg-ground-raised/50"
+        className="glass-panel px-3 py-2.5 text-left flex flex-col gap-1.5 min-h-[68px] transition-all duration-150 hover:-translate-y-0.5 hover:shadow-card-lifted focus-visible:outline-2 focus-visible:outline-accent bg-ground-raised/50"
       >
-        <div className="flex justify-between items-start">
+        <div className="flex justify-between items-center">
           <div className="text-text-mute">
             <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
           </div>
           <div className="text-xs font-semibold text-accent">ALL 11</div>
         </div>
         <div>
-          <div className="text-[11px] font-bold uppercase tracking-wider text-text mb-1 truncate">
+          <div className="text-[11px] font-bold uppercase tracking-wider text-text truncate">
             OPEN ALL
           </div>
           <div className="text-xs text-text-mute group-hover:text-text-dim transition-colors">

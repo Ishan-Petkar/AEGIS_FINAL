@@ -16,7 +16,7 @@ export function NTVStatusBanner() {
       label=""
       className={`h-[80px] !p-6 ${hasAlerts ? "bg-sev-critical/5 border-sev-critical/20" : "bg-sev-normal/5 border-sev-normal/20"}`}
     >
-      <div className="flex items-center gap-4 h-full -mt-4">
+      <div className="flex items-center gap-4 h-full">
         {/* Status Icon */}
         <div className="shrink-0">
           <div className={`flex h-12 w-12 items-center justify-center rounded-xl border ${hasAlerts ? "bg-sev-critical/10 border-sev-critical/20 text-sev-critical" : "bg-white border-glass-border shadow-sm text-sev-normal"}`}>

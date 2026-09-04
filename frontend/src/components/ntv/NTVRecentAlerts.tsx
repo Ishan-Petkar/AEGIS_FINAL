@@ -4,7 +4,6 @@ import { useEffect, useMemo, useState } from "react";
 import { Panel } from "../Panel";
 import { getAlerts, ApiError, ApiNetworkError } from "@/lib/api";
 import { useStream } from "@/lib/stream-context";
-import { useViewMode } from "@/lib/view-mode-context";
 import type { AlertEnvelopeData, AlertOut } from "@/lib/types";
 
 interface AlertRecord {
@@ -24,7 +23,6 @@ function fromEnvelope(a: AlertEnvelopeData): AlertRecord {
 
 export function NTVRecentAlerts() {
   const { alerts: liveAlerts } = useStream();
-  const { setViewMode } = useViewMode();
   const [restAlerts, setRestAlerts] = useState<AlertRecord[]>([]);
   const [isLoading, setIsLoading] = useState(true);
 
@@ -54,16 +52,8 @@ export function NTVRecentAlerts() {
   }, [restAlerts, liveAlerts]);
 
   return (
-    <Panel 
+    <Panel
       label="RECENT ALERTS"
-      action={
-        <button 
-          onClick={() => setViewMode("technical")}
-          className="text-[10px] font-semibold text-accent hover:text-accent-hi uppercase tracking-wider"
-        >
-          View All →
-        </button>
-      }
       className="h-full min-h-[300px]"
       bodyClassName="h-full flex flex-col relative"
     >
