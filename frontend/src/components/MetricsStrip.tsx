@@ -83,7 +83,11 @@ const TONE_BG: Record<string, string> = {
   critical: "bg-sev-critical/10 text-sev-critical",
   warning: "bg-sev-warning/10 text-sev-warning",
   normal: "bg-sev-normal/10 text-sev-normal",
-  text: "bg-glass-raised text-text-dim",
+  // A flat `bg-glass-raised` medallion (a near-white cream tint) on the
+  // equally near-white card behind it was invisible — a bordered chip
+  // instead of a fill gives the neutral tone its own visible shape
+  // without borrowing a semantic color it doesn't have one of.
+  text: "border border-glass-border-strong text-text-dim",
 };
 
 const DETAIL_TEXT: Record<string, string> = {

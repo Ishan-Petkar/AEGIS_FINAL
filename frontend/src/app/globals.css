@@ -16,28 +16,63 @@
  * ------------------------------------------------------------------- */
 
 :root {
-  /* Ground and material */
-  --ground: #f4f5f7;
+  /* ---- Palette source: operator-supplied brand board (6 swatches —
+   * Palladian / Oatmeal / Blue Fantastic / Burning Flame / Truffle
+   * Trouble / Abyssal Anchorfish Blue), light variant. A warm cream
+   * ground with near-black navy text and a terracotta/rust interactive
+   * accent — chosen deliberately over a generic blue-on-white palette
+   * for a distinctive, editorial read. Every hex below traces to one of
+   * the six named swatches or is a direct tint/shade of one — no color
+   * in this file is invented from nothing. ---- */
+
+  /* Ground and material. Cards are pure white against a warm cream page
+   * so the two surfaces read as genuinely distinct layers ("neat and
+   * clean with distinction") rather than two shades of the same gray. */
+  --ground: #eee9df; /* Palladian */
   --ground-raised: #ffffff;
-  --glow-warm: transparent; /* no ambient glow in the light theme */
+  --glow-warm: transparent; /* no ambient glow — flat and clean by request */
   --glass: #ffffff;
-  --glass-raised: #f7f8fa;
-  --glass-border: #e4e7ec;
-  --glass-border-strong: #d0d5dd;
+  --glass-raised: #f6f2ea; /* Palladian, lightened toward white — hover/raised fill */
+  --glass-border: #e6ded0; /* Palladian/Oatmeal blend — hairline on both card and page */
+  --glass-border-strong: #c9c1b1; /* Oatmeal */
 
-  /* Text */
-  --text: #101828;
-  --text-dim: #475467;
-  --text-mute: #98a2b3;
+  /* Text — both navy swatches from the board, used at their native
+   * depth rather than diluted, since they already sit at AA-safe
+   * darkness against a light ground. */
+  --text: #1b2632; /* Abyssal Anchorfish Blue */
+  --text-dim: #2c3b4d; /* Blue Fantastic */
+  --text-mute: #7d7566; /* Oatmeal, deepened for ~4.7:1 on white — the prior
+   * mute gray (#98a2b3, ~2.6:1) failed AA on the small uppercase labels
+   * this token is used for everywhere; this fixes that in the same pass
+   * as the palette swap rather than leaving it for later. */
 
-  /* Brand vs. severity — kept as separate scales */
-  --accent: #3457d1;
-  --accent-hi: #5677e8;
-  --sev-critical: #d92d20;
-  --sev-warning: #dc6803;
-  --sev-normal: #17874a;
-  --sev-info: #0086c9;
-  --financial: #7839c5;
+  /* Brand accent — Truffle Trouble (rust) for anything interactive/
+   * clickable, Burning Flame (light orange) reserved for tint washes,
+   * halos and hover fills, never for text (too light to read at AA).
+   * Severity colors are picked to stay visually distinct from the rust
+   * accent at a glance, not just by hue name. */
+  --accent: #a35139; /* Truffle Trouble */
+  --accent-hi: #ffb162; /* Burning Flame */
+  --sev-critical: #c22f26; /* a cleaner red than the accent's rust, so
+   * "something is broken" and "something is clickable" never collide */
+  --sev-warning: #b9790f; /* gold-amber, warmer than sev-critical, cooler
+   * than accent's rust */
+  --sev-normal: #3a7d44;
+  --sev-info: #3d6b96; /* a lighter, more legible read of Blue Fantastic,
+   * for status chips that need to pop rather than recede like body text */
+  --financial: #2c3b4d; /* Blue Fantastic reused as the financial-sector
+   * marker hue — ties the diamond glyph back to the board's navy rather
+   * than adding a seventh, unrelated color */
+
+  /* City Infrastructure graph — deliberately its OWN accent scale, not
+   * `--accent`/`--accent-hi`. Operator request: the rust brand accent
+   * reads well on buttons/links/badges but is the wrong hue for 50 nodes
+   * of network topology, which stays blue (the console's accent color
+   * before this palette pass). Read by CityGraph.tsx via
+   * `theme-tokens.ts` — everything else in the app keeps the rust
+   * accent untouched. */
+  --graph-accent: #3457d1;
+  --graph-accent-hi: #5677e8;
 
   /* Geometry — rounder than the prior dense-industrial scale, matching
    * a card-based dashboard. */
@@ -45,11 +80,11 @@
   --radius-dense: 8px;
   --motion-duration: 150ms;
 
-  /* Card elevation — replaces the dark theme's translucent-blur "glass"
-   * fill; a light UI reads panels via a soft shadow + hairline border
-   * instead. */
-  --shadow-card: 0 1px 2px rgba(16, 24, 40, 0.04), 0 4px 10px -2px rgba(16, 24, 40, 0.06);
-  --shadow-card-lifted: 0 2px 4px rgba(16, 24, 40, 0.06), 0 12px 24px -6px rgba(16, 24, 40, 0.1);
+  /* Card elevation, warm-tinted (Abyssal Anchorfish Blue at low alpha)
+   * rather than a neutral gray shadow, so elevation reads as part of the
+   * same warm palette instead of a generic UI-kit default. */
+  --shadow-card: 0 1px 2px rgba(27, 38, 50, 0.05), 0 4px 10px -2px rgba(27, 38, 50, 0.08);
+  --shadow-card-lifted: 0 2px 4px rgba(27, 38, 50, 0.07), 0 12px 24px -6px rgba(27, 38, 50, 0.12);
 }
 
 /* Tailwind v4 theme mapping: CSS custom properties -> utility classes.
@@ -70,6 +105,8 @@
 
   --color-accent: var(--accent);
   --color-accent-hi: var(--accent-hi);
+  --color-graph-accent: var(--graph-accent);
+  --color-graph-accent-hi: var(--graph-accent-hi);
 
   --color-sev-critical: var(--sev-critical);
   --color-sev-warning: var(--sev-warning);

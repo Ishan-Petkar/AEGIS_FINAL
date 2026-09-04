@@ -270,10 +270,18 @@ function AlertCard({
   const restFeatures = explanation?.features.slice(3) ?? [];
   const pending = ackMeta?.pending ?? false;
 
+  // An acknowledged alert is de-emphasised by SURFACE, not by opacity.
+  // `opacity-55` was a dark-theme device: a translucent dark card at 55%
+  // still read as its own distinct panel. Now that `.glass-panel` is
+  // opaque white on a cream page, 55% collapses the card toward the page
+  // ground and drags its text down with it — and an acked alert is still
+  // a durable operator record that has to stay readable. Swapping the
+  // fill for the muted raised surface, dropping the shadow, and clearing
+  // the severity stripe keeps it clearly secondary without making it faint.
   return (
     <article
       className={`glass-panel border-l-2 p-3 ${SEVERITY_BORDER[severity]} ${
-        alert.acknowledged ? "opacity-55 !border-l-glass-border" : ""
+        alert.acknowledged ? "!border-l-glass-border bg-glass-raised shadow-none" : ""
       }`}
     >
       <div className="flex items-center gap-2">

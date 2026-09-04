@@ -1,12 +1,23 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import { Panel } from "./Panel";
 import { SeverityGlyph, type Severity } from "./SeverityGlyph";
-import { ApiError, ApiNetworkError, getIpsActions, getIpsPolicy, rollbackIpsAction } from "@/lib/api";
+import { ApiError, ApiNetworkError, getIpsActions, rollbackIpsAction } from "@/lib/api";
 import { useConnection } from "@/lib/connection-context";
 import { useStream } from "@/lib/stream-context";
-import type { EventEnvelopeData, IpsActionOut, IpsPolicyResponse } from "@/lib/types";
+import type { EventEnvelopeData, IpsActionEnvelopeData } from "@/lib/types";
+
+/** The shape both transports agree on. `IpsActionOut` (REST) additionally
+ * carries `replay_session_id`, which nothing here renders, so the live
+ * envelope's narrower type is the common denominator and both merge into
+ * one list without a lossy adapter in between. */
+type IpsActionRecord = IpsActionEnvelopeData;
+
+interface RollbackMeta {
+  pending: boolean;
+  error: string | null;
+}
 
 // DetectionPreventionPanel — the detailed injections/detections/
 // preventions view (console redesign, light-theme dashboard pass).
@@ -76,26 +87,69 @@ function friendlyError(err: unknown, fallback: string): string {
   return fallback;
 }
 
+/** Terminal states have `rolled_back_at` set or a non-active status. Used
+ * as a merge rank: a record showing a MORE advanced lifecycle wins over
+ * one showing a less advanced one, whichever transport it arrived on. */
+function lifecycleRank(a: IpsActionRecord): number {
+  return a.rolled_back_at || !ACTIVE_STATUSES.has(a.status) ? 1 : 0;
+}
+
+/**
+ * Merge REST history with the live `ips_action` stream, deduped by id.
+ *
+ * Deliberately NOT "REST always wins" (the rule `AlertsRail` uses for
+ * alerts): unlike an alert, one IPS action mutates over its lifetime —
+ * created, then expired by TTL, then possibly rolled back — and each
+ * transition is broadcast on the same id. Whichever copy shows the more
+ * advanced lifecycle is the true one, regardless of how it arrived; a
+ * REST snapshot fetched before a rollback must not overwrite the live
+ * envelope announcing it, and vice-versa.
+ */
+function mergeActions(sources: IpsActionRecord[][]): IpsActionRecord[] {
+  const map = new Map<number, IpsActionRecord>();
+  for (const list of sources) {
+    for (const rec of list) {
+      const existing = map.get(rec.id);
+      if (!existing || lifecycleRank(rec) > lifecycleRank(existing)) {
+        map.set(rec.id, rec);
+      }
+    }
+  }
+  return [...map.values()].sort((a, b) => {
+    const ta = Date.parse(a.ts);
+    const tb = Date.parse(b.ts);
+    if (ta !== tb) return tb - ta;
+    return b.id - a.id;
+  });
+}
+
 function PreventionTab() {
-  const [actions, setActions] = useState<IpsActionOut[]>([]);
-  const [policy, setPolicy] = useState<IpsPolicyResponse | null>(null);
+  const [restActions, setRestActions] = useState<IpsActionRecord[]>([]);
   const [state, setState] = useState<LoadState>({ kind: "loading" });
-  const [rollbackPending, setRollbackPending] = useState<Set<number>>(new Set());
+  const [rollbackMetaById, setRollbackMetaById] = useState<Map<number, RollbackMeta>>(new Map());
+  const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set());
   const [retryToken, setRetryToken] = useState(0);
   const { reconnectEpoch } = useConnection();
+  const { ipsActions: liveActions } = useStream();
 
   useEffect(() => {
     let cancelled = false;
     async function load() {
       setState({ kind: "loading" });
       try {
-        const [actionsResp, policyResp] = await Promise.all([
+        // TWO action queries, not one. The recent-history page is capped
+        // at HISTORY_LIMIT, so an action that is still ACTIVE but older
+        // than that window would be invisible — and "Active Mitigations"
+        // would under-count exactly the long-lived mitigations an
+        // operator most needs to know about. The server-side `active`
+        // filter answers that question directly; both results merge into
+        // the same map below, so an action appearing in both is one row.
+        const [recentResp, activeResp] = await Promise.all([
           getIpsActions({ limit: HISTORY_LIMIT }),
-          getIpsPolicy(),
+          getIpsActions({ active: true, limit: HISTORY_LIMIT }),
         ]);
         if (cancelled) return;
-        setActions(actionsResp.actions);
-        setPolicy(policyResp);
+        setRestActions(mergeActions([recentResp.actions, activeResp.actions]));
         setState({ kind: "loaded" });
       } catch (err) {
         if (cancelled) return;
@@ -108,35 +162,49 @@ function PreventionTab() {
     };
   }, [reconnectEpoch, retryToken]);
 
+  const actions = useMemo(
+    () => mergeActions([restActions, liveActions]),
+    [restActions, liveActions]
+  );
   const activeCount = useMemo(() => actions.filter(isActivePrevention).length, [actions]);
 
+  function toggleExpanded(id: number) {
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
   async function handleRollback(id: number) {
-    setRollbackPending((prev) => new Set(prev).add(id));
+    setRollbackMetaById((prev) => new Map(prev).set(id, { pending: true, error: null }));
     try {
       await rollbackIpsAction(id);
+      setRollbackMetaById((prev) => new Map(prev).set(id, { pending: false, error: null }));
       setRetryToken((n) => n + 1);
-    } catch {
-      // Refetch regardless -- a 409 means it's already inactive, which the
-      // refreshed list will show correctly either way.
-      setRetryToken((n) => n + 1);
-    } finally {
-      setRollbackPending((prev) => {
-        const next = new Set(prev);
-        next.delete(id);
-        return next;
-      });
+    } catch (err) {
+      // A 409 is the one "failure" that is really just staleness — the
+      // action already expired or was rolled back elsewhere — so it
+      // refetches quietly. Everything else (404, 401, 429, network) is a
+      // real failure an operator must see: silently swallowing it would
+      // leave them believing a mitigation was lifted when it was not.
+      const alreadyInactive = err instanceof ApiError && err.status === 409;
+      setRollbackMetaById((prev) =>
+        new Map(prev).set(id, {
+          pending: false,
+          error: alreadyInactive ? null : friendlyError(err, "Unknown error rolling back."),
+        })
+      );
+      if (alreadyInactive) setRetryToken((n) => n + 1);
     }
   }
 
-  const protectionLevel = !policy ? "—" : !policy.enabled ? "Disabled" : policy.dry_run ? "Dry-run" : "Enforcing";
-  const protectionTone = !policy || !policy.enabled ? "text-text-mute" : policy.dry_run ? "text-sev-warning" : "text-sev-critical";
-
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-3">
-      <div className="grid grid-cols-3 gap-3">
+      <div className="grid grid-cols-2 gap-3">
         <StatBlock label="Active Mitigations" value={String(activeCount)} />
         <StatBlock label="Recent Decisions" value={String(actions.length)} />
-        <StatBlock label="Protection Mode" value={protectionLevel} valueClassName={protectionTone} />
       </div>
 
       {state.kind === "loading" && actions.length === 0 && <LoadingRow label="Loading prevention decisions…" />}
@@ -149,50 +217,94 @@ function PreventionTab() {
 
       {actions.length > 0 && (
         <div className="min-h-0 flex-1 overflow-auto rounded-[var(--radius-dense)] border border-glass-border">
-          <table className="w-full min-w-[720px] border-collapse text-left text-xs">
+          <table className="w-full min-w-[760px] border-collapse text-left text-xs">
             <thead>
               <tr className="border-b border-glass-border bg-glass-raised text-[10px] uppercase tracking-[0.06em] text-text-mute">
                 <th className="px-3 py-2 font-semibold">Time</th>
                 <th className="px-3 py-2 font-semibold">Target Asset</th>
                 <th className="px-3 py-2 font-semibold">Action</th>
                 <th className="px-3 py-2 font-semibold">Confidence</th>
-                <th className="px-3 py-2 font-semibold">Status</th>
                 <th className="px-3 py-2 font-semibold" />
               </tr>
             </thead>
             <tbody>
               {actions.map((a) => {
                 const active = isActivePrevention(a);
-                const pending = rollbackPending.has(a.id);
+                const meta = rollbackMetaById.get(a.id);
+                const pending = meta?.pending ?? false;
+                const expanded = expandedIds.has(a.id);
                 return (
-                  <tr key={a.id} className="border-b border-glass-border/60 last:border-0 hover:bg-glass-raised">
-                    <td className="whitespace-nowrap px-3 py-2 font-mono text-text-mute">{formatTime(a.ts)}</td>
-                    <td className="max-w-[220px] truncate px-3 py-2 font-mono text-text" title={a.target_asset}>
-                      {a.target_asset}
-                    </td>
-                    <td className="px-3 py-2">
-                      <ActionBadge action={a.action} />
-                      {a.dry_run && (
-                        <span className="ml-1.5 rounded-full border border-glass-border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.05em] text-text-mute">
-                          dry-run
+                  <Fragment key={a.id}>
+                    <tr
+                      className="cursor-pointer border-b border-glass-border last:border-0 hover:bg-glass-raised"
+                      onClick={() => toggleExpanded(a.id)}
+                      aria-expanded={expanded}
+                    >
+                      <td className="whitespace-nowrap px-3 py-2 font-mono text-text-mute">
+                        <span className="mr-1 inline-block w-2 text-text-mute" aria-hidden="true">
+                          {expanded ? "▾" : "▸"}
                         </span>
-                      )}
-                    </td>
-                    <td className="px-3 py-2 font-mono tabular-nums text-text-dim">{a.confidence.toFixed(2)}</td>
-                    <td className="px-3 py-2 text-text-dim">{a.status}</td>
-                    <td className="px-3 py-2 text-right">
-                      {active && (
-                        <button
-                          type="button"
-                          disabled={pending}
-                          onClick={() => handleRollback(a.id)}
-                          className="rounded-[var(--radius-dense)] border border-glass-border px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.06em] text-text-dim transition-colors hover:border-accent hover:text-accent disabled:cursor-not-allowed disabled:opacity-50"
-                        >
-                          {pending ? "Rolling back…" : "Roll back"}
-                        </button>
-                      )}
-                    </td>
-                  </tr>
+                        {formatTime(a.ts)}
+                      </td>
+                      <td className="max-w-[220px] truncate px-3 py-2 font-mono text-text" title={a.target_asset}>
+                        {a.target_asset}
+                      </td>
+                      <td className="px-3 py-2">
+                        <ActionBadge action={a.action} />
+                        {a.dry_run && (
+                          <span className="ml-1.5 rounded-full border border-glass-border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.05em] text-text-mute">
+                            dry-run
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 font-mono tabular-nums text-text-dim">{a.confidence.toFixed(2)}</td>
+                      <td className="px-3 py-2 text-right">
+                        {active && (
+                          <button
+                            type="button"
+                            disabled={pending}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleRollback(a.id);
+                            }}
+                            className="rounded-[var(--radius-dense)] border border-glass-border px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.06em] text-text-dim transition-colors hover:border-accent hover:text-accent disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            {pending ? "Rolling back…" : "Roll back"}
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+
+                    {meta?.error && (
+                      <tr className="border-b border-glass-border last:border-0">
+                        <td colSpan={5} className="px-3 pb-2 text-[11px] text-sev-critical" role="alert">
+                          {meta.error}
+                        </td>
+                      </tr>
+                    )}
+
+                    {expanded && (
+                      <tr className="border-b border-glass-border bg-glass-raised last:border-0">
+                        <td colSpan={5} className="px-3 py-3">
+                          <p className="text-[11px] leading-relaxed text-text-dim">{a.reason}</p>
+
+                          {a.rolled_back_at && (
+                            <p className="mt-2 font-mono text-[10px] text-text-mute">
+                              {a.rollback_reason ?? "rolled back"} · {formatTime(a.rolled_back_at)}
+                            </p>
+                          )}
+
+                          <EvidenceGrid evidence={a.evidence} />
+
+                          {a.triggering_event_id !== null && (
+                            <p className="mt-2 font-mono text-[10px] text-text-mute">
+                              triggering event #{a.triggering_event_id}
+                            </p>
+                          )}
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
                 );
               })}
             </tbody>
@@ -200,6 +312,32 @@ function PreventionTab() {
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * The decision's own evidence snapshot, exactly as the policy engine
+ * recorded it (`backend/ips/policy.py`'s `_evidence`). Rendered from
+ * whatever keys are actually present rather than a hardcoded list, so a
+ * future field added backend-side shows up here without a frontend
+ * change — and a missing one simply doesn't render, instead of printing
+ * a fabricated zero.
+ */
+function EvidenceGrid({ evidence }: { evidence: Record<string, unknown> | null }) {
+  if (!evidence) return null;
+  const entries = Object.entries(evidence).filter(([, v]) => v !== null && v !== undefined);
+  if (entries.length === 0) return null;
+  return (
+    <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 sm:grid-cols-3">
+      {entries.map(([k, v]) => (
+        <div key={k} className="flex min-w-0 flex-col">
+          <dt className="text-[9px] uppercase tracking-[0.06em] text-text-mute">{k.replace(/_/g, " ")}</dt>
+          <dd className="truncate font-mono text-[11px] text-text-dim" title={String(v)}>
+            {Array.isArray(v) ? (v.length > 0 ? v.join(", ") : "—") : typeof v === "number" ? v.toFixed(3).replace(/\.?0+$/, "") : String(v)}
+          </dd>
+        </div>
+      ))}
+    </dl>
   );
 }
 

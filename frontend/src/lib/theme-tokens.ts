@@ -32,6 +32,12 @@ export interface ThemeColors {
   textMute: string;
   accent: string;
   accentHi: string;
+  /** The graph's OWN accent scale (`--graph-accent`/`--graph-accent-hi`,
+   * globals.css) — deliberately separate from `accent`/`accentHi` above.
+   * CityGraph.tsx's nodes/edges stay blue regardless of what the rest of
+   * the app uses as its brand accent; see that CSS var's own comment. */
+  graphAccent: string;
+  graphAccentHi: string;
   sevCritical: string;
   sevWarning: string;
   sevNormal: string;
@@ -39,21 +45,29 @@ export interface ThemeColors {
   financial: string;
 }
 
+// Light-theme keywords (project moved off the prior dark "Warm
+// Industrial Glass" theme) — CSS keywords, never hex, per this module's
+// own convention above. Approximate the real palette (globals.css) in
+// spirit — light cream ground, dark navy text, rust accent — rather
+// than matching hex-for-hex, since a fallback only paints if
+// `getComputedStyle` returns an empty string for that one token.
 const FALLBACK: ThemeColors = {
-  ground: "black",
-  groundRaised: "black",
-  glassBorder: "gray",
-  glassBorderStrong: "gray",
-  text: "whitesmoke",
-  textDim: "silver",
-  textMute: "dimgray",
-  accent: "orange",
-  accentHi: "orange",
-  sevCritical: "crimson",
-  sevWarning: "gold",
+  ground: "whitesmoke",
+  groundRaised: "white",
+  glassBorder: "gainsboro",
+  glassBorderStrong: "darkgray",
+  text: "black",
+  textDim: "dimgray",
+  textMute: "gray",
+  accent: "sienna",
+  accentHi: "sandybrown",
+  graphAccent: "royalblue",
+  graphAccentHi: "cornflowerblue",
+  sevCritical: "firebrick",
+  sevWarning: "darkgoldenrod",
   sevNormal: "seagreen",
   sevInfo: "steelblue",
-  financial: "goldenrod",
+  financial: "darkslateblue",
 };
 
 const VAR_NAMES: Record<keyof ThemeColors, string> = {
@@ -66,6 +80,8 @@ const VAR_NAMES: Record<keyof ThemeColors, string> = {
   textMute: "--text-mute",
   accent: "--accent",
   accentHi: "--accent-hi",
+  graphAccent: "--graph-accent",
+  graphAccentHi: "--graph-accent-hi",
   sevCritical: "--sev-critical",
   sevWarning: "--sev-warning",
   sevNormal: "--sev-normal",

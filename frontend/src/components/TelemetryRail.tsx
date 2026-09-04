@@ -253,7 +253,16 @@ export function TelemetryRail() {
             {displayEvents.map((e, i) => {
               const severity = severityOf(e);
               const isAnomalous = severity !== "normal";
-              const opacity = Math.max(0.35, 1 - i * 0.04);
+              // Recency fade, retuned for the light theme. On the old
+              // near-black ground a 0.35 floor read as "receding into the
+              // background"; on white the same value reads as washed-out
+              // and unreadable (--text-dim at 35% over #ffffff is roughly
+              // 1.5:1, well under any legibility bar). A feed whose entire
+              // job is showing who talked to whom must stay readable to
+              // its last row, so the floor is raised and the per-row step
+              // gentled — the freshest rows are still visibly brighter,
+              // which is all the cue was ever for.
+              const opacity = Math.max(0.72, 1 - i * 0.025);
               const { src, dst, elided } = addressPair(
                 e.source_asset,
                 e.source_ip,
@@ -265,7 +274,7 @@ export function TelemetryRail() {
               return (
                 <li
                   key={e.id}
-                  className={`flex flex-col gap-0.5 border-b border-glass-border/50 py-1 pl-2 font-mono text-xs ${
+                  className={`flex flex-col gap-0.5 border-b border-glass-border py-1 pl-2 font-mono text-xs ${
                     isAnomalous ? "border-l-2" : "border-l-2 border-l-transparent"
                   }`}
                   style={{

@@ -48,6 +48,17 @@ const PULSE_WINDOW_MS = 3000;
 // frontend-only presentation timing, not a domain tunable (the backend
 // computes the CII distribution; this file only paces how it is revealed).
 const CASCADE_STAGGER_MS = 260;
+// Phase 2: passed explicitly to `ForceGraph2D` and used to derive `nodeVal`
+// from the same drawn radius `nodeCanvasObject` paints — react-force-graph's
+// hit-radius formula is `radius = sqrt(val) * nodeRelSize`, so
+// `val = (radius / nodeRelSize)^2` inverts it exactly.
+const NODE_REL_SIZE = 4;
+// Phase 1 fix: nothing previously reset `cascade` back to null, so the
+// origin/impacted rings and lit path persisted for the rest of the
+// session — an hour-old attack looked identical to one seconds old.
+// Hold the fully-revealed state for this long after the last hop would
+// have revealed, then clear.
+const CASCADE_HOLD_MS = 9000;
 
 // Ticket #16 FIX round (HIGH-1): the observed `/24` cluster layer is
 // confined to a narrow vertical band hugging the right edge of the
@@ -252,9 +263,34 @@ function clamp(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
 }
 
-/** Shared by layout (approximate, pre-measurement) and rendering (exact) so the two never disagree about how much room a node's marker needs. */
+/**
+ * Base radius from criticality alone — Phase 2 widened this from `3 +
+ * criticality*7` (3-10px, too small for a legible icon glyph) to
+ * `11 + criticality*7` (11-18px). The dynamic range is deliberately
+ * compressed: this was never meant to be a precise criticality readout —
+ * severity/cascade rings already carry that signal — it just needs to
+ * leave room for `asset-icons.ts` glyphs (Phase 3).
+ */
 function curatedNodeRadius(criticality: number): number {
-  return 3 + criticality * 7;
+  return 11 + criticality * 7;
+}
+
+/**
+ * The ONE place hub/gateway/aggregate radius enlargement is computed —
+ * consumed by both `computeCuratedLayout` (pre-measurement, reserves
+ * label/spacing room) and `nodeCanvasObject` (paint) so the two can never
+ * disagree about how big a marker actually is. Before Phase 2 the layout
+ * used the raw criticality radius while paint independently enlarged the
+ * hub/gateway, so the layout reserved space for a smaller circle than was
+ * actually drawn — this also feeds `nodeVal` for hit-testing, so a click
+ * target now always matches what's on screen.
+ */
+function curatedMarkerRadius(node: { id: string; criticality: number; isAggregate: boolean; isGateway: boolean }): number {
+  const base = curatedNodeRadius(node.criticality);
+  if (node.id === HUB_ASSET_NAME) return Math.max(base * 1.45, 24);
+  if (node.isAggregate) return base * 1.2;
+  if (node.isGateway) return Math.max(base, 13);
+  return base;
 }
 
 // ---------------------------------------------------------------------------
@@ -501,8 +537,10 @@ function computeCuratedLayout(
     y: cy + Math.sin(angle) * frac * radiusY,
   });
 
-  const coreFrac = 0.15;
-  const minSectorFrac = coreFrac * 1.8;
+  // Phase 2: raised alongside the larger hub halo (24px+ now, was 16px) —
+  // at the old 0.15 the enlarged hub collides with the 5-node core ring.
+  const coreFrac = 0.22;
+  const minSectorFrac = coreFrac * 1.55;
 
   const hub = nodes.find((n) => n.name === HUB_ASSET_NAME);
   const core: DisplayNode[] = [];
@@ -630,7 +668,7 @@ function computeCuratedLayout(
   const positions = new Map<string, { x: number; y: number; labelDx: number; labelDy: number }>();
   for (const n of order) {
     const pos = basePositions.get(n.name)!;
-    const r = curatedNodeRadius(n.criticality);
+    const r = curatedMarkerRadius({ id: n.name, criticality: n.criticality, isAggregate: n.isAggregate, isGateway: n.is_gateway });
     // `n.label`, not `n.name`: for a sector aggregate node these differ
     // (id `sector:energy` vs. rendered label `"Energy · 5"`) and this
     // estimate must track whatever `fitLabel`/`ctx.measureText` actually
@@ -1323,6 +1361,7 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
       impacted,
       topology.edges
     );
+    const startedAt = performance.now();
     setCascade({
       originAsset: latestCii.origin_asset,
       ciiMedian: latestCii.cii_median,
@@ -1334,8 +1373,18 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
       pathEdgeIds,
       edgeHopOf,
       fallbackHop,
-      startedAt: performance.now(),
+      startedAt,
     });
+
+    // Auto-clear after the last hop has had time to reveal plus a hold —
+    // `startedAt` is the identity guard: if a newer envelope replaced
+    // `cascade` before this fires, `setCascade` here is a same-value
+    // no-op against a functional update keyed on the timer's own
+    // `startedAt`, so a stale timer can never clear a newer cascade.
+    const clearAfterMs = fallbackHop * CASCADE_STAGGER_MS + CASCADE_HOLD_MS;
+    const timer = window.setTimeout(() => {
+      setCascade((current) => (current?.startedAt === startedAt ? null : current));
+    }, clearAfterMs);
 
     // D-R2/D-R3 "cascade animation still animates on the real impacted
     // payload" must hold in the default sector-aggregated view too, not
@@ -1360,6 +1409,8 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
       const originSector = sectorByName.get(latestCii.origin_asset);
       if (originSector) focusSector(originSector);
     }
+
+    return () => window.clearTimeout(timer);
   }, [latestCii, topology.edges, expanded, sectorByName, focusSector]);
 
   const nodeCanvasObject = useCallback(
@@ -1386,30 +1437,37 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
             : null;
 
       if (node.layer === "curated") {
-        const baseR = curatedNodeRadius(node.criticality);
         // Ticket #16 FIX round (HIGH-1d): the hub must be unmistakably
         // the visual centre, not just another dot with a bigger radius —
         // a distinct double-ring "sun" marker (soft outer halo, solid
         // filled ring, dark core) drawn before the gateway/financial
         // branches so it takes priority regardless of those flags.
-        // `markerR` (not `baseR`) is what the pulse/cascade rings below
-        // are sized off of, so those overlays scale with what's actually
-        // drawn rather than the pre-enlargement criticality radius.
+        // `markerR` (Phase 2: from the shared `curatedMarkerRadius`,
+        // which `computeCuratedLayout` also calls — layout and paint can
+        // no longer disagree about how big a marker is) is what the
+        // pulse/cascade rings below and the financial/default branches
+        // are all sized off of; for a plain node it's just the raw
+        // criticality radius, identical to the old `baseR`.
         const isHub = node.id === HUB_ASSET_NAME;
-        const markerR = isHub ? Math.max(baseR, 16) : baseR;
+        const markerR = curatedMarkerRadius({
+          id: node.id,
+          criticality: node.criticality,
+          isAggregate: node.isAggregate,
+          isGateway: node.isGateway,
+        });
         if (isHub) {
           const haloR = markerR + 8 + (reducedMotion ? 3 : pulseT * 5);
           ctx.beginPath();
           ctx.arc(x, y, haloR, 0, 2 * Math.PI);
           ctx.lineWidth = 1.5;
-          ctx.strokeStyle = colors.accentHi;
+          ctx.strokeStyle = colors.graphAccentHi;
           ctx.globalAlpha = 0.4;
           ctx.stroke();
           ctx.globalAlpha = 1;
 
           ctx.beginPath();
           ctx.arc(x, y, markerR, 0, 2 * Math.PI);
-          ctx.fillStyle = colors.accentHi;
+          ctx.fillStyle = colors.graphAccentHi;
           ctx.fill();
           ctx.lineWidth = 2;
           ctx.strokeStyle = colors.text;
@@ -1420,20 +1478,20 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
           ctx.fillStyle = colors.ground;
           ctx.fill();
         } else if (node.isGateway) {
-          const r = Math.max(baseR, 9);
+          const r = markerR;
           ctx.beginPath();
           ctx.arc(x, y, r, 0, 2 * Math.PI);
           ctx.lineWidth = 1.6;
-          ctx.strokeStyle = colors.accentHi;
+          ctx.strokeStyle = colors.graphAccentHi;
           ctx.stroke();
           ctx.beginPath();
           ctx.arc(x, y, r * 0.55, 0, 2 * Math.PI);
-          ctx.fillStyle = colors.accent;
+          ctx.fillStyle = colors.graphAccent;
           ctx.globalAlpha = 0.55;
           ctx.fill();
           ctx.globalAlpha = 1;
         } else if (node.isFinancial) {
-          const r = baseR;
+          const r = markerR;
           ctx.beginPath();
           ctx.moveTo(x, y - r);
           ctx.lineTo(x + r, y);
@@ -1449,20 +1507,20 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
           // at a glance "this is a rolled-up sector" without reading the
           // label first.
           ctx.beginPath();
-          ctx.arc(x, y, baseR, 0, 2 * Math.PI);
-          ctx.fillStyle = colors.accent;
+          ctx.arc(x, y, markerR, 0, 2 * Math.PI);
+          ctx.fillStyle = colors.graphAccent;
           ctx.fill();
           ctx.beginPath();
-          ctx.arc(x, y, baseR + 3, 0, 2 * Math.PI);
+          ctx.arc(x, y, markerR + 3, 0, 2 * Math.PI);
           ctx.lineWidth = 1.4;
-          ctx.strokeStyle = colors.accentHi;
+          ctx.strokeStyle = colors.graphAccentHi;
           ctx.globalAlpha = 0.6;
           ctx.stroke();
           ctx.globalAlpha = 1;
         } else {
           ctx.beginPath();
-          ctx.arc(x, y, baseR, 0, 2 * Math.PI);
-          ctx.fillStyle = colors.accent;
+          ctx.arc(x, y, markerR, 0, 2 * Math.PI);
+          ctx.fillStyle = colors.graphAccent;
           ctx.fill();
         }
 
@@ -1472,7 +1530,7 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
           ctx.arc(x, y, ringR, 0, 2 * Math.PI);
           ctx.lineWidth = 2;
           ctx.strokeStyle = pulseColor;
-          ctx.globalAlpha = reducedMotion ? 0.9 : 0.35 + (1 - pulseT) * 0.5;
+          ctx.globalAlpha = reducedMotion ? 0.9 : 0.55 + (1 - pulseT) * 0.35;
           ctx.stroke();
           ctx.globalAlpha = 1;
         }
@@ -1492,7 +1550,7 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
             ctx.arc(x, y, ringR, 0, 2 * Math.PI);
             ctx.lineWidth = 2.4;
             ctx.strokeStyle = colors.sevCritical;
-            ctx.globalAlpha = reducedMotion ? 0.95 : 0.45 + (1 - pulseT) * 0.5;
+            ctx.globalAlpha = reducedMotion ? 0.95 : 0.6 + (1 - pulseT) * 0.35;
             ctx.stroke();
             ctx.globalAlpha = 1;
           } else if (
@@ -1514,7 +1572,7 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
               ctx.arc(x, y, ringR, 0, 2 * Math.PI);
               ctx.lineWidth = 2;
               ctx.strokeStyle = colors.sevWarning;
-              ctx.globalAlpha = 0.85;
+              ctx.globalAlpha = 1;
               ctx.stroke();
               ctx.globalAlpha = 1;
             }
@@ -1569,7 +1627,7 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
           const label = fitLabel(ctx, shortenLabel(node.label), curatedLabelMaxWidthRef.current);
           const textWidth = ctx.measureText(label).width;
           const labelDx = node.labelDx ?? 0;
-          const labelDy = node.labelDy ?? baseR + 3;
+          const labelDy = node.labelDy ?? markerR + 3;
           const above = labelDy < 0;
           const anchorX = x + labelDx;
           const anchorY = y + labelDy;
@@ -1577,12 +1635,18 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
           const plateHeight = fontSize + 4;
           const plateTop = above ? anchorY - plateHeight : anchorY;
 
-          ctx.fillStyle = colors.groundRaised;
-          ctx.globalAlpha = 0.85;
+          // Phase 1 fix: `groundRaised` (#ffffff) on the canvas's own
+          // white background is invisible — this token differs from the
+          // panel behind it in a way `groundRaised` no longer does now
+          // that panels are opaque white too. Full alpha (never fades —
+          // labels are glyphs, not fills, per the Phase 1 rule) and a
+          // stroke divided by `globalScale` so the hairline doesn't grow
+          // into a heavy border at zoom (text itself is already held at
+          // constant screen size via the `/globalScale` font calc above).
+          ctx.fillStyle = colors.ground;
           ctx.fillRect(anchorX - textWidth / 2 - platePadX, plateTop, textWidth + platePadX * 2, plateHeight);
-          ctx.globalAlpha = 1;
-          ctx.lineWidth = 1;
-          ctx.strokeStyle = isHub ? colors.accentHi : colors.glassBorder;
+          ctx.lineWidth = 1 / globalScale;
+          ctx.strokeStyle = isHub ? colors.graphAccentHi : colors.glassBorderStrong;
           ctx.strokeRect(anchorX - textWidth / 2 - platePadX, plateTop, textWidth + platePadX * 2, plateHeight);
 
           ctx.textAlign = "center";
@@ -1600,7 +1664,7 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
         ctx.arc(x, y, r, 0, 2 * Math.PI);
         ctx.lineWidth = 1.3;
         ctx.strokeStyle = node.isOther ? colors.textMute : colors.sevInfo;
-        ctx.globalAlpha = 0.8;
+        ctx.globalAlpha = 1;
         ctx.stroke();
         ctx.restore();
 
@@ -1610,7 +1674,7 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
           ctx.arc(x, y, ringR, 0, 2 * Math.PI);
           ctx.lineWidth = 2;
           ctx.strokeStyle = pulseColor;
-          ctx.globalAlpha = reducedMotion ? 0.9 : 0.35 + (1 - pulseT) * 0.5;
+          ctx.globalAlpha = reducedMotion ? 0.9 : 0.55 + (1 - pulseT) * 0.35;
           ctx.stroke();
           ctx.globalAlpha = 1;
         }
@@ -1626,7 +1690,10 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
           ctx.font = `${fontSize}px ${monoFont}`;
           ctx.textAlign = "center";
           ctx.textBaseline = "top";
-          ctx.fillStyle = colors.textMute;
+          // Phase 1 fix: `textMute` (~2.3:1 on white) was unreadable —
+          // `textDim` (~8.6:1) matches every other hover/always-on label
+          // on this canvas.
+          ctx.fillStyle = colors.textDim;
           ctx.fillText(node.label, x, y + r + 3);
         }
       }
@@ -1641,7 +1708,11 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
         const elapsed = reducedMotion ? Infinity : performance.now() - cascade.startedAt;
         if (elapsed >= hop * CASCADE_STAGGER_MS) return colors.sevCritical;
       }
-      return link.layer === "curated" ? (link.isGatewayEdge ? colors.accent : colors.textDim) : colors.textMute;
+      return link.layer === "curated"
+        ? link.isGatewayEdge
+          ? colors.graphAccent
+          : colors.glassBorderStrong
+        : colors.textMute;
     },
     [colors, cascade, reducedMotion]
   );
@@ -1653,7 +1724,13 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
         const elapsed = reducedMotion ? Infinity : performance.now() - cascade.startedAt;
         if (elapsed >= hop * CASCADE_STAGGER_MS) return 2.6;
       }
-      return link.layer === "curated" ? 1.4 : Math.min(2.2, 0.4 + Math.log2(link.count + 1) * 0.3);
+      if (link.layer === "curated") {
+        return link.isGatewayEdge ? 1.2 : 1.0;
+      }
+      // Aggregated `/24` edges scale by their own `count` — recessive
+      // edges (Phase 1) still need to distinguish a single-flow link from
+      // a thousand-flow one, which a flat width would erase.
+      return Math.min(2.2, 0.4 + Math.log2(link.count + 1) * 0.3);
     },
     [cascade, reducedMotion]
   );
@@ -1676,6 +1753,43 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
       ? `${node.label} (rolled up, below cap)`
       : `${node.label} — observed flow count`;
   }, []);
+
+  // Phase 2 (HIGH — every node was previously a ~4px click target
+  // regardless of drawn size, react-force-graph's default `val`).
+  // `drawnRadius` is the single source both `nodeVal` (physics-safe,
+  // `nodeVal`/`triggerUpdate` is read by no d3 force) and
+  // `nodePointerAreaPaint` (the actual hit region) derive from, so a
+  // click target always matches what's on screen — including sector
+  // aggregates, whose primary interaction IS click-to-expand.
+  const drawnRadius = useCallback((node: CityNodeDatum): number => {
+    if (node.layer === "curated") {
+      return curatedMarkerRadius({
+        id: node.id,
+        criticality: node.criticality,
+        isAggregate: node.isAggregate,
+        isGateway: node.isGateway,
+      });
+    }
+    return node.isOther ? 10 : Math.min(18, 5 + Math.log2(node.count + 1) * 2.2);
+  }, []);
+
+  const nodeVal = useCallback(
+    (node: CityNodeDatum) => (drawnRadius(node) / NODE_REL_SIZE) ** 2,
+    [drawnRadius]
+  );
+
+  const nodePointerAreaPaint = useCallback(
+    (node: CityNodeDatum, color: string, ctx: CanvasRenderingContext2D) => {
+      const x = node.x ?? 0;
+      const y = node.y ?? 0;
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(x, y, drawnRadius(node) + 4, 0, 2 * Math.PI);
+      ctx.fill();
+    },
+    [drawnRadius]
+  );
 
   const clusterNodeCount = graphData.nodes.filter(
     (n) => n.layer === "observed" && !n.isOther
@@ -1748,6 +1862,9 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
               nodeCanvasObject={nodeCanvasObject}
               nodeCanvasObjectMode={() => "replace"}
               nodeLabel={nodeLabel}
+              nodeRelSize={NODE_REL_SIZE}
+              nodeVal={nodeVal}
+              nodePointerAreaPaint={nodePointerAreaPaint}
               linkColor={linkColor}
               linkWidth={linkWidth}
               linkLineDash={linkLineDash}
@@ -1824,13 +1941,13 @@ function Legend({ colors }: { colors: ReturnType<typeof useThemeColors> }) {
     <div className="flex flex-wrap items-center gap-3">
       <LegendItem
         swatch={
-          <span className="relative inline-flex h-3.5 w-3.5 items-center justify-center rounded-full" style={{ background: colors.accentHi, boxShadow: `0 0 0 1.5px ${colors.text}` }}>
+          <span className="relative inline-flex h-3.5 w-3.5 items-center justify-center rounded-full" style={{ background: colors.graphAccentHi, boxShadow: `0 0 0 1.5px ${colors.text}` }}>
             <span className="h-1.5 w-1.5 rounded-full" style={{ background: colors.ground }} />
           </span>
         }
         label="Hub"
       />
-      <LegendItem swatch={<span className="inline-block h-2.5 w-2.5 rounded-full" style={{ background: colors.accent }} />} label="Infra" />
+      <LegendItem swatch={<span className="inline-block h-2.5 w-2.5 rounded-full" style={{ background: colors.graphAccent }} />} label="Infra" />
       <LegendItem
         swatch={
           <span
@@ -1841,14 +1958,14 @@ function Legend({ colors }: { colors: ReturnType<typeof useThemeColors> }) {
         label="Financial"
       />
       <LegendItem
-        swatch={<span className="inline-block h-3 w-3 rounded-full border-[1.5px]" style={{ borderColor: colors.accentHi }} />}
+        swatch={<span className="inline-block h-3 w-3 rounded-full border-[1.5px]" style={{ borderColor: colors.graphAccentHi }} />}
         label="Gateway"
       />
       <LegendItem
         swatch={
           <span
             className="inline-block h-3 w-3 rounded-full"
-            style={{ background: colors.accent, boxShadow: `0 0 0 1.5px ${colors.accentHi}` }}
+            style={{ background: colors.graphAccent, boxShadow: `0 0 0 1.5px ${colors.graphAccentHi}` }}
           />
         }
         label="Sector (click to expand)"

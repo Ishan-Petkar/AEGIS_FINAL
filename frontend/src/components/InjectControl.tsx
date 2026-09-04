@@ -154,22 +154,28 @@ export function InjectControl({ running }: { running: boolean }) {
       </button>
 
       {/*
-        The popover is deliberately NOT `.glass-panel`. It floats over the
-        Active Alerts column, and `.glass-panel`'s 4.5%-opacity `--glass` fill
-        is only legible thanks to the `backdrop-filter: blur(14px)` that is
-        meant to accompany it — a blur that does not survive the build.
-        Tailwind v4's Lightning CSS pass collapses the rule's
-        `backdrop-filter` / `-webkit-backdrop-filter` pair down to the
-        `-webkit-` form alone, and Chromium supports only the UNPREFIXED
-        property there (`CSS.supports('-webkit-backdrop-filter','blur(1px)')`
-        returns false), so the computed value is `none`. globals.css's
-        `@supports not (...)` opaque fallback cannot rescue it either: that
-        condition tests for standard support, which IS present. Net effect is
-        a ~4%-opaque panel with no blur, through which alert text reads
-        straight through. Every other `.glass-panel` sits over the flat
-        `--ground` page background where this is invisible; only this popover
-        overlaps real content, so it takes an opaque surface rather than
-        depending on an effect that never reaches the browser.
+        The popover paints its own opaque surface (`bg-ground-raised` +
+        `border-glass-border` + `shadow-lg`) instead of using `.glass-panel`.
+        In the current light theme `.glass-panel` already resolves to an
+        opaque fill (`--ground-raised`, a hairline border, `--shadow-card`),
+        so today the two would look nearly identical — but this popover
+        floats directly over the Active Alerts column's live text, unlike
+        every other `.glass-panel` consumer, which sits on the flat
+        `--ground` page background where the fill's exact opacity has never
+        mattered. That distinction is not hypothetical: this app's theme has
+        already changed once. The dark "glass" theme this class was named
+        for gave `--glass` a ~4.5%-opacity fill that depended on an
+        accompanying `backdrop-filter: blur(...)` for legibility, and that
+        blur silently failed to reach the browser after a Tailwind v4 build
+        pass — this popover rendered at a few percent opacity with alert
+        text bleeding straight through it, a real bug that shipped before it
+        was caught. Trusting `.glass-panel` to "just be opaque" is exactly
+        the assumption that broke last time, so the one place a
+        `.glass-panel` would sit over live, readable content keeps its own
+        explicit opaque styling rather than inheriting whatever
+        `.glass-panel` currently resolves to. `shadow-lg` (vs. the shared
+        `--shadow-card` token) is also a deliberately heavier elevation,
+        appropriate for a floating popover rather than a resting panel.
       */}
       {open && (
         <div

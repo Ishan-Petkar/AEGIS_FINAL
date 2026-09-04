@@ -25,7 +25,17 @@ export default function Home() {
         <TelemetryRail />
         <div className="flex min-h-0 flex-1 flex-col gap-3 xl:overflow-y-auto">
           <MetricsStrip />
-          <div className="flex flex-col gap-3 lg:flex-row">
+          {/* A DEFINITE height at `xl`, not `flex-1`. The right column is
+              `xl:overflow-y-auto` — a scrolling document region, not a
+              viewport-fitted grid — so there is no definite height above
+              this row for a `flex-1` child to resolve against. Without
+              this, `GraphPanel`'s `xl:h-auto` (GraphPanel.tsx) had nothing
+              to stretch to and the canvas ended up sized by whatever
+              `AlertsRail` happened to be tall, i.e. by the alert count;
+              `AlertsRail`'s own `overflow-y-auto` never engaged either and
+              its 100 cards grew the page instead of scrolling. Both panels
+              size against this one number now. */}
+          <div className="flex flex-col gap-3 lg:flex-row xl:h-[56vh] xl:min-h-[460px]">
             <GraphPanel />
             <AlertsRail />
           </div>

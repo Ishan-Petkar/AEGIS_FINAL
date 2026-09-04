@@ -57,18 +57,26 @@ export function GraphPanel() {
 
   return (
     <>
-      {/* Console redesign: a full-viewport takeover needs an opaque
-          backing, not `.glass-panel`'s deliberately near-transparent
-          fill (`--glass`, ~4.5% alpha — right for a small panel floating
-          over the page's own ambient glow, wrong for a "maximised"
-          view that's meant to fully replace what's on screen). Without
-          this, the other panels sitting underneath in normal document
-          flow visibly show through, which reads as a rendering bug, not
-          the intended "the graph now owns the whole window." A separate
-          element (not just an opaque className on the Panel itself)
-          because the Panel keeps its normal glass styling — this is
-          purely the backdrop it sits on. `z-40`, one below the Panel's
-          own `z-50`. */}
+      {/* A full-viewport takeover needs a guaranteed-opaque backing behind
+          the graph. In the current light theme `.glass-panel` (which
+          `<Panel>` uses) is already opaque — a solid `--ground-raised`
+          fill, hairline border, `--shadow-card` — so in practice the
+          Panel's own background already covers the rest of the page once
+          `expanded` flips it to `fixed inset-0 z-50`. This backdrop is
+          deliberately still its own element rather than leaning on that:
+          this app's theme has already been rewritten once (a translucent
+          dark "glass" panel, blurred over an ambient glow, replaced by
+          today's opaque light card), and `.glass-panel` is a shared class
+          every panel on the page depends on — a future theme pass that
+          makes it translucent again (or a one-off override on `<Panel>`)
+          would silently reopen "the rest of the dashboard visibly showing
+          through the maximised graph," which reads as a rendering bug, not
+          the intended "the graph now owns the whole window." A dedicated
+          `bg-ground` element at `z-40`, one below the Panel's own `z-50`,
+          keeps that guarantee independent of whatever `.glass-panel`
+          currently resolves to. Not just an opaque className on the Panel
+          itself, either, because the Panel keeps its normal glass styling
+          — this is purely the backdrop it sits on. */}
       {expanded && <div className="fixed inset-0 z-40 bg-ground" aria-hidden="true" />}
       <Panel
       label="City Infrastructure"
