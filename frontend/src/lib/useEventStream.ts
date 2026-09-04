@@ -8,6 +8,7 @@ import type {
   EventEnvelopeData,
   EventOut,
   HelloEnvelopeData,
+  IpsActionEnvelopeData,
   StreamEnvelope,
 } from "./types";
 
@@ -46,6 +47,7 @@ const MAX_BACKOFF_MS = 15_000;
 const INITIAL_BACKOFF_MS = 1_000;
 const MAX_EVENTS_BUFFER = 200;
 const MAX_ALERTS_BUFFER = 50;
+const MAX_IPS_ACTIONS_BUFFER = 50;
 const RATE_WINDOW_MS = 1_000;
 
 const DEFAULT_WS_URL = "ws://127.0.0.1:8000/ws/stream";
@@ -96,6 +98,10 @@ function toEventEnvelopeData(e: EventOut): EventEnvelopeData {
     batch_index: -1,
     timing_provenance: e.timing_provenance,
     batch_origin: batchOrigin,
+    // `EventOut` (REST) carries no hybrid summary -- that key is WS-live-
+    // envelope-only (see `EventEnvelopeData.hybrid`'s own docstring) --
+    // so a backfilled row honestly has none, not a guessed/defaulted one.
+    hybrid: null,
   };
 }
 
@@ -105,6 +111,16 @@ export interface UseEventStreamResult {
   events: EventEnvelopeData[];
   /** Most recent alerts first, capped at MAX_ALERTS_BUFFER. */
   alerts: AlertEnvelopeData[];
+  /**
+   * Most recent IPS (backend/ips/) action decisions first, capped at
+   * MAX_IPS_ACTIONS_BUFFER — one entry per broadcast `ips_action`
+   * envelope, which fires on a fresh decision, an automatic TTL expiry,
+   * and a manual rollback (three envelopes can therefore describe the
+   * same underlying action's id over its lifecycle; consumers merge by
+   * `id`, newest write wins — same pattern `IpsActionsRail` uses to
+   * merge this with `GET /api/ips/actions` REST history).
+   */
+  ipsActions: IpsActionEnvelopeData[];
   /** Most recent cii snapshot, if any. */
   latestCii: CiiEnvelopeData | null;
   /** Events received in roughly the last second. */
@@ -158,6 +174,7 @@ export function useEventStream(): UseEventStreamResult {
   const [status, setStatus] = useState<StreamStatus>("connecting");
   const [events, setEvents] = useState<EventEnvelopeData[]>([]);
   const [alerts, setAlerts] = useState<AlertEnvelopeData[]>([]);
+  const [ipsActions, setIpsActions] = useState<IpsActionEnvelopeData[]>([]);
   const [latestCii, setLatestCii] = useState<CiiEnvelopeData | null>(null);
   const [eventsPerSecond, setEventsPerSecond] = useState(0);
   const [alertCount, setAlertCount] = useState(0);
@@ -312,6 +329,20 @@ export function useEventStream(): UseEventStreamResult {
             });
             setAlertCount((n) => n + 1);
             break;
+          case "ips_action":
+            setIpsActions((prev) => {
+              // The same action id rebroadcasts on decision -> expiry ->
+              // rollback (three distinct lifecycle events, one row) — drop
+              // any stale copy before prepending the fresh one, so the
+              // buffer never shows the same action twice with two
+              // different statuses.
+              const withoutStale = prev.filter((a) => a.id !== envelope.data.id);
+              const next = [envelope.data, ...withoutStale];
+              return next.length > MAX_IPS_ACTIONS_BUFFER
+                ? next.slice(0, MAX_IPS_ACTIONS_BUFFER)
+                : next;
+            });
+            break;
           case "cii":
             setLatestCii(envelope.data);
             break;
@@ -406,6 +437,7 @@ export function useEventStream(): UseEventStreamResult {
     status,
     events,
     alerts,
+    ipsActions,
     latestCii,
     eventsPerSecond,
     alertCount,

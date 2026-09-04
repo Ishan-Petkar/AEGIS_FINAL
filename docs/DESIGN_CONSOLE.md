@@ -11,6 +11,16 @@ Where `docs/PHASE5_BUILD_PLAN.md` §3 and `PLAN_MASTER.md` §Phase-5 say the
 scaffold ports `docs/DESIGN.md` tokens, **this file supersedes that** for
 the Operations Console.
 
+**Superseded 2026-09-04.** The dark "Warm Industrial Glass" theme and the
+single-row (Telemetry | Graph | Alerts | IPS) layout this document
+describes below were replaced by an operator-requested light-only,
+card-based dashboard redesign — same token architecture (`globals.css`
++ `@theme inline`, `theme-tokens.ts` resolving them for `CityGraph`'s
+canvas layer), new palette and layout. See `frontend/src/app/globals.css`
+for the current tokens and `frontend/src/app/page.tsx` for the current
+layout; the sections below describe the prior dark theme and are kept
+for history, not as the current spec.
+
 ---
 
 ## 1. Direction: Warm Industrial Glass

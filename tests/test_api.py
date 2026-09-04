@@ -1139,6 +1139,15 @@ def test_stats_no_replay_no_alerts_sane_zeros(sqlite_session_scope):
         "alerts_suppressed": 0,
         "broadcast_failures": 0,
         "events_pruned": 0,
+        # IPS (backend/ips/) counters — additive telemetry, always 0 here
+        # (no batches ingested, and ips_enabled defaults False regardless).
+        "ips_decisions": 0,
+        "ips_actions_enforced": 0,
+        "ips_actions_simulated": 0,
+        "ips_actions_duplicate_suppressed": 0,
+        "ips_actions_escalated": 0,
+        "ips_actions_failed": 0,
+        "ips_actions_expired": 0,
     }
     assert body["replay"]["running"] is False
     assert body["alerts"] == {"total": 0, "unacknowledged": 0, "by_severity": []}

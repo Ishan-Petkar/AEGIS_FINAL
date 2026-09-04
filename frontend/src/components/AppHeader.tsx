@@ -3,7 +3,6 @@
 import { useState } from "react";
 import { ConnectionState } from "./ConnectionState";
 import { StreamState } from "./StreamState";
-import { StatChip } from "./StatChip";
 import { InjectControl } from "./InjectControl";
 import {
   ApiError,
@@ -12,37 +11,16 @@ import {
   startReplay,
   stopReplay,
 } from "@/lib/api";
-import { useConnection } from "@/lib/connection-context";
 import { useStream } from "@/lib/stream-context";
 import type { HelloEnvelopeData } from "@/lib/types";
 
 const SPEED_OPTIONS = [1, 5, 20, 60] as const;
 
-/**
- * `RISK` chip tooltip (D16-1) — the number in a header labelled RISK
- * reads as authoritative, so its exact definition is stated inline
- * rather than left for an operator to guess. Kept in one place so the
- * chip's `title` and any future surface using the same figure agree.
- */
-const RISK_INDEX_TOOLTIP =
-  "risk = clamp(0-100) of Σ over UNACKNOWLEDGED alerts of " +
-  "(severity_weight × asset_criticality), normalised against a " +
-  "configured presentation-scale constant (BACKEND_SETTINGS." +
-  "risk_index_full_scale) -- not a calibrated probability. Falls when " +
-  "alerts are acknowledged. Deliberately not built on CII, which is " +
-  "currently near-binary across the graph.";
-
-const ALERTS_SUPPRESSED_TOOLTIP =
-  "Volumetric anomalies that were detected, scored, persisted, and " +
-  "broadcast, but deliberately did NOT page an operator -- the " +
-  "unsupervised channel measures ~0.02 precision on real replayed " +
-  "traffic (docs/DETECTION_STUDY.md). Cumulative since the backend last " +
-  "restarted.";
-
-const ALERTS_CHIP_TOOLTIP =
-  "Alerts received over this browser tab's live connection since it " +
-  "last connected -- resets on reconnect. See the alerts panel for the " +
-  "full, durable history.";
+// Console redesign (light-theme dashboard pass): the header's own
+// Events/s, Alerts, Risk, and Suppressed stat chips moved to
+// `MetricsStrip` (its own card row, with the same tooltips) so this bar
+// stays a slim control strip — live status, replay progress, speed,
+// restart, inject.
 
 /**
  * AppHeader (DESIGN_CONSOLE.md §5, §6) — brand, live pulse dot, stat
@@ -74,14 +52,11 @@ const ALERTS_CHIP_TOOLTIP =
 export function AppHeader() {
   const {
     status: streamStatus,
-    eventsPerSecond,
-    alertCount,
     hello,
     liveEmittedSinceHello,
     lastVirtualPosition,
     forceReconnect,
   } = useStream();
-  const { stats } = useConnection();
 
   // Same "is a session live" derivation `ReplayProgress` already uses
   // below — `hello.running` is a one-time snapshot from connect/reconnect,
@@ -89,47 +64,19 @@ export function AppHeader() {
   // instead (`liveEmittedSinceHello > 0`), never fabricated or polled.
   const running = (hello?.running ?? false) || liveEmittedSinceHello > 0;
 
-  const riskIndex = stats?.risk_index ?? null;
-  const riskTone =
-    riskIndex === null ? "text" : riskIndex === 0 ? "text" : riskIndex >= 50 ? "critical" : "warning";
-
   return (
-    <header className="glass-panel flex h-14 shrink-0 items-center gap-6 rounded-none border-x-0 border-t-0 px-4">
+    <header className="glass-panel flex h-16 shrink-0 items-center gap-6 rounded-none border-x-0 border-t-0 px-5">
       <div className="flex items-center gap-2">
         <span
           className="h-2 w-2 rounded-full bg-accent animate-aegis-pulse"
           aria-hidden="true"
         />
-        <span className="text-sm font-bold tracking-[-0.02em] text-text">
+        <span className="text-base font-bold tracking-[-0.02em] text-text">
           AEGIS
         </span>
         <ConnectionState />
         <StreamState status={streamStatus} />
         <RestartStreamButton forceReconnect={forceReconnect} />
-      </div>
-
-      <div className="flex items-center gap-6">
-        <StatChip label="Events/s" value={String(eventsPerSecond)} tone="accent" />
-        <StatChip
-          label="Alerts"
-          value={String(alertCount)}
-          tone={alertCount > 0 ? "critical" : "text"}
-          title={ALERTS_CHIP_TOOLTIP}
-        />
-        <StatChip
-          label="Risk"
-          value={riskIndex === null ? "—" : String(riskIndex)}
-          tone={riskTone}
-          title={RISK_INDEX_TOOLTIP}
-        />
-        <div className="hidden lg:flex">
-          <StatChip
-            label="Suppressed"
-            value={stats ? String(stats.ingest.alerts_suppressed) : "—"}
-            tone="text"
-            title={ALERTS_SUPPRESSED_TOOLTIP}
-          />
-        </div>
       </div>
 
       <ReplayProgress hello={hello} liveEmittedSinceHello={liveEmittedSinceHello} lastVirtualPosition={lastVirtualPosition} />

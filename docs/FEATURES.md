@@ -3,7 +3,8 @@
 What's actually built and running, versus what's planned. Code is
 authoritative over this document — if the two disagree, trust the code
 (see `CLAUDE.md` §8). Compiled 2026-09-03, updated same day after the
-Hybrid IDS landed — not carried forward from older planning docs.
+Hybrid IDS landed, updated again 2026-09-04 after the IPS layer landed —
+not carried forward from older planning docs.
 
 ---
 
@@ -44,7 +45,7 @@ Hybrid IDS landed — not carried forward from older planning docs.
 | Tool | Role |
 |---|---|
 | ruff | Python lint (`src/`, `backend/`) |
-| pytest + pytest-cov | 662+ tests, coverage |
+| pytest + pytest-cov | 720+ tests, coverage |
 | eslint (`eslint-config-next`) | Frontend lint |
 | Custom AST duplicate-def checker | CI — no function/class defined twice in `src/*.py` |
 | `scripts/dev-up.sh` / `dev-down.sh` / `dev-open.sh` | One-command local dev lifecycle |
@@ -143,10 +144,12 @@ re-measurement, not a tuning knob. Live-verified: the existing tripwire
 alert path (title, severity, debounce, risk index) is byte-for-byte
 unchanged with the hybrid layer running underneath it.
 
-**Deferred for IPS**: `ResponseAction.THROTTLE`/`.BLOCK` are declared in
-the contract but never produced by the fusion engine and nothing consumes
-them yet — this is detection and advisory alerting only, no active
-prevention.
+**This layer stays detection/advisory-only.** `ResponseAction.THROTTLE`/
+`.BLOCK` remain declared in the contract but never produced by the fusion
+engine — that has not changed. §5's IPS layer, added 2026-09-04, does now
+add active prevention downstream of this one, but as its own action set
+(`PreventionAction`) consuming `FusedDecision` read-only, not by finally
+using these two reserved-but-unused values.
 
 ---
 
@@ -172,7 +175,103 @@ prevention.
 
 ---
 
-## 5. Real-time Operations Console (backend + frontend)
+## 5. IPS — prevention layer (`backend/ips/`)
+
+Added 2026-09-04. Sits one step downstream of §3's Hybrid IDS and §4's
+CII engine, per the target architecture:
+
+```
+Traffic → Hybrid IDS → Detection Fusion → Risk + CII
+        → IPS Policy Engine → Prevention Decision
+        → Enforcement Adapter → Audit / Persistence / Alert / WS / UI
+```
+
+**Consumes, does not re-detect.** `IPSPolicyEngine.decide()`
+(`backend/ips/policy.py`) is a pure function of an already-fused
+`FusedDecision` plus asset criticality and CII median impact — it never
+examines a raw flow or reimplements any of the five Hybrid IDS channels.
+
+**Never blocks on a single weak signal.** Active prevention
+(RATE_LIMIT/BLOCK/QUARANTINE) requires EITHER a `Certainty.CONFIRMED`
+signal (the honeytoken tripwire, which cannot false-positive) OR at
+least `ips_min_corroborating_detectors` (default 2) independently fired
+detectors — a lone heuristic detector, however confident, can only ever
+reach ALERT. Tier selection above that floor: RATE_LIMIT on any
+corroborated signal past its threat-score floor; BLOCK additionally
+needs sufficient target-asset criticality; QUARANTINE additionally needs
+a real, currently-projected CII blast radius — high criticality alone is
+not enough to isolate an asset that has nothing left downstream to
+protect right now.
+
+**Own action set**, deliberately not an extension of the pinned
+`ResponseAction` enum (`backend/detection/contracts.py` still only ever
+emits OBSERVE/ALERT — `THROTTLE`/`BLOCK` stay declared-but-unused there,
+exactly as before): `PreventionAction` = observe / alert / rate_limit /
+block / quarantine (`backend/ips/contracts.py`).
+
+**Enforcement adapter** (`backend/ips/enforcement.py`) — a `Protocol`
+so a future adapter that talks to a real firewall/SDN/security-group API
+is a drop-in replacement, no change needed to the policy engine or
+`IngestPipeline`. The shipped default, `SimulatedEnforcementAdapter`, is
+the honest choice for this environment specifically: AEGIS has no real
+network fabric to enforce against (same "no live ingestion... no
+production deployment" scope CLAUDE.md §1 already states), so claiming a
+real block here would be exactly the kind of overclaim this project's
+other honesty trade-offs (§2's real 0.02 precision, §4's median-of-zero
+reporting) already refuse to make elsewhere.
+
+**Safety controls** (all requirement-driven, all configurable via
+`BACKEND_SETTINGS.ips_*`, `backend/config.py`):
+- `ips_enabled` (default **False**) — master switch, off by default
+  unlike the Hybrid IDS layer's `hybrid_enabled=True`, since this layer
+  can act on a decision (even in simulation) rather than only observe
+- `ips_dry_run` (default **True**) — decisions are computed, persisted,
+  and broadcast normally, but never mutate the pipeline's own active-
+  mitigation state; independent of `ips_enabled`, so a layer can stay
+  enabled-but-simulated indefinitely
+- TTL/expiry on every active action (`ips_rate_limit_ttl_sec` 15m,
+  `ips_block_ttl_sec` 30m, `ips_quarantine_ttl_sec` 1h) — swept once per
+  batch against `IngestPipeline`'s in-memory registry (mirrors the CII
+  debounce cache's own bounded-`OrderedDict` pattern), auto-expiring to
+  `ActionStatus.EXPIRED` with a real rollback call
+- Manual unblock/rollback: `POST /api/ips/actions/{id}/rollback` — 404
+  unknown id, 409 if the action is not currently active (already
+  terminal, or was only ever an ALERT-tier decision with nothing
+  enforced to undo)
+- Duplicate/conflicting-action protection: a repeat decision on an
+  already-actioned asset at the same or lower severity is suppressed,
+  never re-persisted; a strictly higher-severity decision supersedes the
+  existing row (marked `SUPERSEDED`, not deleted — the audit trail keeps
+  every approved decision)
+- Fail-open on enforcement failure: an adapter exception is caught,
+  logged, and recorded as `ActionStatus.FAILED` — never raised into the
+  batch, which would otherwise abort ordinary ingest over an IPS bug
+
+**Audit trail** — every approved decision (ALERT and above; OBSERVE is
+never persisted, mirroring how a suppressed volumetric anomaly gets no
+`alerts` row either) is a durable `ips_actions` row (`backend/models.py`
+`IpsAction`): what (action), why (reason + full evidence snapshot —
+threat_score, band, fired detectors, criticality, CII median), target,
+timestamp, result (status), and rollback/expiry state. Surfaced via
+`GET /api/ips/actions` (filterable by `active`/`target_asset`) and
+`GET /api/ips/policy` (the live configured thresholds), broadcast live as
+an additive `ips_action` WebSocket envelope, and shown in the console's
+new **IPS Prevention** panel (active mitigations, dry-run badge,
+confidence, TTL countdown, roll-back control).
+
+**Verified under real load** — driven directly against the real pipeline
+(real `StreamingScorer`/`SupervisedFlowScorer`, real signature/beaconing
+detectors, real Postgres) with `ips_enabled=True` over 20,000 real
+friday-afternoon-portscan flows: 3 approved decisions (2 rate-limit, 1
+alert-only — the corroboration floor correctly withheld the other 11
+hybrid-likely candidates that only had one detector fire), 11 duplicate
+decisions correctly suppressed, 0 failures, full audit trail confirmed
+end-to-end through the live REST API including a real rollback (200 →
+409 on retry) and dry-run enforcement (0 real state changes recorded).
+
+---
+
+## 6. Real-time Operations Console (backend + frontend)
 
 ### Data pipeline
 - **Real captured traffic replay** — CIC-IDS2017 (2017 network capture,
@@ -245,7 +344,7 @@ prevention.
 
 ---
 
-## 6. Frontend UX details
+## 7. Frontend UX details
 
 - Freeze-on-hover/scroll telemetry feed with an honest "Paused · N new"
   badge — display only, the stream keeps receiving underneath
@@ -261,12 +360,12 @@ prevention.
 
 ---
 
-## 7. Testing & CI discipline
+## 8. Testing & CI discipline
 
-- **662 passing / 15 skipped** in the default no-DB posture (skips are
+- **720 passing / 15 skipped** in the default no-DB posture (skips are
   real-dataset / live-DB tests gated on actual data/DB presence, not
-  silent failures) — **677 passing / 0 skipped** with a real Postgres
-  present, see §10
+  silent failures) — **735 passing / 0 skipped** with a real Postgres
+  present, see §11
 - ruff clean, zero duplicate top-level definitions across `src/*.py`
   (CI-enforced)
 - Every public function follows an optional-override signature
@@ -278,7 +377,7 @@ prevention.
 
 ---
 
-## 8. Known, documented limitations (stated on purpose, not hidden)
+## 9. Known, documented limitations (stated on purpose, not hidden)
 
 - Unsupervised detector: ~0.02 precision on real traffic — a genuine,
   published finding, not a bug to be quietly patched over
@@ -295,7 +394,7 @@ prevention.
 
 ---
 
-## 9. Planned / not yet implemented
+## 10. Planned / not yet implemented
 
 Ordered by how soon each would matter, not by difficulty.
 
@@ -348,17 +447,19 @@ Ordered by how soon each would matter, not by difficulty.
 
 ---
 
-## 10. Where each of these came from
+## 11. Where each of these came from
 
 - Hybrid IDS: `backend/detection/` module docstrings; signature engine
   firing-rate measurements (20.0% -> 0.56%) run directly against real
-  friday-morning flows during this pass, not estimated; full-suite counts
-  (662 default posture / 677 with live Postgres) verified twice — the
-  first live-DB run surfaced one more pre-existing row-count assumption
-  (test_live_roundtrip_persists_events_and_scores, the same class of
-  issue as 4 default-posture tests fixed earlier in this pass) that the
-  default-posture run alone could not have caught, since that test is
-  gated on AEGIS_TEST_LIVE_DB=1
+  friday-morning flows during this pass, not estimated
+- IPS layer: `backend/ips/` module docstrings; full-suite counts (720
+  default posture / 735 with live Postgres) measured directly after this
+  pass, both fully green — one pre-existing test in each of
+  `tests/test_api.py` (`IngestCountersOut`'s hardcoded field dict) and
+  `tests/test_backend_models.py` (the "five tables" assertion) needed
+  updating for the new `ips_*` counters and the new `ips_actions` table,
+  same class of maintenance CLAUDE.md §8 already documents as expected,
+  not a regression
 - Detection numbers: `docs/DETECTION_STUDY.md`, `docs/EVALUATION.md`
 - CII engine details: `src/cii_calculator.py`, `CLAUDE.md` §4
 - Operations Console history: `docs/PHASE5_STATE.md` (per-ticket build log)

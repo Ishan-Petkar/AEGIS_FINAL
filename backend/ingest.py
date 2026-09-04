@@ -82,7 +82,7 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional, Protocol, Sequence
 
 import numpy as np
@@ -107,7 +107,17 @@ from backend.detection.contracts import (
 )
 from backend.detection.fusion import HybridFusionEngine
 from backend.detection.signature import SignatureEngine
-from backend.models import Alert, CiiSnapshot, Event, EventScore
+from backend.ips.contracts import (
+    ACTIVE_PREVENTION_ACTIONS,
+    PREVENTION_SEVERITY,
+    ActionStatus,
+    EnforcementAdapter,
+    PreventionAction,
+    PreventionDecision,
+)
+from backend.ips.enforcement import SimulatedEnforcementAdapter
+from backend.ips.policy import IPSPolicyEngine
+from backend.models import Alert, CiiSnapshot, Event, EventScore, IpsAction
 from backend.replay_engine import BatchMeta
 from backend.replay_reader import ReplayFlow
 from backend.retention import prune_events
@@ -158,6 +168,12 @@ _HYBRID_DETECTOR_NAMES = (DETECTOR_SIGNATURE, DETECTOR_BEACONING, DETECTOR_HYBRI
 ENVELOPE_EVENT = "event"
 ENVELOPE_ALERT = "alert"
 ENVELOPE_CII = "cii"
+#: The IPS layer's own envelope (backend/ips/). Broadcast for every
+#: APPROVED prevention decision (ALERT/RATE_LIMIT/BLOCK/QUARANTINE — never
+#: OBSERVE, mirrored from what `_apply_ips_action` persists), plus one
+#: more time on automatic TTL expiry and on a manual rollback via
+#: POST /api/ips/actions/{id}/rollback — see `_ips_action_envelope`.
+ENVELOPE_IPS_ACTION = "ips_action"
 
 SEVERITY_CRITICAL = "critical"
 SEVERITY_WARNING = "warning"
@@ -251,6 +267,18 @@ class BatchResult:
     hybrid_beaconing_hits: int = 0
     hybrid_likely_or_above: int = 0
     hybrid_gated_alerts: int = 0
+    #: IPS (backend/ips/) per-batch counters. All zero when
+    #: ips_enabled=False, or whenever `fused_decisions` is None (the IPS
+    #: layer consumes Hybrid IDS output — see backend/ips/policy.py's
+    #: module docstring — so it never runs without it, independent of
+    #: ips_enabled's own value).
+    ips_decisions: int = 0
+    ips_actions_enforced: int = 0
+    ips_actions_simulated: int = 0
+    ips_actions_duplicate_suppressed: int = 0
+    ips_actions_escalated: int = 0
+    ips_actions_failed: int = 0
+    ips_actions_expired: int = 0
 
 
 @dataclass
@@ -282,6 +310,13 @@ class IngestStats:
     hybrid_beaconing_hits: int = 0
     hybrid_likely_or_above: int = 0
     hybrid_gated_alerts: int = 0
+    ips_decisions: int = 0
+    ips_actions_enforced: int = 0
+    ips_actions_simulated: int = 0
+    ips_actions_duplicate_suppressed: int = 0
+    ips_actions_escalated: int = 0
+    ips_actions_failed: int = 0
+    ips_actions_expired: int = 0
 
     def absorb(self, result: BatchResult) -> None:
         self.batches += 1
@@ -298,6 +333,17 @@ class IngestStats:
         self.hybrid_beaconing_hits += result.hybrid_beaconing_hits
         self.hybrid_likely_or_above += result.hybrid_likely_or_above
         self.hybrid_gated_alerts += result.hybrid_gated_alerts
+        self.ips_decisions += result.ips_decisions
+        self.ips_actions_enforced += result.ips_actions_enforced
+        self.ips_actions_simulated += result.ips_actions_simulated
+        self.ips_actions_duplicate_suppressed += result.ips_actions_duplicate_suppressed
+        self.ips_actions_escalated += result.ips_actions_escalated
+        self.ips_actions_failed += result.ips_actions_failed
+        # ips_actions_expired is NOT absorbed from BatchResult — expiry is
+        # driven by wall-clock TTL, not batch volume, and is applied
+        # directly against the live self._stats by `_maybe_expire_ips_actions`
+        # (mirroring how `events_pruned` is added directly in
+        # `ingest_batch`, not threaded through BatchResult either).
 
 
 @dataclass
@@ -307,6 +353,24 @@ class _CacheEntry:
     result: CIIResult
     snapshot_id: Optional[int]
     computed_at: float
+
+
+@dataclass
+class _IpsActionState:
+    """One active-mitigation registry entry (`IngestPipeline.
+    _active_ips_actions`, keyed by target asset).
+
+    `expires_at` is in the SAME clock domain as `self._clock()` (monotonic
+    seconds, injectable for tests — matching `_CacheEntry.computed_at`
+    and `_last_alert_at`'s values), NOT a wall-clock `datetime`; the
+    persisted `IpsAction.expires_at` column is the wall-clock twin of
+    this, computed once at creation time from `datetime.now(timezone.utc)
+    + timedelta(seconds=ttl_sec)`.
+    """
+
+    action: PreventionAction
+    action_id: Optional[int]
+    expires_at: Optional[float]
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +491,36 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _ips_action_envelope(row: IpsAction) -> dict[str, Any]:
+    """Build an `ips_action` WebSocket envelope from a persisted (and
+    flushed -- `row.id` must already be set) `IpsAction` row. Shared by
+    every call site that broadcasts one: a freshly-created action
+    (`_apply_ips_action`), an expired one (`_maybe_expire_ips_actions`),
+    and a manually rolled-back one (`POST /api/ips/actions/{id}/rollback`
+    in backend/routes.py), so the shape is identical regardless of why
+    the row changed -- same "split out to avoid writing the dict literal
+    twice" rationale as `_publish_cii_envelope`.
+    """
+    return {
+        "type": ENVELOPE_IPS_ACTION,
+        "data": {
+            "id": row.id,
+            "ts": row.ts.isoformat(),
+            "target_asset": row.target_asset,
+            "action": row.action,
+            "status": row.status,
+            "reason": row.reason,
+            "evidence": row.evidence,
+            "confidence": row.confidence,
+            "dry_run": row.dry_run,
+            "triggering_event_id": row.triggering_event_id,
+            "expires_at": row.expires_at.isoformat() if row.expires_at else None,
+            "rolled_back_at": row.rolled_back_at.isoformat() if row.rolled_back_at else None,
+            "rollback_reason": row.rollback_reason,
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # IngestPipeline
 # ---------------------------------------------------------------------------
@@ -477,6 +571,17 @@ class IngestPipeline:
     clock:
         Monotonic seconds source for the debounce windows. Injectable so
         debounce tests need no `sleep()`.
+    ips_enabled, ips_dry_run, ips_active_action_cache_max_entries:
+        Optional overrides for the matching `BACKEND_SETTINGS.ips_*`
+        fields (backend/ips/). `ips_enabled=False` (the default) makes
+        the IPS layer a complete no-op, mirroring `hybrid_enabled`'s role
+        for the Hybrid IDS layer — see backend/ips/policy.py's module
+        docstring.
+    policy_engine, enforcement_adapter:
+        Optional injected `IPSPolicyEngine` / `EnforcementAdapter`
+        (backend/ips/), same injectable-optional-override pattern as
+        `signature_engine`/`beaconing_detector`/`fusion_engine` above —
+        a fresh default instance of each is constructed when omitted.
     """
 
     def __init__(
@@ -500,6 +605,11 @@ class IngestPipeline:
         signature_engine: Optional[SignatureEngine] = None,
         beaconing_detector: Optional[BeaconingDetector] = None,
         fusion_engine: Optional[HybridFusionEngine] = None,
+        ips_enabled: Optional[bool] = None,
+        ips_dry_run: Optional[bool] = None,
+        ips_active_action_cache_max_entries: Optional[int] = None,
+        policy_engine: Optional[IPSPolicyEngine] = None,
+        enforcement_adapter: Optional[EnforcementAdapter] = None,
     ) -> None:
         if scorer is None:
             raise ValueError("IngestPipeline requires a fitted StreamingScorer")
@@ -584,6 +694,33 @@ class IngestPipeline:
         self._beaconing_detector = beaconing_detector or BeaconingDetector()
         self._fusion_engine = fusion_engine or HybridFusionEngine()
 
+        # ---- IPS (backend/ips/) -----------------------------------------
+        # Same optional-override / BACKEND_SETTINGS-fallback pattern as
+        # the Hybrid IDS block above. `ips_enabled=False` by default
+        # (unlike `hybrid_enabled=True`) — see backend/config.py's
+        # `ips_enabled` docstring for why this layer ships opt-in rather
+        # than on-but-advisory. `IPSPolicyEngine` and
+        # `SimulatedEnforcementAdapter` are both stateless/pure, so a
+        # fresh instance vs. an injected one behaves identically — held
+        # on `self` so tests can inject a double the same way
+        # `fusion_engine` already is.
+        self._ips_enabled = settings.ips_enabled if ips_enabled is None else ips_enabled
+        self._ips_dry_run = settings.ips_dry_run if ips_dry_run is None else ips_dry_run
+        self._ips_active_action_cache_max_entries = (
+            settings.ips_active_action_cache_max_entries
+            if ips_active_action_cache_max_entries is None
+            else ips_active_action_cache_max_entries
+        )
+        self._policy_engine = policy_engine or IPSPolicyEngine()
+        self._enforcement_adapter = enforcement_adapter or SimulatedEnforcementAdapter()
+        #: Active-mitigation registry, keyed by target asset — mirrors
+        #: `_cii_cache`/`_last_alert_at`'s bounded-OrderedDict shape
+        #: exactly. This is the ONLY place duplicate/conflicting-action
+        #: protection and TTL expiry are decided; `IPSPolicyEngine`
+        #: itself is stateless and knows nothing about it (see that
+        #: module's docstring).
+        self._active_ips_actions: "OrderedDict[str, _IpsActionState]" = OrderedDict()
+
         # The engine drives the consumer from its own replay thread, while
         # Ticket #16's /api/stats reads counters from a request thread.
         self._lock = threading.Lock()
@@ -661,9 +798,18 @@ class IngestPipeline:
                 supervised_scored=supervised_scored,
                 fused_decisions=fused_decisions,
             )
-            cii_outcomes, alert_outcomes = self._handle_anomalies(
-                session, scored, inserted_ids, resolutions, tripwire_fired, is_anomaly,
+            cii_outcomes, alert_outcomes, ips_outcomes = self._handle_anomalies(
+                session, scored, inserted_ids, resolutions, tripwire_fired, is_anomaly, meta,
                 fused_decisions=fused_decisions,
+            )
+            # IPS TTL sweep: cheap (in-memory registry, not a DB scan —
+            # see its docstring), so it runs every batch rather than being
+            # gated behind `_retention_check_every_n_batches` like
+            # `_maybe_prune`. Skipped entirely when the layer is off,
+            # matching every other IPS call site's `self._ips_enabled`
+            # guard.
+            expired_envelopes = (
+                self._maybe_expire_ips_actions(session) if self._ips_enabled else []
             )
             pruned = self._maybe_prune(session)
 
@@ -672,7 +818,12 @@ class IngestPipeline:
             scored, inserted_ids, resolutions, tripwire_fired, is_anomaly, confidence, meta,
             fused_decisions=fused_decisions,
         )
-        for envelope in cii_outcomes.envelopes + alert_outcomes.envelopes:
+        for envelope in (
+            cii_outcomes.envelopes
+            + alert_outcomes.envelopes
+            + ips_outcomes.envelopes
+            + expired_envelopes
+        ):
             self._safe_publish(envelope)
 
         hybrid_signature_hits = 0
@@ -702,6 +853,12 @@ class IngestPipeline:
             hybrid_beaconing_hits=hybrid_beaconing_hits,
             hybrid_likely_or_above=hybrid_likely_or_above,
             hybrid_gated_alerts=alert_outcomes.hybrid_gated,
+            ips_decisions=ips_outcomes.decisions,
+            ips_actions_enforced=ips_outcomes.enforced,
+            ips_actions_simulated=ips_outcomes.simulated,
+            ips_actions_duplicate_suppressed=ips_outcomes.duplicate_suppressed,
+            ips_actions_escalated=ips_outcomes.escalated,
+            ips_actions_failed=ips_outcomes.failed,
         )
         with self._lock:
             self._stats.absorb(result)
@@ -1050,8 +1207,9 @@ class IngestPipeline:
         resolutions: list[tuple[Any, Any]],
         tripwire_fired: np.ndarray,
         is_anomaly: np.ndarray,
+        meta: BatchMeta,
         fused_decisions: Optional[Sequence[FusedDecision]] = None,
-    ) -> tuple["_CiiOutcome", "_AlertOutcome"]:
+    ) -> tuple["_CiiOutcome", "_AlertOutcome", "_IpsOutcome"]:
         """See the module docstring for the existing tripwire/volumetric
         policy. `fused_decisions`, when supplied, additionally widens
         this loop to flows the EXISTING channels did not flag
@@ -1063,9 +1221,22 @@ class IngestPipeline:
         Monte Carlo for a known-in-advance non-event is pure waste).
         Flows already covered by `is_anomaly[i]` are completely
         unaffected -- they take the exact branch this method always has.
+
+        IPS (backend/ips/): computed for EVERY flow that reaches this far
+        in the loop (both the `is_anomaly[i]` and `hybrid_candidate`
+        branches), immediately after `cii_result` -- unlike the alert
+        decision, which is branch-specific and may suppress/gate, the IPS
+        decision is evaluated independent of whether an alert is actually
+        created, per the target architecture (Risk + CII -> IPS Policy
+        Engine -> Prevention Decision, not gated behind "and an alert
+        exists"). It is a complete no-op whenever `ips_enabled` is False
+        or `fused_decisions` is None (Hybrid IDS disabled) -- see
+        `_compute_ips_decision`'s docstring for why the IPS layer
+        structurally cannot run without the Hybrid IDS layer's output.
         """
         cii_outcome = _CiiOutcome()
         alert_outcome = _AlertOutcome()
+        ips_outcome = _IpsOutcome()
 
         for i, scored_flow in enumerate(scored):
             hybrid_candidate = (
@@ -1092,6 +1263,16 @@ class IngestPipeline:
             snapshot_id, cii_result = self._cii_for(
                 session, origin_asset, scored_flow, event_id, cii_outcome
             )
+
+            if self._ips_enabled and fused_decisions is not None:
+                ips_decision = self._compute_ips_decision(
+                    fused_decisions[i],
+                    origin_asset,
+                    resolutions[i][0].criticality,
+                    cii_result,
+                )
+                if ips_decision is not None:
+                    self._apply_ips_action(session, ips_decision, event_id, meta, ips_outcome)
 
             if is_anomaly[i]:
                 # Broadcast the cii envelope BEFORE the alert-suppression
@@ -1176,7 +1357,252 @@ class IngestPipeline:
                     },
                 }
             )
-        return cii_outcome, alert_outcome
+        return cii_outcome, alert_outcome, ips_outcome
+
+    # ------------------------------------------------------------------
+    # IPS (backend/ips/) -- decision, enforcement, persistence, expiry
+    # ------------------------------------------------------------------
+
+    def _compute_ips_decision(
+        self,
+        fused: FusedDecision,
+        origin_asset: str,
+        asset_criticality: float,
+        cii_result: Optional[CIIResult],
+    ) -> Optional[PreventionDecision]:
+        """Ask the policy engine what to do about `origin_asset`, or
+        `None` if there is nothing to persist (`PreventionAction.OBSERVE`
+        -- see `PreventionDecision`'s docstring for why OBSERVE decisions
+        are not audit-worthy in the same way ALERT/RATE_LIMIT/BLOCK/
+        QUARANTINE are, mirroring how a below-threshold volumetric score
+        never gets its own `alerts` row either).
+
+        `IPSPolicyEngine` itself never sees a raw flow or re-runs
+        detection -- only the already-fused `FusedDecision` plus the two
+        numbers this method already has to hand, per the requirement's
+        "Consume Hybrid IDS outputs ... rather than implementing
+        independent attack detection."
+        """
+        decision = self._policy_engine.decide(
+            fused,
+            target_asset=origin_asset,
+            asset_criticality=asset_criticality,
+            cii_median=(float(cii_result.cii_median) if cii_result is not None else None),
+        )
+        if decision.action == PreventionAction.OBSERVE:
+            return None
+        return decision
+
+    def _apply_ips_action(
+        self,
+        session: Any,
+        decision: PreventionDecision,
+        event_id: int,
+        meta: BatchMeta,
+        outcome: "_IpsOutcome",
+    ) -> None:
+        """Apply one `PreventionDecision`: duplicate/conflict check against
+        the active-mitigation registry, enforcement (fail-open), audit
+        persistence, and envelope collection.
+
+        Duplicate/conflicting-action protection (the requirement's own
+        phrase): if `origin_asset` already has an active action at the
+        same or higher severity (`PREVENTION_SEVERITY`), this decision is
+        a no-op -- counted, never persisted, never re-enforced. A
+        strictly higher-severity decision supersedes the existing one
+        (its DB row is marked SUPERSEDED, not deleted -- the audit trail
+        keeps every decision that was ever approved) before the new one
+        is applied. This check runs even for a plain ALERT decision
+        (severity 1): a corroborated-but-not-yet-block-worthy signal
+        against an asset already under RATE_LIMIT should not re-persist
+        a redundant ALERT row every batch.
+        """
+        existing = self._active_ips_actions.get(decision.target_asset)
+        new_severity = PREVENTION_SEVERITY[decision.action]
+        if existing is not None and PREVENTION_SEVERITY[existing.action] >= new_severity:
+            outcome.duplicate_suppressed += 1
+            return
+
+        superseded_id = None
+        if existing is not None:
+            # Escalation: the existing (lower-severity) action is
+            # superseded, not silently overwritten -- its row stays in
+            # the audit trail with a terminal status.
+            superseded_id = existing.action_id
+            outcome.escalated += 1
+
+        dry_run = self._ips_dry_run or not decision.is_active_prevention
+        try:
+            result = self._enforcement_adapter.apply(decision, dry_run=dry_run)
+        except Exception:
+            # Fail-open (the requirement's "graceful/fail-safe handling
+            # when enforcement fails"): an adapter bug must never abort
+            # the batch or block ordinary ingest -- unlike a persistence
+            # failure (see the module docstring, "Failure semantics"),
+            # a failed ENFORCEMENT attempt is recorded and swallowed, not
+            # raised. `SimulatedEnforcementAdapter.apply()` itself cannot
+            # raise (see its docstring), so reaching this branch means a
+            # different adapter was injected and it misbehaved.
+            logger.error(
+                "ips: enforcement adapter raised for %s -> %s; failing open",
+                decision.target_asset,
+                decision.action.value,
+                exc_info=True,
+            )
+            result_status = ActionStatus.FAILED
+            result_detail = "enforcement adapter raised an exception; action not applied"
+            outcome.failed += 1
+        else:
+            result_status = result.status
+            result_detail = result.detail
+            if result_status == ActionStatus.ENFORCED:
+                outcome.enforced += 1
+            elif result_status == ActionStatus.SIMULATED:
+                outcome.simulated += 1
+            else:
+                outcome.failed += 1
+
+        now_wall = meta.emitted_at
+        expires_at = (
+            now_wall + timedelta(seconds=decision.ttl_sec) if decision.ttl_sec else None
+        )
+        row = IpsAction(
+            ts=now_wall,
+            target_asset=decision.target_asset,
+            action=decision.action.value,
+            status=result_status.value,
+            reason=f"{decision.reason} [{result_detail}]",
+            evidence=_jsonable(dict(decision.evidence)),
+            confidence=decision.confidence,
+            dry_run=dry_run,
+            triggering_event_id=event_id,
+            replay_session_id=meta.replay_session_id,
+            expires_at=expires_at,
+        )
+        session.add(row)
+        session.flush()  # need row.id for the broadcast envelope + registry
+
+        if superseded_id is not None:
+            superseded_row = session.get(IpsAction, superseded_id)
+            if superseded_row is not None:
+                superseded_row.status = ActionStatus.SUPERSEDED.value
+                superseded_row.rolled_back_at = now_wall
+                superseded_row.rollback_reason = f"superseded by action {row.id}"
+
+        # Active-mitigation registry: only ACTIVE prevention (RATE_LIMIT/
+        # BLOCK/QUARANTINE) is tracked here -- a plain ALERT decision is
+        # persisted (above) for the audit trail but never occupies a
+        # registry slot, so it can never block or need to be superseded
+        # by a later real prevention action against the same asset.
+        if decision.is_active_prevention:
+            self._active_ips_actions[decision.target_asset] = _IpsActionState(
+                action=decision.action,
+                action_id=row.id,
+                expires_at=(self._clock() + decision.ttl_sec if decision.ttl_sec else None),
+            )
+            self._active_ips_actions.move_to_end(decision.target_asset)
+            while len(self._active_ips_actions) > self._ips_active_action_cache_max_entries:
+                self._active_ips_actions.popitem(last=False)
+
+        outcome.decisions += 1
+        outcome.envelopes.append(_ips_action_envelope(row))
+
+    def _maybe_expire_ips_actions(self, session: Any) -> list[dict[str, Any]]:
+        """Sweep the active-mitigation registry for TTL-expired entries,
+        mark their DB rows EXPIRED, roll them back via the enforcement
+        adapter, and return the `ips_action` envelopes to broadcast.
+
+        Called once per batch (cheap: iterates an in-memory OrderedDict,
+        not a DB scan -- the registry IS the live set of candidates,
+        mirroring how `_debounce_ok` never queries the database either).
+        A row that expires is looked up by id and updated in place, same
+        pattern `_apply_ips_action` already uses for a superseded row.
+        """
+        now = self._clock()
+        expired_assets = [
+            asset
+            for asset, state in self._active_ips_actions.items()
+            if state.expires_at is not None and state.expires_at <= now
+        ]
+        if not expired_assets:
+            return []
+
+        envelopes: list[dict[str, Any]] = []
+        for asset in expired_assets:
+            state = self._active_ips_actions.pop(asset)
+            self._enforcement_adapter.rollback(asset, state.action)
+            if state.action_id is None:
+                continue
+            row = session.get(IpsAction, state.action_id)
+            if row is None:
+                continue
+            row.status = ActionStatus.EXPIRED.value
+            row.rolled_back_at = datetime.now(timezone.utc)
+            row.rollback_reason = "TTL expired"
+            envelopes.append(_ips_action_envelope(row))
+        with self._lock:
+            self._stats.ips_actions_expired += len(envelopes)
+        return envelopes
+
+    def rollback_ips_action(
+        self, action_id: int, reason: Optional[str] = None
+    ) -> Optional[dict[str, Any]]:
+        """Manual operator rollback (`POST /api/ips/actions/{id}/rollback`,
+        backend/routes.py) — the requirement's "unblock/rollback" control.
+
+        Returns the `ips_action` envelope for the caller to broadcast (the
+        route publishes it via the same `Broadcaster` this pipeline
+        already holds — see `backend/routes.py`), or `None` if `action_id`
+        does not exist (the route turns that into a 404) or is not a
+        currently-active ACTIVE-PREVENTION action — either already
+        terminal (rolled back / expired / superseded) or an `alert`-tier
+        decision that was never enforced in the first place, so there is
+        nothing to unblock (the route turns both into a 409, since
+        re-rolling-back an already-inactive action is not a legitimate
+        no-op the way stopping an already-stopped replay is: an operator
+        asking to unblock something that is not currently blocking
+        anything is telling us our active-mitigation state disagrees
+        with theirs, which is worth surfacing, not silently swallowing).
+
+        Public (unlike `_apply_ips_action`/`_maybe_expire_ips_actions`)
+        because it is the one IPS operation genuinely triggered from
+        OUTSIDE the ingest batch loop — an HTTP route, not a replay
+        batch — so it opens its own short-lived session rather than
+        requiring a caller-supplied one.
+        """
+        with self._session_factory() as session:
+            row = session.get(IpsAction, action_id)
+            if row is None:
+                return None
+            if row.status not in (ActionStatus.SIMULATED.value, ActionStatus.ENFORCED.value):
+                return None
+            if PreventionAction(row.action) not in ACTIVE_PREVENTION_ACTIONS:
+                return None
+            row.status = ActionStatus.ROLLED_BACK.value
+            row.rolled_back_at = datetime.now(timezone.utc)
+            row.rollback_reason = reason or "manual operator rollback"
+            action = PreventionAction(row.action)
+            target_asset = row.target_asset  # read while still attached -- see note below
+            envelope = _ips_action_envelope(row)
+        # `row` is DETACHED once the `with` block above exits (session_scope
+        # commits and closes) -- every attribute access below must go
+        # through `target_asset`/`action`/`envelope`, captured above,
+        # never `row.*` again.
+
+        self._enforcement_adapter.rollback(target_asset, action)
+        existing = self._active_ips_actions.get(target_asset)
+        if existing is not None and existing.action_id == action_id:
+            del self._active_ips_actions[target_asset]
+        return envelope
+
+    def active_ips_actions(self) -> dict[str, str]:
+        """Snapshot of the active-mitigation registry — `{target_asset:
+        action}` for every asset currently under RATE_LIMIT/BLOCK/
+        QUARANTINE. Read by `GET /api/ips/actions?active=true`
+        (backend/routes.py) as a cheap in-memory cross-check against the
+        DB query it also runs, and by tests."""
+        with self._lock:
+            return {asset: state.action.value for asset, state in self._active_ips_actions.items()}
 
     @staticmethod
     def _publish_cii_envelope(
@@ -1614,6 +2040,20 @@ class IngestPipeline:
     def cii_cache_size(self) -> int:
         return len(self._cii_cache)
 
+    def publish_envelope(self, envelope: dict[str, Any]) -> None:
+        """Publish one envelope through this pipeline's `Broadcaster`,
+        outside the normal `ingest_batch` flow. The one real caller is
+        `POST /api/ips/actions/{id}/rollback` (backend/routes.py): a
+        manual rollback is a state change triggered from an HTTP request,
+        not a replay batch, so there is no `ingest_batch` call underway
+        to append the envelope to — this is the public seam that lets the
+        route push it live anyway, going through the same `_safe_publish`
+        failure-isolation every other envelope does (a dead WebSocket
+        must not turn a successful, already-committed rollback into a
+        500).
+        """
+        self._safe_publish(envelope)
+
 
 @dataclass
 class _CiiOutcome:
@@ -1632,4 +2072,18 @@ class _AlertOutcome:
     #: tripwire nor the volumetric channel would have alerted on that
     #: flow by itself. Always 0 when hybrid_gates_alerts is False.
     hybrid_gated: int = 0
+    envelopes: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class _IpsOutcome:
+    """Per-batch IPS (backend/ips/) outcome — see `IngestStats`'s matching
+    `ips_*` fields for what each counter means."""
+
+    decisions: int = 0
+    enforced: int = 0
+    simulated: int = 0
+    duplicate_suppressed: int = 0
+    escalated: int = 0
+    failed: int = 0
     envelopes: list[dict[str, Any]] = field(default_factory=list)

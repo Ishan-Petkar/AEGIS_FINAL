@@ -953,6 +953,201 @@ class BackendSettings(BaseSettings):
         ),
     )
 
+    # ---- IPS: prevention policy layer --------------------------------------
+    # Sits downstream of the Hybrid IDS layer above: `IPSPolicyEngine`
+    # (backend/ips/policy.py) consumes a `FusedDecision` (already fused,
+    # already weighted) plus asset criticality and CII median impact, and
+    # decides among observe / alert / rate-limit / block / quarantine. See
+    # that module's docstring for the full decision tree; the fields below
+    # are its configurable inputs, following the exact optional-override /
+    # BACKEND_SETTINGS-fallback convention the Hybrid IDS fields above use.
+    ips_enabled: bool = Field(
+        default=False,
+        description=(
+            "Master switch for the IPS (prevention) layer. When False, no "
+            "IPS decision is ever computed, persisted, enforced, or "
+            "broadcast — the pipeline behaves exactly as it did before "
+            "this layer existed, mirroring hybrid_enabled's role for the "
+            "Hybrid IDS layer. Off by default: unlike the advisory Hybrid "
+            "IDS layer, this layer can actively act on a decision (even if "
+            "only in simulation via ips_dry_run below), so it ships opt-in "
+            "rather than on-but-non-authoritative."
+        ),
+    )
+    ips_dry_run: bool = Field(
+        default=True,
+        description=(
+            "When True (default), every IPS decision is still computed, "
+            "persisted, and broadcast exactly as normal, but the "
+            "enforcement adapter is told this is a simulation and the "
+            "pipeline's active-mitigation registry (which flows treat an "
+            "asset as already actioned) is updated for bookkeeping only — "
+            "no separate code path is skipped, since this environment has "
+            "no real network fabric to act on regardless (see "
+            "backend/ips/enforcement.py). Independent of ips_enabled: an "
+            "operator can leave the layer enabled-but-simulated "
+            "indefinitely, which is the requirement's own 'validate first "
+            "in dry-run mode' step made a persistent, not one-shot, "
+            "posture."
+        ),
+    )
+    ips_min_corroborating_detectors: int = Field(
+        default=2,
+        ge=1,
+        le=5,
+        description=(
+            "Minimum independently-fired detectors (out of the five "
+            "Hybrid IDS channels) required before the IPS layer will "
+            "consider ACTIVE prevention (rate-limit/block/quarantine) — "
+            "unless the fused decision already carries a "
+            "Certainty.CONFIRMED signal (the honeytoken tripwire), which "
+            "always corroborates on its own. This is what stops a single "
+            "miscalibrated heuristic detector from ever triggering a block "
+            "by itself; it is not a threshold and cannot be tuned away by "
+            "relaxing threat_score cutoffs alone — see IPSPolicyEngine."
+        ),
+    )
+    ips_rate_limit_min_threat_score: float = Field(
+        default=0.55,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Fused threat_score at or above which a corroborated decision "
+            "qualifies for RATE_LIMIT. Matches hybrid_band_likely by "
+            "default (the same score that already clears the existing "
+            "Hybrid IDS alert band), not a separately tuned number, so "
+            "'the fused layer says LIKELY or above, and it is "
+            "corroborated' is what unlocks active prevention at all."
+        ),
+    )
+    ips_block_min_threat_score: float = Field(
+        default=0.85,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Fused threat_score at or above which a corroborated decision "
+            "qualifies for BLOCK (subject also to "
+            "ips_block_min_asset_criticality) or QUARANTINE (subject also "
+            "to the quarantine-specific criticality and CII floors below). "
+            "Matches hybrid_band_confirmed by default."
+        ),
+    )
+    ips_block_min_asset_criticality: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum target-asset criticality (cii_calculator's "
+            "criticality map, 0-1) required, alongside "
+            "ips_block_min_threat_score, before BLOCK is considered. A "
+            "low-value/auto-discovered asset (e.g. an Unresolved_<ip> "
+            "node, criticality 0.1) never reaches BLOCK under the default "
+            "policy even at threat_score 1.0 — it can still reach "
+            "RATE_LIMIT."
+        ),
+    )
+    ips_quarantine_min_asset_criticality: float = Field(
+        default=0.85,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum target-asset criticality required, alongside "
+            "ips_block_min_threat_score and ips_quarantine_min_cii_median, "
+            "before QUARANTINE (the strongest, most disruptive tier — "
+            "isolating the asset entirely) is considered. Enforced to sit "
+            "at or above ips_block_min_asset_criticality by "
+            "_check_ips_thresholds_ordered below — quarantine must never "
+            "be reachable by an asset that would not already qualify for "
+            "the lesser BLOCK action."
+        ),
+    )
+    ips_quarantine_min_cii_median: float = Field(
+        default=0.10,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum CII median (fraction of the city's total criticality "
+            "mass projected to cascade, see cii_calculator.py) required "
+            "before QUARANTINE is considered, alongside the criticality "
+            "floor above. Guards against isolating an intrinsically "
+            "critical asset whose CURRENT projected blast radius is near "
+            "zero — e.g. every downstream dependent is already isolated, "
+            "or the asset is a structural leaf right now — where isolating "
+            "it further would remove an operator's own visibility into it "
+            "without containing anything additional."
+        ),
+    )
+    ips_rate_limit_ttl_sec: float = Field(
+        default=900.0,
+        gt=0.0,
+        description=(
+            "How long a RATE_LIMIT action stays active before it "
+            "automatically expires (the requirement's 'temporary actions "
+            "with TTL/expiry'). 15 minutes — long enough to matter during "
+            "a live incident, short enough that a stale action from an "
+            "old, already-resolved compromise does not linger indefinitely "
+            "with no operator involvement."
+        ),
+    )
+    ips_block_ttl_sec: float = Field(
+        default=1800.0,
+        gt=0.0,
+        description=(
+            "TTL for a BLOCK action. 30 minutes — longer than "
+            "RATE_LIMIT's, reflecting the stronger evidence bar BLOCK "
+            "already requires to trigger at all."
+        ),
+    )
+    ips_quarantine_ttl_sec: float = Field(
+        default=3600.0,
+        gt=0.0,
+        description=(
+            "TTL for a QUARANTINE action, the most disruptive tier. 1 "
+            "hour — long enough that an operator has real time to review "
+            "before it auto-expires, short enough that an unreviewed "
+            "isolation cannot silently become permanent."
+        ),
+    )
+    ips_active_action_cache_max_entries: int = Field(
+        default=2000,
+        ge=10,
+        le=200_000,
+        description=(
+            "LRU cap on IngestPipeline's in-memory active-mitigation "
+            "registry (keyed by target asset). Same rationale as "
+            "cii_cache_max_entries / the alert debounce map: "
+            "AssetRegistry auto-registers one node per unique unresolved "
+            "IP, so an unbounded registry is an unbounded leak over a long "
+            "replay."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_ips_thresholds_ordered(self) -> "BackendSettings":
+        """Mirrors `_check_hybrid_bands_ordered` above: an out-of-order IPS
+        threshold does not raise anywhere downstream — it just makes a
+        tier unreachable or reachable in the wrong place — so it is
+        caught here, at construction, instead."""
+        if not (
+            self.ips_rate_limit_min_threat_score <= self.ips_block_min_threat_score
+        ):
+            raise ValueError(
+                "ips_rate_limit_min_threat_score "
+                f"({self.ips_rate_limit_min_threat_score}) must be <= "
+                f"ips_block_min_threat_score ({self.ips_block_min_threat_score})"
+            )
+        if not (
+            self.ips_block_min_asset_criticality
+            <= self.ips_quarantine_min_asset_criticality
+        ):
+            raise ValueError(
+                "ips_block_min_asset_criticality "
+                f"({self.ips_block_min_asset_criticality}) must be <= "
+                "ips_quarantine_min_asset_criticality "
+                f"({self.ips_quarantine_min_asset_criticality})"
+            )
+        return self
+
     @model_validator(mode="after")
     def _check_hybrid_bands_ordered(self) -> "BackendSettings":
         """Band thresholds must be strictly increasing.

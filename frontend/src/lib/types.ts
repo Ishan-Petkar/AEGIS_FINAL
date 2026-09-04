@@ -325,6 +325,23 @@ export interface EventEnvelopeData {
    * this field exists to prevent.
    */
   batch_origin: string;
+  /**
+   * Hybrid IDS layer summary (backend/detection/), additive — `null` when
+   * `hybrid_enabled=False`. A compact per-flow snapshot of the fused
+   * decision across all five detection channels; the full per-verdict
+   * evidence lives on the alert this may have produced, not here (this
+   * key is broadcast on EVERY event at up to ~2000/s, so it stays small
+   * — see backend/ingest.py `_broadcast_batch`'s own docstring). This
+   * field existed on the wire since the Hybrid IDS layer shipped but had
+   * no frontend type until this pass — nothing before this read it.
+   */
+  hybrid: {
+    threat_score: number;
+    band: string;
+    action: string;
+    fired_detectors: string[];
+    rationale: string;
+  } | null;
 }
 
 export interface AlertEnvelopeData {
@@ -349,6 +366,60 @@ export interface CiiEnvelopeData {
   trigger_event_id: number | null;
 }
 
+// ---------------------------------------------------------------------------
+// IPS (backend/ips/) — prevention layer. `ips_action` is broadcast once per
+// approved decision (ALERT/RATE_LIMIT/BLOCK/QUARANTINE — OBSERVE never
+// reaches the wire, see backend/ips/contracts.py's `PreventionDecision`
+// docstring), again on automatic TTL expiry, and again on a manual
+// POST /api/ips/actions/{id}/rollback.
+// ---------------------------------------------------------------------------
+
+export interface IpsActionEnvelopeData {
+  id: number;
+  ts: string;
+  target_asset: string;
+  /** "observe" | "alert" | "rate_limit" | "block" | "quarantine" (backend/ips/contracts.py PreventionAction) — "observe" never actually appears on the wire. */
+  action: string;
+  /** "simulated" | "enforced" | "failed" | "expired" | "rolled_back" | "superseded" (ActionStatus). */
+  status: string;
+  reason: string;
+  evidence: Record<string, unknown> | null;
+  confidence: number;
+  dry_run: boolean;
+  triggering_event_id: number | null;
+  expires_at: string | null;
+  rolled_back_at: string | null;
+  rollback_reason: string | null;
+}
+
+/** `GET /api/ips/actions` row shape (backend/schemas.py `IpsActionOut`) —
+ * identical to `IpsActionEnvelopeData` plus the two fields the live
+ * envelope omits, mirroring `AlertOut` vs. `AlertEnvelopeData`. */
+export interface IpsActionOut extends IpsActionEnvelopeData {
+  replay_session_id: string | null;
+}
+
+export interface IpsActionsResponse {
+  actions: IpsActionOut[];
+}
+
+/** `GET /api/ips/policy` (backend/schemas.py `IpsPolicyResponse`) — the
+ * live configured thresholds, for a UI that wants to explain a decision
+ * rather than just display it. */
+export interface IpsPolicyResponse {
+  enabled: boolean;
+  dry_run: boolean;
+  min_corroborating_detectors: number;
+  rate_limit_min_threat_score: number;
+  block_min_threat_score: number;
+  block_min_asset_criticality: number;
+  quarantine_min_asset_criticality: number;
+  quarantine_min_cii_median: number;
+  rate_limit_ttl_sec: number;
+  block_ttl_sec: number;
+  quarantine_ttl_sec: number;
+}
+
 export interface EventEnvelope {
   type: "event";
   data: EventEnvelopeData;
@@ -362,6 +433,11 @@ export interface AlertEnvelope {
 export interface CiiEnvelope {
   type: "cii";
   data: CiiEnvelopeData;
+}
+
+export interface IpsActionEnvelope {
+  type: "ips_action";
+  data: IpsActionEnvelopeData;
 }
 
 // ---------------------------------------------------------------------------
@@ -394,4 +470,9 @@ export interface HelloEnvelope {
   data: HelloEnvelopeData;
 }
 
-export type StreamEnvelope = EventEnvelope | AlertEnvelope | CiiEnvelope | HelloEnvelope;
+export type StreamEnvelope =
+  | EventEnvelope
+  | AlertEnvelope
+  | CiiEnvelope
+  | IpsActionEnvelope
+  | HelloEnvelope;

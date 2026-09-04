@@ -20,6 +20,9 @@ import type {
   HealthResponse,
   InjectRequest,
   InjectResponse,
+  IpsActionOut,
+  IpsActionsResponse,
+  IpsPolicyResponse,
   ReplayStatusResponse,
   ScenariosResponse,
   StatsResponse,
@@ -191,6 +194,43 @@ export function getAlerts(params?: {
  */
 export function ackAlert(id: number): Promise<AlertOut> {
   return apiFetch<AlertOut>(`/api/alerts/${id}/ack`, { method: "POST" });
+}
+
+/**
+ * GET /api/ips/actions?active=&target_asset=&limit= — the IPS (backend/
+ * ips/) prevention layer's action history / active-mitigation list.
+ */
+export function getIpsActions(params?: {
+  active?: boolean;
+  target_asset?: string;
+  limit?: number;
+}): Promise<IpsActionsResponse> {
+  const search = new URLSearchParams();
+  if (params?.active !== undefined) search.set("active", String(params.active));
+  if (params?.target_asset !== undefined) search.set("target_asset", params.target_asset);
+  if (params?.limit !== undefined) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return apiFetch<IpsActionsResponse>(`/api/ips/actions${qs ? `?${qs}` : ""}`);
+}
+
+/** GET /api/ips/policy — the live configured IPS thresholds. */
+export function getIpsPolicy(): Promise<IpsPolicyResponse> {
+  return apiFetch<IpsPolicyResponse>("/api/ips/policy");
+}
+
+/**
+ * POST /api/ips/actions/{id}/rollback — manual unblock/rollback. 404 if
+ * the action does not exist; 409 if it exists but is already terminal
+ * (rolled back, expired, superseded, or failed) — see
+ * `backend/routes.py::rollback_ips_action`'s docstring for why that is
+ * surfaced rather than treated as an idempotent no-op.
+ */
+export function rollbackIpsAction(id: number, reason?: string): Promise<IpsActionOut> {
+  return apiFetch<IpsActionOut>(`/api/ips/actions/${id}/rollback`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(reason !== undefined ? { reason } : {}),
+  });
 }
 
 /**

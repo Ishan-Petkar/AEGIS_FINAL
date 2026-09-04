@@ -76,7 +76,8 @@ from backend.ingest import (
     build_criticality_map,
     compute_risk_index,
 )
-from backend.models import Alert, Event, EventScore
+from backend.ips.contracts import ACTIVE_PREVENTION_ACTIONS, ActionStatus
+from backend.models import Alert, Event, EventScore, IpsAction
 from backend.replay_engine import ReplayEngineError, ReplayStatus
 from backend.runtime import AppRuntime
 from backend.security import enforce_rate_limit, require_api_token
@@ -93,6 +94,10 @@ from backend.schemas import (
     IngestCountersOut,
     InjectRequest,
     InjectResponse,
+    IpsActionOut,
+    IpsActionsResponse,
+    IpsPolicyResponse,
+    IpsRollbackRequest,
     ReplaySpeedRequest,
     ReplayStartRequest,
     ReplayStatusResponse,
@@ -485,6 +490,146 @@ def acknowledge_alert(
             alert.acknowledged = True
             alert.acknowledged_at = datetime.now(timezone.utc)
         return AlertOut.model_validate(alert)
+
+
+# ---------------------------------------------------------------------------
+# GET /api/ips/policy | GET /api/ips/actions | POST /api/ips/actions/{id}/rollback
+#
+# The IPS (prevention) layer's own routes (backend/ips/). Mirrors the
+# alerts routes immediately above wherever the shape matches (list +
+# filter, mutating-route deps, 404 on an unknown id) — deliberately not a
+# separate pattern.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/api/ips/policy", response_model=IpsPolicyResponse)
+def get_ips_policy() -> IpsPolicyResponse:
+    """The currently configured IPS thresholds — read straight from
+    `BACKEND_SETTINGS.ips_*`, never a second copy of these numbers. No DB,
+    no runtime/engine required (unlike the routes below), since this is
+    pure static configuration — same shape as `GET /api/inject/scenarios`.
+    """
+    s = BACKEND_SETTINGS
+    return IpsPolicyResponse(
+        enabled=s.ips_enabled,
+        dry_run=s.ips_dry_run,
+        min_corroborating_detectors=s.ips_min_corroborating_detectors,
+        rate_limit_min_threat_score=s.ips_rate_limit_min_threat_score,
+        block_min_threat_score=s.ips_block_min_threat_score,
+        block_min_asset_criticality=s.ips_block_min_asset_criticality,
+        quarantine_min_asset_criticality=s.ips_quarantine_min_asset_criticality,
+        quarantine_min_cii_median=s.ips_quarantine_min_cii_median,
+        rate_limit_ttl_sec=s.ips_rate_limit_ttl_sec,
+        block_ttl_sec=s.ips_block_ttl_sec,
+        quarantine_ttl_sec=s.ips_quarantine_ttl_sec,
+    )
+
+
+@router.get("/api/ips/actions", response_model=IpsActionsResponse)
+def list_ips_actions(
+    active: bool | None = Query(
+        default=None,
+        description=(
+            "True: only currently-active PREVENTION rows — action is "
+            "rate_limit/block/quarantine (not a bare 'alert' decision, "
+            "which is never enforced and has nothing to be 'active') AND "
+            "status is still simulated/enforced. False: everything else "
+            "(terminal rows, plus every 'alert'-only decision). Omitted "
+            "returns both."
+        ),
+    ),
+    target_asset: str | None = Query(
+        default=None, description="Filter to one target asset."
+    ),
+    limit: int = Query(
+        default=BACKEND_SETTINGS.api_alerts_default_limit,
+        ge=1,
+        le=BACKEND_SETTINGS.api_events_max_limit,
+        description="Max rows to return. Above the cap -> 422 (never silently clamped).",
+    ),
+    scope: Callable[[], ContextManager[Session]] = Depends(get_session_scope),
+) -> IpsActionsResponse:
+    """Action list, `ORDER BY ts DESC, id DESC` (same tie-break rationale
+    as `/api/events`/`/api/alerts`) — the requirement's "action history".
+    """
+    stmt = select(IpsAction).order_by(IpsAction.ts.desc(), IpsAction.id.desc()).limit(limit)
+    if target_asset is not None:
+        stmt = stmt.where(IpsAction.target_asset == target_asset)
+    active_action_values = tuple(a.value for a in ACTIVE_PREVENTION_ACTIONS)
+    active_status_values = (ActionStatus.SIMULATED.value, ActionStatus.ENFORCED.value)
+    if active is True:
+        stmt = stmt.where(
+            IpsAction.action.in_(active_action_values),
+            IpsAction.status.in_(active_status_values),
+        )
+    elif active is False:
+        stmt = stmt.where(
+            ~(
+                IpsAction.action.in_(active_action_values)
+                & IpsAction.status.in_(active_status_values)
+            )
+        )
+
+    with scope() as session:
+        rows = session.execute(stmt).scalars().all()
+        actions = [IpsActionOut.model_validate(row) for row in rows]
+    return IpsActionsResponse(actions=actions)
+
+
+@router.post(
+    "/api/ips/actions/{action_id}/rollback",
+    response_model=IpsActionOut,
+    dependencies=_MUTATING_ROUTE_DEPS,
+)
+def rollback_ips_action(
+    action_id: int,
+    body: IpsRollbackRequest = IpsRollbackRequest(),
+    runtime: AppRuntime = Depends(get_runtime),
+    scope: Callable[[], ContextManager[Session]] = Depends(get_session_scope),
+) -> IpsActionOut:
+    """Manually roll back / unblock an active IPS action — the
+    requirement's "unblock/rollback" control.
+
+    503 if the scorer never loaded (`_require_replay_engine`, mirroring
+    every other route that needs a live `IngestPipeline` — `pipeline` and
+    `engine` are set or left `None` together, see `AppRuntime`'s
+    docstring). 404 if the id does not exist. 409 if it exists but is
+    already in a terminal state (already rolled back / expired /
+    superseded / failed) — rolling back something not currently active is
+    not a legitimate no-op the way re-acking an alert is; it means the
+    operator's view of what's blocked disagrees with the system's, which
+    is worth surfacing.
+
+    Delegates the actual state change to `IngestPipeline.
+    rollback_ips_action` (not duplicated here) so the SAME code path
+    updates the active-mitigation registry, calls the enforcement
+    adapter's `rollback()`, and builds the envelope, regardless of
+    whether the rollback was triggered by this route or by TTL expiry
+    inside `ingest_batch` — one rollback implementation, two triggers.
+    """
+    _require_replay_engine(runtime)  # asserts a live pipeline exists — see docstring
+    envelope = runtime.pipeline.rollback_ips_action(action_id, reason=body.reason)
+    if envelope is None:
+        with scope() as session:
+            row = session.get(IpsAction, action_id)
+            # Read while still attached to `session` -- `row` itself must
+            # not be touched again once this block exits (same
+            # DetachedInstanceError risk `IngestPipeline.
+            # rollback_ips_action` documents at its own equivalent point).
+            status = row.status if row is not None else None
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"ips action {action_id} not found")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"ips action {action_id} is not active (status={status!r}); "
+                "nothing to roll back"
+            ),
+        )
+    runtime.pipeline.publish_envelope(envelope)
+    with scope() as session:
+        row = session.get(IpsAction, action_id)
+        return IpsActionOut.model_validate(row)
 
 
 # ---------------------------------------------------------------------------

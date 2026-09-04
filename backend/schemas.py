@@ -187,6 +187,66 @@ class AlertsResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# GET /api/ips/actions | POST /api/ips/actions/{id}/rollback | GET /api/ips/policy
+#
+# Mirrors AlertOut/AlertsResponse's own shape and from_attributes=True
+# convention exactly — `IpsActionOut.model_validate(row)` is called inside
+# the route handler for the identical DetachedInstanceError reason
+# documented in this module's own docstring above.
+# ---------------------------------------------------------------------------
+
+
+class IpsActionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    ts: datetime
+    target_asset: str
+    action: str
+    status: str
+    reason: str
+    evidence: Optional[dict[str, Any]]
+    confidence: float
+    dry_run: bool
+    triggering_event_id: Optional[int]
+    replay_session_id: Optional[UUID]
+    expires_at: Optional[datetime]
+    rolled_back_at: Optional[datetime]
+    rollback_reason: Optional[str]
+
+
+class IpsActionsResponse(BaseModel):
+    actions: list[IpsActionOut]
+
+
+class IpsRollbackRequest(BaseModel):
+    reason: Optional[str] = Field(
+        default=None,
+        max_length=500,
+        description="Optional operator note recorded as rollback_reason. Defaults to a generic 'manual operator rollback' when omitted.",
+    )
+
+
+class IpsPolicyResponse(BaseModel):
+    """GET /api/ips/policy — the currently configured IPS thresholds, read
+    straight from `BACKEND_SETTINGS.ips_*` (never a second copy of these
+    numbers) — lets an operator or the console confirm what policy is
+    live without cross-referencing `.env` / source."""
+
+    enabled: bool
+    dry_run: bool
+    min_corroborating_detectors: int
+    rate_limit_min_threat_score: float
+    block_min_threat_score: float
+    block_min_asset_criticality: float
+    quarantine_min_asset_criticality: float
+    quarantine_min_cii_median: float
+    rate_limit_ttl_sec: float
+    block_ttl_sec: float
+    quarantine_ttl_sec: float
+
+
+# ---------------------------------------------------------------------------
 # GET /api/cii/{asset}
 # ---------------------------------------------------------------------------
 
@@ -383,6 +443,16 @@ class IngestCountersOut(BaseModel):
     alerts_suppressed: int
     broadcast_failures: int
     events_pruned: int
+    #: IPS (backend/ips/) cumulative counters — always 0 when
+    #: ips_enabled=False. Mirrors how the hybrid_* counters above are
+    #: additive telemetry with no effect on the pre-existing fields.
+    ips_decisions: int = 0
+    ips_actions_enforced: int = 0
+    ips_actions_simulated: int = 0
+    ips_actions_duplicate_suppressed: int = 0
+    ips_actions_escalated: int = 0
+    ips_actions_failed: int = 0
+    ips_actions_expired: int = 0
 
 
 class AlertSeverityCount(BaseModel):

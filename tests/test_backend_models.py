@@ -39,13 +39,17 @@ from backend.seed import compute_seed_rows
 # ---------------------------------------------------------------------------
 
 
-def test_all_five_tables_registered():
+def test_all_six_tables_registered():
+    """Five original tables plus `ips_actions` (backend/ips/'s audit
+    trail, added this pass -- see IpsAction's own module-docstring
+    section in backend/models.py)."""
     assert set(Base.metadata.tables.keys()) == {
         "assets",
         "events",
         "event_scores",
         "cii_snapshots",
         "alerts",
+        "ips_actions",
     }
 
 
@@ -292,6 +296,77 @@ def test_alerts_composite_index_acknowledged_ts_desc():
     matching = [ix for ix in table.indexes if ix.name == "ix_alerts_acknowledged_ts_desc"]
     assert len(matching) == 1
     assert {c.name for c in matching[0].columns} == {"acknowledged", "ts"}
+
+
+# ---------------------------------------------------------------------------
+# ips_actions (backend/ips/'s audit trail)
+# ---------------------------------------------------------------------------
+
+
+def test_ips_actions_columns_and_fk_set_null():
+    cols = Base.metadata.tables["ips_actions"].columns
+    assert {
+        "id",
+        "ts",
+        "target_asset",
+        "action",
+        "status",
+        "reason",
+        "evidence",
+        "confidence",
+        "dry_run",
+        "triggering_event_id",
+        "replay_session_id",
+        "expires_at",
+        "rolled_back_at",
+        "rollback_reason",
+    } <= set(cols.keys())
+    fks = list(cols["triggering_event_id"].foreign_keys)
+    assert len(fks) == 1
+    assert fks[0].column.table.name == "events"
+    assert fks[0].ondelete == "SET NULL"
+    assert cols["triggering_event_id"].nullable is True
+
+
+def test_ips_actions_dry_run_not_null_default_true():
+    """Defaults to the SAFE value (dry_run=True), not False -- a raw SQL
+    INSERT omitting this column must never accidentally claim a real
+    enforcement action."""
+    cols = Base.metadata.tables["ips_actions"].columns
+    assert cols["dry_run"].nullable is False
+    assert cols["dry_run"].default is not None
+    assert cols["dry_run"].default.arg is True
+
+
+def test_ips_actions_dry_run_has_db_server_default_true():
+    cols = Base.metadata.tables["ips_actions"].columns
+    assert cols["dry_run"].server_default is not None
+    assert "true" in str(cols["dry_run"].server_default.arg).lower()
+
+
+def test_ips_actions_action_check_constraint_values():
+    table = Base.metadata.tables["ips_actions"]
+    constraints = [c for c in table.constraints if getattr(c, "name", None) == "ck_ips_actions_action"]
+    assert len(constraints) == 1
+    sqltext = str(constraints[0].sqltext)
+    for value in ("observe", "alert", "rate_limit", "block", "quarantine"):
+        assert value in sqltext
+
+
+def test_ips_actions_status_check_constraint_values():
+    table = Base.metadata.tables["ips_actions"]
+    constraints = [c for c in table.constraints if getattr(c, "name", None) == "ck_ips_actions_status"]
+    assert len(constraints) == 1
+    sqltext = str(constraints[0].sqltext)
+    for value in ("simulated", "enforced", "failed", "expired", "rolled_back", "superseded"):
+        assert value in sqltext
+
+
+def test_ips_actions_indexes():
+    table = Base.metadata.tables["ips_actions"]
+    names = {ix.name for ix in table.indexes}
+    assert "ix_ips_actions_target_asset" in names
+    assert "ix_ips_actions_ts_desc" in names
 
 
 # ---------------------------------------------------------------------------

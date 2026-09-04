@@ -303,3 +303,99 @@ class Alert(Base):
 # Required composite index: alerts(acknowledged, ts DESC) — the "unacked,
 # newest first" listing is the primary alerts-panel query.
 Index("ix_alerts_acknowledged_ts_desc", Alert.acknowledged, Alert.ts.desc())
+
+
+# ---------------------------------------------------------------------------
+# ips_actions — audit trail for the IPS (prevention) layer
+# (backend/ips/). One row per APPROVED prevention decision — ALERT,
+# RATE_LIMIT, BLOCK, or QUARANTINE (backend.ips.contracts.PreventionAction);
+# OBSERVE decisions are never persisted here, "nothing happened" stays
+# implicit in the absence of a row, the same way a suppressed volumetric
+# alert never gets its own `alerts` row while still being visible via
+# `event_scores`.
+#
+# `action`/`status` use the same plain-TEXT-plus-CHECK-constraint approach
+# as `events.timing_provenance` (Decision D6) rather than a native
+# Postgres ENUM, for the identical reason: Decision D3 opted out of
+# Alembic, and a CHECK constraint can be redefined without a migration if
+# a new value is ever added, without touching the column type itself.
+# Deliberately literal strings here rather than importing
+# `backend.ips.contracts`'s enums — this module has no dependency on
+# `backend.ips` otherwise, and a CHECK constraint's SQL body has to be a
+# literal string regardless of where the allowed values are defined in
+# Python.
+#
+# `triggering_event_id` is ON DELETE SET NULL, matching
+# `alerts.cii_snapshot_id` / `cii_snapshots.trigger_event_id` above: an
+# ips_actions row is an operator-facing audit/compliance record — the
+# requirement's "record every prevention decision ... what, why,
+# evidence, target, action, timestamp, result, and rollback/expiry
+# state" — and must survive retention pruning of the event that
+# triggered it, not disappear or block deletion.
+# ---------------------------------------------------------------------------
+
+
+class IpsAction(Base):
+    __tablename__ = "ips_actions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    target_asset: Mapped[str] = mapped_column(String, nullable=False)
+    #: PreventionAction value: "observe" | "alert" | "rate_limit" | "block"
+    #: | "quarantine". "observe" never actually appears (see module note
+    #: above) but is included in the CHECK constraint for forward
+    #: compatibility with PreventionAction, not left as a silent gap.
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    #: ActionStatus value — see backend/ips/contracts.py for what each
+    #: means; SIMULATED/ENFORCED are both "approved", FAILED/EXPIRED/
+    #: ROLLED_BACK/SUPERSEDED are all terminal, non-active states.
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    # server_default alongside the Python-side default, matching
+    # Alert.acknowledged / Asset.is_gateway above (MEDIUM-1 review
+    # convention) — a raw SQL INSERT that omits this column defaults to
+    # the SAFER value (dry_run=true), never silently to a real action.
+    dry_run: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("true")
+    )
+    triggering_event_id: Mapped[int | None] = mapped_column(
+        ForeignKey("events.id", ondelete="SET NULL"), nullable=True
+    )
+    replay_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    #: TTL expiry, computed at decision time (ts + PreventionDecision.
+    #: ttl_sec). NULL for a row that was never an active-prevention
+    #: action (e.g. status started as FAILED) or has no TTL by design.
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    #: Set together, either by automatic TTL expiry (rollback_reason
+    #: "expired") or a manual operator rollback (POST /api/ips/actions/
+    #: {id}/rollback) — the requirement's "unblock/rollback".
+    rolled_back_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rollback_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "action IN ('observe','alert','rate_limit','block','quarantine')",
+            name="ck_ips_actions_action",
+        ),
+        CheckConstraint(
+            "status IN ('simulated','enforced','failed','expired','rolled_back','superseded')",
+            name="ck_ips_actions_status",
+        ),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging convenience
+        return (
+            f"<IpsAction id={self.id} action={self.action!r} "
+            f"target={self.target_asset!r} status={self.status!r}>"
+        )
+
+
+# `target_asset` lookups (the active-mitigation registry rebuild path,
+# and GET /api/ips/actions?target_asset=) and the "most recent actions"
+# listing are the two real query shapes against this table.
+Index("ix_ips_actions_target_asset", IpsAction.target_asset)
+Index("ix_ips_actions_ts_desc", IpsAction.ts.desc())

@@ -38,7 +38,7 @@ from backend.ingest import (
     compute_risk_index,
     default_tripwire_signal,
 )
-from backend.models import Alert, CiiSnapshot
+from backend.models import Alert, CiiSnapshot, IpsAction
 from backend.replay_engine import BatchMeta
 from backend.replay_reader import ReplayFlow
 from backend.streaming import ScoredFlow
@@ -223,11 +223,26 @@ class FakeSession:
                 obj.id = self._next_pk
                 self._next_pk += 1
 
+    def get(self, model, pk):
+        """Minimal stand-in for `Session.get()` — used by
+        `IngestPipeline._apply_ips_action`'s supersede path and
+        `_maybe_expire_ips_actions` to look up a previously-added row by
+        id. Real SQLAlchemy would hit the identity map or the DB; this
+        fake only ever needs to find rows this same fake already added.
+        """
+        for obj in self.added:
+            if isinstance(obj, model) and getattr(obj, "id", None) == pk:
+                return obj
+        return None
+
     def alerts(self):
         return [o for o in self.added if isinstance(o, Alert)]
 
     def snapshots(self):
         return [o for o in self.added if isinstance(o, CiiSnapshot)]
+
+    def ips_actions(self):
+        return [o for o in self.added if isinstance(o, IpsAction)]
 
 
 def make_pipeline(scorer=None, session=None, broadcaster=None, **kw):
