@@ -59,14 +59,16 @@ Algorithm — self-temporal drift + edge novelty
    edges are weighted by flow count/bytes in the window. Edges older than
    `tgnn_window_sec` are pruned — this is the node's CURRENT/live state.
 
-2. Separately, maintain a never-pruned, LRU-bounded HISTORY of every
-   node's out-neighbors and per-peer byte totals ever observed
-   (`_history_out_peers`, `_history_weights`), plus a global set of every
-   destination IP ever observed anywhere in the network
-   (`_history_global_destinations`). This is the node's BASELINE — it
-   grows continuously and is read *before* each batch is merged into it,
-   so a batch is always scored against strictly prior history, never
-   against itself.
+2. Separately, maintain a never-pruned HISTORY of every node's
+   out-neighbors and per-peer byte totals ever observed
+   (`_history_out_peers`: node -> LRU map of peer -> cumulative bytes,
+   itself capped at `tgnn_max_history_peers_per_node` so one long-lived
+   node cannot accumulate an unbounded peer set over a multi-day run),
+   plus a global LRU set of every destination IP ever observed anywhere
+   in the network (`_history_global_destinations`). This is the node's
+   BASELINE — it grows continuously and is read *before* each batch is
+   merged into it, so a batch is always scored against strictly prior
+   history, never against itself.
 
 3. Per scorable node (out-degree, in the LIVE window, at or above
    `tgnn_min_edges_to_score`), extract four temporal-delta features —
@@ -208,6 +210,7 @@ class TGNNDetector:
         contamination: Optional[float] = None,
         reliability: Optional[float] = None,
         max_training_rows: Optional[int] = None,
+        max_history_peers_per_node: Optional[int] = None,
     ) -> None:
         # Optional-override convention (CLAUDE.md section 5)
         self._window_sec = (
@@ -248,6 +251,11 @@ class TGNNDetector:
             if max_training_rows is not None
             else BACKEND_SETTINGS.tgnn_max_training_rows
         )
+        self._max_history_peers_per_node = (
+            max_history_peers_per_node
+            if max_history_peers_per_node is not None
+            else BACKEND_SETTINGS.tgnn_max_history_peers_per_node
+        )
 
         # DiGraph: nodes are IPs, edges weighted by (count, bytes_sum).
         # Edges carry timestamp of last update for pruning. This is the
@@ -257,13 +265,15 @@ class TGNNDetector:
         # LRU node tracking (same pattern as BeaconingDetector)
         self._node_created_at: OrderedDict[str, datetime] = OrderedDict()
 
-        # Never-pruned HISTORY — the node's baseline. `_history_out_peers`
-        # is the cumulative set of distinct out-neighbors ever observed
-        # per node; `_history_weights` the cumulative bytes sent to each
-        # of those peers. Both are purged only on LRU eviction (mirroring
+        # Never-pruned HISTORY — the node's baseline. Per node, an LRU
+        # (most-recently-touched peer wins) map of out-peer -> cumulative
+        # bytes sent to it, bounded at `tgnn_max_history_peers_per_node`
+        # so a long-lived hub cannot accumulate an unbounded peer set
+        # over a multi-day run merely by staying in the node LRU
+        # (`tgnn_max_nodes` bounds node COUNT, not any one node's own
+        # history size). Purged only on node LRU eviction (mirroring
         # `_graph`'s own eviction) or `reset()`.
-        self._history_out_peers: dict[str, set[str]] = {}
-        self._history_weights: dict[str, dict[str, float]] = {}
+        self._history_out_peers: dict[str, OrderedDict[str, float]] = {}
         #: LRU set (as an OrderedDict) of every destination IP ever seen
         #: anywhere in the network — the reference a node with NO history
         #: of its own falls back to for edge-novelty scoring. See module
@@ -351,7 +361,6 @@ class TGNNDetector:
         self._graph.clear()
         self._node_created_at.clear()
         self._history_out_peers.clear()
-        self._history_weights.clear()
         self._history_global_destinations.clear()
         self._training_rows.clear()
         self._batches_seen = 0
@@ -389,7 +398,6 @@ class TGNNDetector:
                     self._graph.remove_node(old_ip)
                     del self._node_created_at[old_ip]
                     self._history_out_peers.pop(old_ip, None)
-                    self._history_weights.pop(old_ip, None)
             else:
                 self._node_created_at.move_to_end(ip)
 
@@ -435,9 +443,11 @@ class TGNNDetector:
             # HISTORY grows unbounded despite the node cap.
             if src not in self._graph:
                 continue
-            self._history_out_peers.setdefault(src, set()).add(dst)
-            weights = self._history_weights.setdefault(src, {})
-            weights[dst] = weights.get(dst, 0.0) + flow.bytes
+            peers = self._history_out_peers.setdefault(src, OrderedDict())
+            peers[dst] = peers.get(dst, 0.0) + flow.bytes
+            peers.move_to_end(dst)
+            while len(peers) > self._max_history_peers_per_node:
+                peers.popitem(last=False)
 
             if dst in self._history_global_destinations:
                 self._history_global_destinations.move_to_end(dst)
@@ -489,8 +499,9 @@ class TGNNDetector:
             ]
             current_entropy = self._shannon_entropy(current_weights)
 
-            baseline_peers = self._history_out_peers.get(node)
-            has_own_baseline = bool(baseline_peers)
+            baseline_map = self._history_out_peers.get(node)
+            has_own_baseline = bool(baseline_map)
+            baseline_peers = frozenset(baseline_map) if baseline_map else frozenset()
 
             if current_peers:
                 if has_own_baseline:
@@ -505,19 +516,19 @@ class TGNNDetector:
             else:
                 unseen_peer_ratio = 0.0
 
-            baseline_degree = len(baseline_peers) if baseline_peers else 0
+            baseline_degree = len(baseline_map) if baseline_map else 0
             degree_expansion = self._graph.out_degree(node) / (baseline_degree + 1)
 
             if has_own_baseline or current_peers:
-                union_size = len((baseline_peers or set()) | current_peers)
-                intersection_size = len((baseline_peers or set()) & current_peers)
+                union_size = len(baseline_peers | current_peers)
+                intersection_size = len(baseline_peers & current_peers)
                 jaccard = intersection_size / union_size if union_size else 1.0
                 neighbor_drift = 1.0 - jaccard
             else:
                 neighbor_drift = 0.0
 
-            baseline_weights = self._history_weights.get(node, {})
-            baseline_entropy = self._shannon_entropy(list(baseline_weights.values()))
+            baseline_weights = list(baseline_map.values()) if baseline_map else []
+            baseline_entropy = self._shannon_entropy(baseline_weights)
             traffic_entropy_delta = abs(current_entropy - baseline_entropy)
 
             features[node] = np.array(

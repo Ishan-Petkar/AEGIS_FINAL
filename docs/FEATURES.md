@@ -165,6 +165,20 @@ edge novelty, above, measures the same replay at BENIGN 1.67% / Bot
 28.48% — signal now correctly ordered and both past their respective
 targets (<5% / >25%).
 
+**Per-node history is LRU-bounded too (2026-09-05).** `tgnn_max_nodes`
+caps how many NODES are tracked, but said nothing about how large any
+one node's own peer history could grow — a long-lived hub surviving a
+multi-day run could accumulate an unbounded peer set even with the node
+count flat. `tgnn_max_history_peers_per_node` (default 2,000) closes
+that: each node's `_history_out_peers` is now itself an LRU map, oldest
+peer evicted first. The first value tried (200) silently reopened the
+hub-inflation failure the pivot above exists to close — clipping a busy
+node's historical degree at 200 when the real friday-morning replay's
+busiest node reaches 1,301 inflates `degree_expansion` for perfectly
+ordinary hubs, and measurably so: BENIGN firing rose from 1.67% to 9.65%
+on the identical replay. 2,000 was chosen by measuring that real maximum
+and re-verified to reproduce the exact 1.67%/28.48% figures unchanged.
+
 Calibration is anchored to the fitted forest's own contamination boundary
 (`decision_function`'s sign is its inlier/outlier verdict), scaled by the
 empirical spread of the training population on each side of that
@@ -185,9 +199,11 @@ never averaged), otherwise weighted noisy-OR over fired heuristic
 verdicts (`1 - Π(1 - score×reliability)`), banded against configured
 thresholds. Reliability weights default to each channel's own *measured*
 precision from `docs/DETECTION_STUDY.md` (volumetric 0.02, supervised
-0.90, tripwire 1.0) — beaconing's weight (0.50) and T-GNN's weight
-(`hybrid_weight_tgnn`, default 0.50) are both explicitly flagged as
-unmeasured placeholders, not evidence of quality.
+0.90, tripwire 1.0) and, as of the 2026-09-05 T-GNN self-temporal-drift
+pivot, `hybrid_weight_tgnn` too (0.15 — precision = 560/(560+3166) Bot vs.
+BENIGN fires on the same friday-morning replay, see that setting's
+docstring). Beaconing's weight (0.50) is still an explicitly flagged
+unmeasured placeholder, not evidence of quality.
 
 **Shipped posture — observable, not yet authoritative**:
 `hybrid_enabled=True` (the layer runs on every batch and persists a
@@ -481,8 +497,9 @@ Ordered by how soon each would matter, not by difficulty.
   §3's signature/beaconing detectors don't reach: those catch specific
   known shapes (rules) and one specific temporal pattern (periodicity); a
   graph-structural detector learns peer/concentration structure neither
-  can express. Its reliability weight (`hybrid_weight_tgnn`, default
-  0.50) is an unmeasured placeholder like beaconing's, and its baseline
+  can express. Its reliability weight (`hybrid_weight_tgnn`) was measured
+  post-pivot at 0.15 precision (see §4 and the setting's own docstring),
+  no longer the earlier 0.50 unmeasured placeholder. Its baseline still
   carries the same first-N-batches-are-benign assumption as the
   volumetric channel — a demo that opens with an injection poisons it
 - [ ] **Learned edge probabilities** for the CII dependency graph (Bayesian

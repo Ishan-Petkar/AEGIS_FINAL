@@ -63,7 +63,7 @@ aegis-project/
 │       ├── swat_adapter.py     #   SWaT ICS/OT sensor telemetry
 │       ├── download_datasets.py    # helper script (see Known issues)
 │       └── generate_paysim_sample.py  # helper script
-├── tests/                      # pytest, 738 passed / 15 skipped (see note below)
+├── tests/                      # pytest, 739 passed / 15 skipped (see note below)
 ├── datasets/                   # gitignored — real CSVs live here
 ├── docs/                       # ARCHITECTURE / DATA_SCHEMA / DESIGN / SETUP / …
 ├── graphify-out/               # generated knowledge-graph artifacts (not source)
@@ -257,7 +257,7 @@ Datasets are gitignored and must be placed manually under `datasets/`:
 Tests skip rather than fail when data is absent, so a green local run does not
 prove the adapter paths were exercised — check for `skipped` in the output.
 
-The suite currently reports **738 passed, 15 skipped**. The 15 skips are the
+The suite currently reports **739 passed, 15 skipped**. The 15 skips are the
 live-Postgres tests in `tests/test_backend_models.py`, which are gated on
 `AEGIS_TEST_LIVE_DB=1` and run only against a real database:
 
@@ -270,6 +270,20 @@ module scope, so the suite reads committed field defaults and never the
 gitignored repo-root `.env` — a result that depends on an untracked file is
 not reproducible. Exported `AEGIS_*` environment variables are deliberately
 left alone, since the live-DB gate above is one of them.
+
+**REST/WS schema parity fix (2026-09-05).** `GET /api/events`' `EventOut`
+carried only the volumetric/tripwire fields, contradicting its own
+docstring's claim of parity with the live `/ws/stream` "hybrid" envelope —
+a REST backfill after a reconnect silently dropped every signature/
+beaconing/tgnn/supervised/fused signal for the events it returned. Root
+cause: `IngestPipeline._persist_scores()` never wrote an `event_scores` row
+for `signature`, `beaconing`, or `tgnn` at all (only volumetric, tripwire,
+supervised, hybrid did), even though `_HYBRID_DETECTOR_NAMES`
+(`backend/ingest.py`) was already declared for exactly that purpose and
+simply never read. Fixed by persisting those three from
+`fused_decisions[i].verdicts` directly, and by adding `hybrid_threat_score`
+/ `fired_detectors` to `EventOut` so REST reconstructs what WS already
+broadcasts.
 
 ## 7. Known issues (verified in the current tree)
 

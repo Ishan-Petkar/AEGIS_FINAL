@@ -412,7 +412,24 @@ def test_lru_cap_bounds_memory():
     # Eviction must purge HISTORY too, not just the live graph, or memory
     # is unbounded despite the node cap.
     assert len(detector._history_out_peers) <= 10
-    assert len(detector._history_weights) <= 10
+
+
+def test_per_node_history_peer_set_is_lru_bounded():
+    """`tgnn_max_nodes` bounds how many NODES are tracked; it says
+    nothing about how large any single node's own peer history can grow.
+    A long-lived node (a gateway) that survives the whole session while
+    continuously reaching new destinations must still have its own
+    history capped, or a multi-day run leaks memory one peer at a time
+    even though the node count stays flat."""
+    detector = TGNNDetector(
+        baseline_batches=100, min_edges_to_score=2, max_history_peers_per_node=5
+    )
+    # One long-lived source, 20 distinct destinations across 20 batches —
+    # the node itself is never evicted (only one node ever tracked).
+    for i in range(20):
+        detector.examine([_flow(_T0 + timedelta(seconds=i), src="10.0.0.1", dst=f"10.9.0.{i}")])
+
+    assert len(detector._history_out_peers["10.0.0.1"]) <= 5
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +451,6 @@ def test_reset_clears_state():
     assert detector.tracked_nodes == 0
     assert detector._isolation_forest is None
     assert detector._history_out_peers == {}
-    assert detector._history_weights == {}
     assert len(detector._history_global_destinations) == 0
     assert len(detector._training_rows) == 0
 

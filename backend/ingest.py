@@ -1160,6 +1160,25 @@ class IngestPipeline:
         in both columns, so a caller reading either gets the fused
         figure rather than accidentally reading a different channel's
         `confidence[i]` under the `hybrid` detector name.
+
+        Also writes one row per event for each of `DETECTOR_SIGNATURE`,
+        `DETECTOR_BEACONING` and `DETECTOR_TGNN` -- always, same
+        rationale as volumetric: an abstain/no-fire verdict from these
+        channels is diagnostic ("T-GNN's baseline wasn't fitted yet",
+        "signature scored 0.1 and did not match"), not a no-information
+        default the way an untouched honeytoken is. These three verdicts
+        are read directly off `fused_decisions[i].verdicts` -- the SAME
+        `DetectorVerdict` objects `HybridFusionEngine.fuse()` already
+        combined -- rather than threaded through as separate parameters,
+        so a persisted row can never disagree with what the fused
+        decision (and its `fired_detectors` in the broadcast envelope)
+        actually used. `_HYBRID_DETECTOR_NAMES` was already declared for
+        exactly this purpose (see its docstring) but nothing read it
+        before this fix -- these three channels ran on every batch and
+        fed the fusion result, yet were structurally invisible to any
+        `event_scores` query, contradicting `DetectorVerdict.detector`'s
+        own docstring contract that every detector's verdict "is written
+        straight into `event_scores.detector`".
         """
         rows: list[dict[str, Any]] = []
         for i, scored_flow in enumerate(scored):
@@ -1214,6 +1233,18 @@ class IngestPipeline:
                         "confidence": decision.threat_score,
                     }
                 )
+                for v in decision.verdicts:
+                    if v.detector in _HYBRID_DETECTOR_NAMES and v.detector != DETECTOR_HYBRID:
+                        rows.append(
+                            {
+                                "event_id": event_id,
+                                "detector": v.detector,
+                                "raw_score": v.raw_score,
+                                "calibrated_score": v.calibrated_score,
+                                "is_anomaly": bool(v.fired),
+                                "confidence": v.calibrated_score,
+                            }
+                        )
         if rows:
             session.execute(pg_insert(EventScore).values(rows))
 

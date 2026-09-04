@@ -71,6 +71,7 @@ from backend.config import BACKEND_SETTINGS
 from backend.db import session_scope
 from backend.inject import SCENARIOS, InjectionError, build_injection_flows
 from backend.ingest import (
+    DETECTOR_HYBRID,
     DETECTOR_TRIPWIRE,
     DETECTOR_VOLUMETRIC,
     build_criticality_map,
@@ -413,11 +414,27 @@ def list_events(
             )
             volumetric_by_event_id: dict[int, EventScore] = {}
             tripwire_event_ids: set[int] = set()
+            hybrid_by_event_id: dict[int, EventScore] = {}
+            fired_by_event_id: dict[int, list[str]] = {}
             for score_row in score_rows:
                 if score_row.detector == DETECTOR_VOLUMETRIC:
                     volumetric_by_event_id[score_row.event_id] = score_row
                 elif score_row.detector == DETECTOR_TRIPWIRE:
                     tripwire_event_ids.add(score_row.event_id)
+                elif score_row.detector == DETECTOR_HYBRID:
+                    hybrid_by_event_id[score_row.event_id] = score_row
+                # Every persisted channel's own fired state (volumetric
+                # and tripwire included) — a REST-side reconstruction of
+                # `FusedDecision.fired_detectors`, which the live
+                # `/ws/stream` "hybrid" envelope already carries. The
+                # `DETECTOR_HYBRID` row is excluded: its `is_anomaly`
+                # means "band != BENIGN" for the FUSED decision, not "this
+                # channel fired", so including it here would misrepresent
+                # it as a seventh contributing detector.
+                if score_row.detector != DETECTOR_HYBRID and score_row.is_anomaly:
+                    fired_by_event_id.setdefault(score_row.event_id, []).append(
+                        score_row.detector
+                    )
             for event in events:
                 volumetric = volumetric_by_event_id.get(event.id)
                 if volumetric is not None:
@@ -426,6 +443,10 @@ def list_events(
                     event.is_anomaly = volumetric.is_anomaly
                     event.confidence = volumetric.confidence
                 event.tripwire_fired = event.id in tripwire_event_ids
+                hybrid = hybrid_by_event_id.get(event.id)
+                if hybrid is not None:
+                    event.hybrid_threat_score = hybrid.calibrated_score
+                event.fired_detectors = fired_by_event_id.get(event.id, [])
 
     return EventsResponse(events=events, has_more=has_more)
 

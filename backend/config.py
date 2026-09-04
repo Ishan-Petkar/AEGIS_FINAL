@@ -848,15 +848,22 @@ class BackendSettings(BaseSettings):
         ),
     )
     hybrid_weight_tgnn: float = Field(
-        default=0.50,
+        default=0.15,
         ge=0.0,
         le=1.0,
         description=(
             "Reliability weight for the graph-structural (T-GNN) detector. "
-            "Deliberately mid-range and explicitly UNMEASURED on this "
-            "corpus at time of writing, mirroring hybrid_weight_beaconing — "
-            "there is no labelled structural-anomaly corpus yet to fit it "
-            "against. Treat it as a placeholder, not evidence of quality."
+            "MEASURED, not the earlier 0.50 placeholder: precision = "
+            "TP/(TP+FP) = 560/(560+3166) = 0.15 on the same CIC-IDS2017 "
+            "friday-morning replay used to tune tgnn_window_sec/"
+            "tgnn_min_edges_to_score/tgnn_contamination above (Bot fired "
+            "560 of 1966 = 28.48% recall; BENIGN fired 3166 of 189067 = "
+            "1.67%). Same methodology as hybrid_weight_volumetric's 0.02 "
+            "(docs/DETECTION_STUDY.md). Caveat this shares with every "
+            "other weight here: one dataset, one day, one attack family "
+            "(Bot/Ares C2) — not cross-validated against a second corpus "
+            "or a second attack type, so treat 0.15 as a real first "
+            "measurement, not a ceiling on the channel's eventual quality."
         ),
     )
 
@@ -1090,6 +1097,38 @@ class BackendSettings(BaseSettings):
             "trains on recent behaviour rather than the session's entire "
             "history. At 4 float32 features per row the cap costs "
             "kilobytes, not a scaling concern."
+        ),
+    )
+    tgnn_max_history_peers_per_node: int = Field(
+        default=2_000,
+        ge=10,
+        le=1_000_000,
+        description=(
+            "LRU cap (most-recently-touched peer wins) on the number of "
+            "distinct out-peers HISTORY remembers per node. "
+            "`tgnn_max_nodes` bounds the number of TRACKED NODES, but "
+            "says nothing about how large any one node's own peer set "
+            "can grow — a long-lived hub (a gateway, a proxy) that "
+            "survives the whole session while continuously reaching new "
+            "destinations would otherwise accumulate an unbounded "
+            "per-node peer history over a multi-day run even though the "
+            "node count itself stays capped. "
+            "MEASURED, not guessed, and tightly coupled to the other "
+            "tgnn_* defaults: over the full CIC-IDS2017 friday-morning "
+            "replay (the same one tgnn_window_sec/tgnn_min_edges_to_score/"
+            "tgnn_contamination/hybrid_weight_tgnn are tuned against), the "
+            "busiest node accumulates 1,301 distinct historical peers. An "
+            "initial value of 200 clipped that and 9 other genuinely busy "
+            "nodes' baseline degree, which artificially inflates "
+            "degree_expansion for perfectly ordinary hubs — the exact "
+            "hub-inflation failure mode the 2026-09-04 pivot away from "
+            "pooled centrality was meant to close, reopened through the "
+            "back door: BENIGN firing rose from 1.67% to 9.65% at cap=200 "
+            "on the identical replay. 2,000 sits comfortably above the "
+            "observed maximum (headroom for a longer real deployment) "
+            "while still being a real, finite ceiling rather than a "
+            "nominal one — verified to reproduce the exact 1.67%/28.48% "
+            "BENIGN/Bot figures the other three settings above cite."
         ),
     )
     tgnn_fire_threshold: float = Field(

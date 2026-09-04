@@ -141,6 +141,18 @@ class EventOut(BaseModel):
     is_anomaly: Optional[bool] = None
     confidence: Optional[float] = None
     tripwire_fired: bool = False
+    #: Hybrid IDS enrichment, added alongside the `_persist_scores` fix
+    #: that made `signature`/`beaconing`/`tgnn` verdicts persist at all
+    #: (previously silent contributors to `hybrid_threat_score` with no
+    #: queryable row of their own). `hybrid_threat_score` is the
+    #: `DETECTOR_HYBRID` row's `calibrated_score`; `fired_detectors` is
+    #: every OTHER channel's `event_scores` row for this event whose
+    #: `is_anomaly` is `True` — the same set `FusedDecision.fired_detectors`
+    #: exposes live over `/ws/stream`. `None`/`[]` when the Hybrid IDS
+    #: layer was disabled for this event (`hybrid_enabled=False`), same
+    #: "absent row = channel didn't run" convention as `tripwire_fired`.
+    hybrid_threat_score: Optional[float] = None
+    fired_detectors: list[str] = Field(default_factory=list)
 
 
 class EventsResponse(BaseModel):

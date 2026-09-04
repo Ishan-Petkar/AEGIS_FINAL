@@ -22,6 +22,7 @@ from backend.detection.contracts import (
     DETECTOR_BEACONING,
     DETECTOR_HYBRID,
     DETECTOR_SIGNATURE,
+    DETECTOR_TGNN,
     Certainty,
     DetectorVerdict,
     FlowFeatures,
@@ -169,9 +170,18 @@ def test_hybrid_row_survives_deduplication_too():
     assert result.events_inserted == 1
     assert result.events_deduplicated == 1
     rows = rows_of(stmts_for(session, "event_scores")[0])
-    # volumetric + hybrid for the ONE real event, nothing for the deduped one
-    assert len(rows) == 2
-    assert {r["detector"] for r in rows} == {DETECTOR_VOLUMETRIC, DETECTOR_HYBRID}
+    # volumetric + hybrid + the three always-on heuristic channels
+    # (signature/beaconing/tgnn abstain on this tiny batch but still get
+    # a row each — see _persist_scores's docstring) for the ONE real
+    # event, nothing for the deduped one.
+    assert len(rows) == 5
+    assert {r["detector"] for r in rows} == {
+        DETECTOR_VOLUMETRIC,
+        DETECTOR_HYBRID,
+        DETECTOR_SIGNATURE,
+        DETECTOR_BEACONING,
+        DETECTOR_TGNN,
+    }
 
 
 # ---------------------------------------------------------------------------
