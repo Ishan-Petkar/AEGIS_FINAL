@@ -63,7 +63,7 @@ aegis-project/
 │       ├── swat_adapter.py     #   SWaT ICS/OT sensor telemetry
 │       ├── download_datasets.py    # helper script (see Known issues)
 │       └── generate_paysim_sample.py  # helper script
-├── tests/                      # pytest, 88 tests, all currently passing
+├── tests/                      # pytest, 738 passed / 15 skipped (see note below)
 ├── datasets/                   # gitignored — real CSVs live here
 ├── docs/                       # ARCHITECTURE / DATA_SCHEMA / DESIGN / SETUP / …
 ├── graphify-out/               # generated knowledge-graph artifacts (not source)
@@ -256,6 +256,20 @@ Datasets are gitignored and must be placed manually under `datasets/`:
 
 Tests skip rather than fail when data is absent, so a green local run does not
 prove the adapter paths were exercised — check for `skipped` in the output.
+
+The suite currently reports **738 passed, 15 skipped**. The 15 skips are the
+live-Postgres tests in `tests/test_backend_models.py`, which are gated on
+`AEGIS_TEST_LIVE_DB=1` and run only against a real database:
+
+```bash
+AEGIS_TEST_LIVE_DB=1 PYTHONPATH=src python -m pytest tests/ -q
+```
+
+`tests/conftest.py` rebuilds `BACKEND_SETTINGS` with `_env_file=None` at
+module scope, so the suite reads committed field defaults and never the
+gitignored repo-root `.env` — a result that depends on an untracked file is
+not reproducible. Exported `AEGIS_*` environment variables are deliberately
+left alone, since the live-DB gate above is one of them.
 
 ## 7. Known issues (verified in the current tree)
 

@@ -96,6 +96,7 @@ from backend.detection.contracts import (
     DETECTOR_BEACONING,
     DETECTOR_HYBRID,
     DETECTOR_SIGNATURE,
+    DETECTOR_TGNN,
     DetectorVerdict,
     FlowFeatures,
     FusedDecision,
@@ -107,6 +108,7 @@ from backend.detection.contracts import (
 )
 from backend.detection.fusion import HybridFusionEngine
 from backend.detection.signature import SignatureEngine
+from backend.detection.tgnn import TGNNDetector
 from backend.ips.contracts import (
     ACTIVE_PREVENTION_ACTIONS,
     PREVENTION_SEVERITY,
@@ -161,7 +163,7 @@ DETECTOR_SUPERVISED = "random_forest"
 #: package, not its source of truth. DETECTOR_VOLUMETRIC / _TRIPWIRE /
 #: _SUPERVISED above stay defined in THIS module because they predate the
 #: hybrid layer and other code already imports them from here.
-_HYBRID_DETECTOR_NAMES = (DETECTOR_SIGNATURE, DETECTOR_BEACONING, DETECTOR_HYBRID)
+_HYBRID_DETECTOR_NAMES = (DETECTOR_SIGNATURE, DETECTOR_BEACONING, DETECTOR_TGNN, DETECTOR_HYBRID)
 
 #: WebSocket envelope types (docs/PHASE5_BUILD_PLAN.md section 7). Ticket
 #: #9 owns the transport; this module owns the payloads it carries.
@@ -265,6 +267,7 @@ class BatchResult:
     alerts_suppressed: int
     hybrid_signature_hits: int = 0
     hybrid_beaconing_hits: int = 0
+    hybrid_tgnn_hits: int = 0
     hybrid_likely_or_above: int = 0
     hybrid_gated_alerts: int = 0
     #: IPS (backend/ips/) per-batch counters. All zero when
@@ -308,6 +311,7 @@ class IngestStats:
     #: additive telemetry, never read by the existing alert/CII path.
     hybrid_signature_hits: int = 0
     hybrid_beaconing_hits: int = 0
+    hybrid_tgnn_hits: int = 0
     hybrid_likely_or_above: int = 0
     hybrid_gated_alerts: int = 0
     ips_decisions: int = 0
@@ -331,6 +335,7 @@ class IngestStats:
         self.alerts_suppressed += result.alerts_suppressed
         self.hybrid_signature_hits += result.hybrid_signature_hits
         self.hybrid_beaconing_hits += result.hybrid_beaconing_hits
+        self.hybrid_tgnn_hits += result.hybrid_tgnn_hits
         self.hybrid_likely_or_above += result.hybrid_likely_or_above
         self.hybrid_gated_alerts += result.hybrid_gated_alerts
         self.ips_decisions += result.ips_decisions
@@ -604,6 +609,7 @@ class IngestPipeline:
         hybrid_gates_alerts: Optional[bool] = None,
         signature_engine: Optional[SignatureEngine] = None,
         beaconing_detector: Optional[BeaconingDetector] = None,
+        tgnn_detector: Optional[TGNNDetector] = None,
         fusion_engine: Optional[HybridFusionEngine] = None,
         ips_enabled: Optional[bool] = None,
         ips_dry_run: Optional[bool] = None,
@@ -690,8 +696,13 @@ class IngestPipeline:
         # a fresh instance vs. an injected one behaves identically; they are
         # still held on `self` so a caller can inject a test double for
         # either the same way `scorer`/`supervised_scorer` are injected.
+        # `TGNNDetector` is STATEFUL like `BeaconingDetector` (an
+        # accumulating communication graph plus a lazily-fitted baseline
+        # spanning batches), so it holds the same long-lived-instance
+        # requirement -- see `TGNNDetector`'s class docstring.
         self._signature_engine = signature_engine or SignatureEngine()
         self._beaconing_detector = beaconing_detector or BeaconingDetector()
+        self._tgnn_detector = tgnn_detector or TGNNDetector()
         self._fusion_engine = fusion_engine or HybridFusionEngine()
 
         # ---- IPS (backend/ips/) -----------------------------------------
@@ -828,6 +839,7 @@ class IngestPipeline:
 
         hybrid_signature_hits = 0
         hybrid_beaconing_hits = 0
+        hybrid_tgnn_hits = 0
         hybrid_likely_or_above = 0
         if fused_decisions is not None:
             for decision in fused_decisions:
@@ -836,6 +848,8 @@ class IngestPipeline:
                         hybrid_signature_hits += 1
                     elif verdict.fired and verdict.detector == DETECTOR_BEACONING:
                         hybrid_beaconing_hits += 1
+                    elif verdict.fired and verdict.detector == DETECTOR_TGNN:
+                        hybrid_tgnn_hits += 1
                 if decision.action == ResponseAction.ALERT:
                     hybrid_likely_or_above += 1
 
@@ -851,6 +865,7 @@ class IngestPipeline:
             alerts_suppressed=alert_outcomes.suppressed,
             hybrid_signature_hits=hybrid_signature_hits,
             hybrid_beaconing_hits=hybrid_beaconing_hits,
+            hybrid_tgnn_hits=hybrid_tgnn_hits,
             hybrid_likely_or_above=hybrid_likely_or_above,
             hybrid_gated_alerts=alert_outcomes.hybrid_gated,
             ips_decisions=ips_outcomes.decisions,
@@ -922,6 +937,11 @@ class IngestPipeline:
             if BACKEND_SETTINGS.beaconing_enabled
             else [None] * len(features)
         )
+        tgnn_verdicts = (
+            self._tgnn_detector.examine(features)
+            if BACKEND_SETTINGS.tgnn_enabled
+            else [None] * len(features)
+        )
 
         settings = BACKEND_SETTINGS
         decisions: list[FusedDecision] = []
@@ -947,6 +967,8 @@ class IngestPipeline:
                 verdicts.append(signature_verdicts[i])
             if beaconing_verdicts[i] is not None:
                 verdicts.append(beaconing_verdicts[i])
+            if tgnn_verdicts[i] is not None:
+                verdicts.append(tgnn_verdicts[i])
 
             decisions.append(self._fusion_engine.fuse(verdicts))
         return decisions

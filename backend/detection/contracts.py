@@ -66,6 +66,9 @@ DETECTOR_SIGNATURE = "signature"
 #: Temporal/periodicity detector (`backend/detection/beaconing.py`).
 DETECTOR_BEACONING = "beaconing"
 
+#: Graph-structural anomaly detector (`backend/detection/tgnn.py`).
+DETECTOR_TGNN = "tgnn"
+
 #: The fused hybrid decision itself. Persisted as its own `event_scores`
 #: row so the combined verdict is auditable next to the per-detector rows
 #: that produced it, rather than being recomputable-only.

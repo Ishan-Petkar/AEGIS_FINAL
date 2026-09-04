@@ -40,17 +40,24 @@ work; the Operations Console is where you watch it happen.
 
 ## What it does
 
-- **Three detection channels, all scored live, every batch.** An
-  unsupervised Isolation Forest (novel-threat channel), a supervised
-  RandomForest (known-threat channel, fit once at build time on real
-  labelled attack traffic — `backend/warmup_supervised.py`), and a
-  honeytoken tripwire (deception channel), each persisted as its own
-  `event_scores` row per event. Their real, measured strengths and limits
-  are in §*Honest limitations* — in particular, watch the volumetric and
-  known-threat channels disagree live: inject a real Bot scenario
-  (`POST /api/inject`) and the Isolation Forest says "normal" while the
-  RandomForest flags it at 0.96+ confidence, the exact, concrete shape of
-  the paradigm gap this section describes.
+- **Six detection channels, correlated into one fused decision.** The
+  original three, all scored live every batch and persisted as their own
+  `event_scores` row per event: an unsupervised Isolation Forest
+  (novel-threat channel), a supervised RandomForest (known-threat
+  channel, fit once at build time on real labelled attack traffic —
+  `backend/warmup_supervised.py`), and a honeytoken tripwire (deception
+  channel). Their real, measured strengths and limits are in §*Honest
+  limitations* — in particular, watch the volumetric and known-threat
+  channels disagree live: inject a real Bot scenario (`POST /api/inject`)
+  and the Isolation Forest says "normal" while the RandomForest flags it
+  at 0.96+ confidence, the exact, concrete shape of the paradigm gap this
+  section describes. Three more feed the Hybrid IDS fusion layer
+  (`docs/FEATURES.md` §3): a signature engine (declarative rules over
+  flow metadata), a beaconing detector (inter-arrival timing regularity),
+  and **T-GNN** (topological channel) — lightweight structural-embedding
+  anomaly detection over a sliding-window traffic graph (NetworkX +
+  IsolationForest, honestly not a full GNN) that catches an attacker who
+  is volumetrically quiet and rule-compliant but topologically unusual.
 - **Mandatory gateway topology** — every path to a high-criticality asset
   is structurally rewritten to route through a Purdue-zone gateway node
   (`src/graph_manager.py`). It is a chokepoint in the graph itself, not a

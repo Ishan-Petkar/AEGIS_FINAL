@@ -14,6 +14,11 @@ no pipeline, no database and no replay engine.
   `beaconing.py`  temporal/periodicity detector — the documented answer to
                   the volumetric channel's measured blind spot.
   `signature.py`  declarative rule/signature matching over flow metadata.
+  `tgnn.py`       graph-structural anomaly detector — a lightweight,
+                  NetworkX + IsolationForest stand-in for a temporal GNN
+                  (Anomal-E / E-GraphSAGE style), the documented answer to
+                  the blind spot where an attacker is quiet, regular, and
+                  rule-compliant but topologically unusual.
   `fusion.py`     `HybridFusionEngine` — combines verdicts into one
                   decision by weighted noisy-OR with a confirmed-signal
                   precedence override.

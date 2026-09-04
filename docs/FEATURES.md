@@ -3,8 +3,9 @@
 What's actually built and running, versus what's planned. Code is
 authoritative over this document — if the two disagree, trust the code
 (see `CLAUDE.md` §8). Compiled 2026-09-03, updated same day after the
-Hybrid IDS landed, updated again 2026-09-04 after the IPS layer landed —
-not carried forward from older planning docs.
+Hybrid IDS landed, updated again 2026-09-04 after the IPS layer landed,
+and again same day after the T-GNN detector landed — not carried forward
+from older planning docs.
 
 ---
 
@@ -80,7 +81,7 @@ narrative — see §3.
 
 ---
 
-## 3. Hybrid IDS — correlating five detectors into one decision
+## 3. Hybrid IDS — correlating six detectors into one decision
 
 Added 2026-09-03. Sits alongside the three-channel research narrative in
 §2, not in place of it: every existing channel's own verdict feeds into
@@ -125,14 +126,68 @@ decision to `threat_score = 1.0` without being diluted by a
   per-flow volumetric feature can carry). Stateful — one long-lived
   instance per pipeline, LRU-bounded per-pair history.
 
+**A third new detector, added 2026-09-04**: **T-GNN**
+(`backend/detection/tgnn.py`) — graph-structural anomaly detection,
+closing the blind spot none of the other five channels cover: an
+attacker who is volumetrically quiet, temporally regular, and
+rule-compliant, but *topologically* unusual (talking to peers it's never
+talked to, concentrating traffic where it shouldn't). Named honestly —
+it is "lightweight structural-embedding anomaly detection inspired by
+E-GraphSAGE / Anomal-E, using NetworkX + IsolationForest rather than a
+full GNN framework," deliberately not PyTorch/PyTorch-Geometric, and it
+does not claim to be a real neural network.
+
+Maintains a sliding-window `DiGraph` (nodes = IPs, edges weighted by
+flow count/bytes, pruned after `tgnn_window_sec`, default 60s — see
+below) as each node's CURRENT state, plus a separate, never-pruned,
+LRU-bounded HISTORY of every node's out-neighbors and per-peer byte
+totals ever observed, as each node's BASELINE. Per scorable node
+(out-degree ≥ `tgnn_min_edges_to_score`), extracts four *self-temporal
+drift* features — `unseen_peer_ratio`, `degree_expansion`,
+`neighbor_drift` (Jaccard distance), `traffic_entropy_delta` — all
+comparing the node's CURRENT window against its OWN history, and scored
+by an Isolation Forest fit on a rolling buffer of these feature rows
+collected every batch (`tgnn_max_training_rows`). A node with no history
+at all (first-ever appearance) falls back to *edge novelty* against a
+global "every destination ever seen" set, rather than trivially reading
+maximal drift against nothing.
+
+This replaced an earlier version (through 2026-09-03) that scored
+*pooled global centrality* — weighted in/out-degree, PageRank, clustering
+coefficient — fit once across the whole graph. Offline replay against
+CIC-IDS2017 friday-morning showed that design's signal was INVERTED:
+BENIGN fired at 20.19%, the Bot (Ares C2) label at only 9.00%, because
+high centrality is a stable property of infrastructure ROLE (gateways,
+DNS servers), not of attack behavior, while the low out-degree (1-2) Ares
+bot looked like a textbook inlier in a feature space built entirely from
+"how central is this node." The 2026-09-04 pivot to self-temporal drift +
+edge novelty, above, measures the same replay at BENIGN 1.67% / Bot
+28.48% — signal now correctly ordered and both past their respective
+targets (<5% / >25%).
+
+Calibration is anchored to the fitted forest's own contamination boundary
+(`decision_function`'s sign is its inlier/outlier verdict), scaled by the
+empirical spread of the training population on each side of that
+boundary — not a percentile rank, which is uniform over its reference
+population by construction and so fires on a fixed fraction of NORMAL
+traffic regardless of the threshold chosen. Certainty is always
+`HEURISTIC` — topology drift alone cannot confirm compromise, since it
+can equally mean a legitimate failover or a new service deployment.
+Abstains (`fired=False`, `calibrated_score=0.0`) until its baseline is
+fitted (first `tgnn_baseline_batches` batches, default 10) — and shares
+the volumetric channel's known limitation that the baseline assumes
+those first batches are benign; a demo that starts with an injection
+immediately poisons it. `tests/test_tgnn.py` — 18 tests, all passing.
+
 **Fusion** (`backend/detection/fusion.py`) — confirmed-signal precedence
 first (any fired `CONFIRMED` verdict wins outright, `threat_score = 1.0`,
 never averaged), otherwise weighted noisy-OR over fired heuristic
 verdicts (`1 - Π(1 - score×reliability)`), banded against configured
 thresholds. Reliability weights default to each channel's own *measured*
 precision from `docs/DETECTION_STUDY.md` (volumetric 0.02, supervised
-0.90, tripwire 1.0) — beaconing's weight (0.50) is explicitly flagged as
-an unmeasured placeholder, not evidence of quality.
+0.90, tripwire 1.0) — beaconing's weight (0.50) and T-GNN's weight
+(`hybrid_weight_tgnn`, default 0.50) are both explicitly flagged as
+unmeasured placeholders, not evidence of quality.
 
 **Shipped posture — observable, not yet authoritative**:
 `hybrid_enabled=True` (the layer runs on every batch and persists a
@@ -189,7 +244,7 @@ Traffic → Hybrid IDS → Detection Fusion → Risk + CII
 **Consumes, does not re-detect.** `IPSPolicyEngine.decide()`
 (`backend/ips/policy.py`) is a pure function of an already-fused
 `FusedDecision` plus asset criticality and CII median impact — it never
-examines a raw flow or reimplements any of the five Hybrid IDS channels.
+examines a raw flow or reimplements any of the six Hybrid IDS channels.
 
 **Never blocks on a single weak signal.** Active prevention
 (RATE_LIMIT/BLOCK/QUARANTINE) requires EITHER a `Certainty.CONFIRMED`
@@ -409,21 +464,27 @@ Ordered by how soon each would matter, not by difficulty.
   Spoofing / Data Exfiltration currently recon against a gateway with no
   materialized protected asset)
 - [ ] Resolve/clarify the "three channels" framing everywhere it's
-  written — now sharper, not settled, now that §3 adds two more detector
-  inputs (signature, beaconing) feeding the same fused decision. "Three
-  channels, benchmarked" and "five detectors, fused" are both currently
-  true statements about different parts of the system and need one
-  consistent story in the pitch materials
+  written — now sharper, not settled, now that §3 adds three more
+  detector inputs (signature, beaconing, T-GNN) feeding the same fused
+  decision. "Three channels, benchmarked" and "six detectors, fused" are
+  both currently true statements about different parts of the system and
+  need one consistent story in the pitch materials
 
 ### Research-grade upgrades (bigger lift, real differentiator)
-- [ ] **Graph neural network** for novel-threat detection (Anomal-E /
-  E-GraphSAGE style) — self-supervised, edge-aware, no labels required;
-  would also give the "observed traffic doesn't map onto curated assets"
-  gap a principled learned-topology answer instead of two disconnected
-  layers. Complementary to, not superseded by, §3's signature/beaconing
-  detectors: those catch specific known shapes (rules) and one specific
-  temporal pattern (periodicity); a GNN would learn structure a
-  hand-written rule or a single-pair statistic cannot express
+- [x] ~~Graph neural network for novel-threat detection (Anomal-E /
+  E-GraphSAGE style)~~ — **done 2026-09-04**, see §3
+  (`backend/detection/tgnn.py`). Shipped as lightweight
+  structural-embedding anomaly detection (NetworkX graph features +
+  IsolationForest), not a full GNN framework — honestly labeled T-GNN
+  rather than claimed as a real neural network. Closes the "topologically
+  unusual but volumetrically/temporally unremarkable" gap that
+  §3's signature/beaconing detectors don't reach: those catch specific
+  known shapes (rules) and one specific temporal pattern (periodicity); a
+  graph-structural detector learns peer/concentration structure neither
+  can express. Its reliability weight (`hybrid_weight_tgnn`, default
+  0.50) is an unmeasured placeholder like beaconing's, and its baseline
+  carries the same first-N-batches-are-benign assumption as the
+  volumetric channel — a demo that opens with an injection poisons it
 - [ ] **Learned edge probabilities** for the CII dependency graph (Bayesian
   attack graph posterior updates from observed telemetry) instead of the
   current hand-assigned static probabilities

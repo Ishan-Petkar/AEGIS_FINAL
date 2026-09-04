@@ -847,6 +847,18 @@ class BackendSettings(BaseSettings):
             "it as evidence of the channel's quality."
         ),
     )
+    hybrid_weight_tgnn: float = Field(
+        default=0.50,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Reliability weight for the graph-structural (T-GNN) detector. "
+            "Deliberately mid-range and explicitly UNMEASURED on this "
+            "corpus at time of writing, mirroring hybrid_weight_beaconing — "
+            "there is no labelled structural-anomaly corpus yet to fit it "
+            "against. Treat it as a placeholder, not evidence of quality."
+        ),
+    )
 
     # ---- Hybrid IDS: beaconing (temporal) detector ------------------------
     beaconing_enabled: bool = Field(
@@ -927,6 +939,184 @@ class BackendSettings(BaseSettings):
             "Intervals longer than this are excluded from the CV "
             "computation — a gap that large means the channel went away and "
             "came back, not that it beaconed slowly."
+        ),
+    )
+
+    # ---- Hybrid IDS: T-GNN (graph-structural) detector --------------------
+    tgnn_enabled: bool = Field(
+        default=True,
+        description=(
+            "Whether the graph-structural detector runs. It addresses the "
+            "blind spot shared by every other channel: an attacker who is "
+            "volumetrically quiet, temporally regular, and rule-compliant "
+            "but talks to unusual peers or concentrates traffic in an "
+            "unusual way is invisible to size/timing/rule-based detectors "
+            "but visible in the communication graph's topology."
+        ),
+    )
+    tgnn_window_sec: float = Field(
+        default=60.0,
+        gt=0.0,
+        description=(
+            "Sliding window (seconds) for graph edge retention. Edges not "
+            "refreshed within this window are pruned, so the graph reflects "
+            "recent structural state rather than the entire session's "
+            "cumulative history. "
+            "MEASURED against the 2026-09-04 self-temporal-drift pivot's "
+            "offline replay (CIC-IDS2017 friday-morning): at the prior "
+            "default of 300s, a window this wide over real bursty traffic "
+            "captures enough incidental peer churn that neighbor_drift's "
+            "median sits above 0.8 for BENIGN flows too, drowning the "
+            "signal (benign fired 9.96%, Bot only 3.15%). 60s narrows the "
+            "window to traffic that is actually concurrent, cutting "
+            "incidental churn enough to separate the two (benign 1.67%, "
+            "Bot 28.48%, together with tgnn_min_edges_to_score=4 and "
+            "tgnn_contamination=0.1 below)."
+        ),
+    )
+    tgnn_max_nodes: int = Field(
+        default=500,
+        ge=10,
+        le=100_000,
+        description=(
+            "LRU cap on tracked graph nodes (IPs). Mirrors "
+            "beaconing_max_tracked_pairs — unbounded per-node state is a "
+            "real leak risk over a long-running stream given how many "
+            "distinct IPs a replay day can carry."
+        ),
+    )
+    tgnn_baseline_batches: int = Field(
+        default=10,
+        ge=1,
+        le=10_000,
+        description=(
+            "Number of ingest batches assumed benign before the detector "
+            "fits its IsolationForest baseline and switches from abstaining "
+            "to scoring. Mirrors StreamingScorer's fit-on-benign-first "
+            "convention. If the demo starts with an injection immediately, "
+            "the baseline will be poisoned — same limitation the volumetric "
+            "channel already has. "
+            "MEASURED, not guessed: a full friday-morning replay at 40x "
+            "produced only 49 ingest batches end to end, so the original "
+            "value of 50 meant the baseline was NEVER fitted and the "
+            "channel abstained on all 1,080 ingested flows — a silently "
+            "dead detector. 10 fits early enough to leave the large "
+            "majority of a replay in scoring mode."
+        ),
+    )
+    tgnn_min_baseline_nodes: int = Field(
+        default=8,
+        ge=2,
+        le=10_000,
+        description=(
+            "Minimum number of accumulated training ROWS (one scorable "
+            "node's feature vector from one batch — see "
+            "tgnn_max_training_rows) required before the baseline will be "
+            "fitted at all. The forest is deliberately fitted on the same "
+            "SCORABLE population it later scores (out-degree past "
+            "tgnn_min_edges_to_score) — see `_fit_baseline`'s docstring "
+            "for the measurement showing why fitting on the whole graph "
+            "instead saturates the channel at a 100% firing rate — and that "
+            "population is small, so this floor stops an IsolationForest "
+            "being fitted on two or three points, where its notion of an "
+            "outlier is meaningless. Below the floor the detector keeps "
+            "abstaining, which is the honest answer while it has nothing to "
+            "compare against."
+        ),
+    )
+    tgnn_refit_every_batches: int = Field(
+        default=100,
+        ge=1,
+        le=100_000,
+        description=(
+            "Refit the structural baseline every N batches once it has "
+            "first been fitted, so the reference distribution tracks the "
+            "traffic's CURRENT normal instead of staying frozen on the "
+            "first window ever seen. "
+            "MEASURED, not guessed: with a single frozen baseline fitted at "
+            "batch 10, the graph is still tiny and unrepresentative, and "
+            "every later node falls outside its range — the percentile "
+            "score came out p10=0.947 / p50=0.995 over 33,372 scored real "
+            "flows, i.e. essentially everything read as an outlier and the "
+            "channel fired on 100% of what it scored. Periodic refitting is "
+            "what makes the calibration mean anything on a graph that grows "
+            "over a session. "
+            "Tradeoff, stated plainly: structural change that persists "
+            "across a refit is absorbed into the new normal, so this "
+            "detects a CHANGE in topology rather than a standing "
+            "misconfiguration — the same class of limitation as the "
+            "benign-baseline assumption above."
+        ),
+    )
+    tgnn_min_edges_to_score: int = Field(
+        default=4,
+        ge=1,
+        le=10_000,
+        description=(
+            "Minimum outgoing edges a node must have before it is "
+            "considered scorable. Below this, the sample is too small for "
+            "the temporal-drift features (unseen-peer ratio, degree "
+            "expansion, neighbor drift, entropy delta) to mean anything, "
+            "and the detector abstains rather than guessing. "
+            "MEASURED against the 2026-09-04 self-temporal-drift pivot's "
+            "offline replay (CIC-IDS2017 friday-morning, paired with "
+            "tgnn_window_sec=60 and tgnn_contamination=0.1): 3 left in "
+            "enough low-context, one-off nodes that BENIGN firing sat at "
+            "9.96% against Bot's 3.15% — inverted. 4 filters out that "
+            "low-context noise; BENIGN firing fell to 1.67% and Bot rose "
+            "to 28.48%."
+        ),
+    )
+    tgnn_max_training_rows: int = Field(
+        default=5_000,
+        ge=50,
+        le=1_000_000,
+        description=(
+            "Cap on the rolling buffer of per-batch, per-scorable-node "
+            "temporal-drift feature rows the IsolationForest is fitted on "
+            "(a `collections.deque(maxlen=...)`, oldest rows drop first). "
+            "Rows are collected every batch — including before the "
+            "baseline is first fitted — because a SINGLE snapshot compared "
+            "against itself gives every delta feature exactly zero "
+            "variance (unseen-peer ratio, degree expansion, drift and "
+            "entropy delta are all trivially 0 when 'current' and "
+            "'baseline' are read at the same instant), and an "
+            "IsolationTree cannot split on a zero-variance column. "
+            "Accumulating rows across many batches captures REAL temporal "
+            "spread instead — established nodes contribute near-zero "
+            "drift rows while newly-appeared nodes contribute high-drift "
+            "ones — which is what makes 'unusual drift' answerable at "
+            "fit time. The rolling window also means a periodic refit "
+            "trains on recent behaviour rather than the session's entire "
+            "history. At 4 float32 features per row the cap costs "
+            "kilobytes, not a scaling concern."
+        ),
+    )
+    tgnn_fire_threshold: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Calibrated score at or above which a T-GNN verdict fires. "
+            "Applied to the linear map of IsolationForest's anomaly score "
+            "onto [0, 1] — see tgnn.py's module docstring for the mapping."
+        ),
+    )
+    tgnn_contamination: float = Field(
+        default=0.1,
+        gt=0.0,
+        le=0.5,
+        description=(
+            "IsolationForest's contamination parameter — the assumed "
+            "fraction of structurally anomalous rows in the training "
+            "buffer used to set its internal decision threshold. "
+            "MEASURED against the 2026-09-04 self-temporal-drift pivot's "
+            "offline replay (paired with tgnn_window_sec=60 and "
+            "tgnn_min_edges_to_score=4): 0.05 under-fired on Bot (19.79% "
+            "vs BENIGN 0.46% — correctly ordered but short of the >25% "
+            "target); 0.1 reached BENIGN 1.67% / Bot 28.48%. 0.15 pushed "
+            "Bot to 30.11% but also BENIGN to 4.61%, most of the way back "
+            "to the 5% ceiling — 0.1 was kept as the safer margin."
         ),
     )
 
