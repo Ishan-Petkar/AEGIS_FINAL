@@ -6,7 +6,7 @@ import { SeverityGlyph, type Severity } from "./SeverityGlyph";
 import { ApiError, ApiNetworkError, getIpsActions, getIpsPolicy, rollbackIpsAction } from "@/lib/api";
 import { useConnection } from "@/lib/connection-context";
 import { useStream } from "@/lib/stream-context";
-import type { EventEnvelopeData, IpsActionOut, IpsPolicyResponse } from "@/lib/types";
+import type { EventEnvelopeData, IpsActionEnvelopeData, IpsActionOut, IpsPolicyResponse } from "@/lib/types";
 
 // DetectionPreventionPanel — the detailed injections/detections/
 // preventions view (console redesign, light-theme dashboard pass).
@@ -76,13 +76,189 @@ function friendlyError(err: unknown, fallback: string): string {
   return fallback;
 }
 
+/** Merge live WS ipsActions into the REST list: newest lifecycle state
+ * per id wins (a rollback envelope must beat the original decision entry). */
+function mergeIpsActions(rest: IpsActionOut[], live: IpsActionEnvelopeData[]): IpsActionOut[] {
+  const map = new Map<number, IpsActionOut>();
+  // REST first (base)
+  for (const a of rest) map.set(a.id, a);
+  // Live overwrites any stale REST copy (same id, newer lifecycle state)
+  for (const a of live) {
+    const existing = map.get(a.id);
+    map.set(a.id, {
+      ...(existing ?? { replay_session_id: null }),
+      ...a,
+    });
+  }
+  return [...map.values()].sort((a, b) => b.id - a.id);
+}
+
+/** Remaining seconds until `expires_at`, or null. */
+function useTtl(expiresAt: string | null): number | null {
+  const [remaining, setRemaining] = useState<number | null>(() => {
+    if (!expiresAt) return null;
+    return Math.max(0, Math.round((new Date(expiresAt).getTime() - Date.now()) / 1000));
+  });
+  useEffect(() => {
+    if (!expiresAt) return;
+    const tick = () => {
+      const r = Math.max(0, Math.round((new Date(expiresAt).getTime() - Date.now()) / 1000));
+      setRemaining(r);
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [expiresAt]);
+  return remaining;
+}
+
+function TtlBadge({ expiresAt }: { expiresAt: string | null }) {
+  const remaining = useTtl(expiresAt);
+  if (remaining === null) return null;
+  const tone = remaining <= 30 ? "text-sev-warning" : "text-text-mute";
+  return (
+    <span className={`font-mono text-[10px] tabular-nums ${tone}`} title={`Expires at ${expiresAt ?? ""}`}>
+      TTL {remaining}s
+    </span>
+  );
+}
+
+interface RollbackState {
+  pending: boolean;
+  error: string | null;
+}
+
+function PreventionRow({
+  a,
+  onRollback,
+}: {
+  a: IpsActionOut;
+  onRollback: (id: number) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [rb, setRb] = useState<RollbackState>({ pending: false, error: null });
+
+  async function handleRollback() {
+    setRb({ pending: true, error: null });
+    try {
+      await rollbackIpsAction(a.id);
+      onRollback(a.id);
+      setRb({ pending: false, error: null });
+    } catch (err) {
+      const msg = friendlyError(err, "Rollback failed — unknown error.");
+      setRb({ pending: false, error: msg });
+      onRollback(a.id); // refetch anyway — a 409 means it's already inactive
+    }
+  }
+
+  const active = isActivePrevention(a);
+  const isTerminal = !!a.rolled_back_at;
+
+  // Parse evidence for display
+  const ev = a.evidence as Record<string, unknown> | null;
+
+  return (
+    <>
+      <tr className="border-b border-glass-border last:border-0 hover:bg-glass-raised">
+        <td className="whitespace-nowrap px-3 py-2 font-mono text-text-mute">{formatTime(a.ts)}</td>
+        <td className="max-w-[220px] truncate px-3 py-2 font-mono text-text" title={a.target_asset}>
+          {a.target_asset}
+        </td>
+        <td className="px-3 py-2">
+          <ActionBadge action={a.action} />
+          {a.dry_run && (
+            <span className="ml-1.5 rounded-full border border-glass-border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.05em] text-text-mute">
+              dry-run
+            </span>
+          )}
+        </td>
+        <td className="px-3 py-2 font-mono tabular-nums text-text-dim">{a.confidence.toFixed(2)}</td>
+        <td className="px-3 py-2 text-text-dim">
+          <div className="flex flex-col gap-0.5">
+            <span>{a.status}</span>
+            {active && <TtlBadge expiresAt={a.expires_at} />}
+            {isTerminal && a.rolled_back_at && (
+              <span className="font-mono text-[10px] text-text-mute">
+                rolled back {new Date(a.rolled_back_at).toLocaleTimeString()}
+              </span>
+            )}
+          </div>
+        </td>
+        <td className="px-3 py-2 text-right">
+          <div className="flex items-center justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => setOpen((v) => !v)}
+              className="rounded-[var(--radius-dense)] border border-glass-border px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.06em] text-text-mute hover:border-accent hover:text-accent"
+              aria-label={open ? "Collapse detail" : "Expand detail"}
+            >
+              {open ? "▲" : "▼"}
+            </button>
+            {active && (
+              <button
+                type="button"
+                disabled={rb.pending}
+                onClick={handleRollback}
+                className="rounded-[var(--radius-dense)] border border-glass-border px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.06em] text-text-dim transition-colors hover:border-accent hover:text-accent disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {rb.pending ? "Rolling back…" : "Roll back"}
+              </button>
+            )}
+          </div>
+        </td>
+      </tr>
+      {rb.error && (
+        <tr className="border-b border-glass-border">
+          <td colSpan={6} className="px-3 py-1 text-xs text-sev-critical" role="alert">
+            {rb.error}
+          </td>
+        </tr>
+      )}
+      {open && (
+        <tr className="border-b border-glass-border bg-glass-raised/50">
+          <td colSpan={6} className="px-3 py-2 text-xs text-text-dim">
+            <div className="flex flex-col gap-1 font-mono">
+              <p>
+                <span className="text-text-mute">reason:</span> {a.reason}
+              </p>
+              {a.triggering_event_id != null && (
+                <p>
+                  <span className="text-text-mute">trigger event:</span> #{a.triggering_event_id}
+                </p>
+              )}
+              {isTerminal && a.rollback_reason && (
+                <p>
+                  <span className="text-text-mute">rollback reason:</span> {a.rollback_reason}
+                </p>
+              )}
+              {ev && (
+                <div className="mt-1">
+                  <p className="text-text-mute">evidence:</p>
+                  <ul className="pl-3">
+                    {Object.entries(ev).map(([k, v]) => (
+                      <li key={k}>
+                        {k}: {String(v)}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
 function PreventionTab() {
-  const [actions, setActions] = useState<IpsActionOut[]>([]);
+  const [restActions, setRestActions] = useState<IpsActionOut[]>([]);
   const [policy, setPolicy] = useState<IpsPolicyResponse | null>(null);
   const [state, setState] = useState<LoadState>({ kind: "loading" });
-  const [rollbackPending, setRollbackPending] = useState<Set<number>>(new Set());
   const [retryToken, setRetryToken] = useState(0);
   const { reconnectEpoch } = useConnection();
+  // Live IPS action stream — merged with REST by id; newest lifecycle wins
+  const { ipsActions: liveIpsActions } = useStream();
 
   useEffect(() => {
     let cancelled = false;
@@ -90,11 +266,12 @@ function PreventionTab() {
       setState({ kind: "loading" });
       try {
         const [actionsResp, policyResp] = await Promise.all([
-          getIpsActions({ limit: HISTORY_LIMIT }),
+          // Pass active=true so activeCount is accurate past the 100-row page
+          getIpsActions({ limit: HISTORY_LIMIT, active: true }),
           getIpsPolicy(),
         ]);
         if (cancelled) return;
-        setActions(actionsResp.actions);
+        setRestActions(actionsResp.actions);
         setPolicy(policyResp);
         setState({ kind: "loaded" });
       } catch (err) {
@@ -108,25 +285,11 @@ function PreventionTab() {
     };
   }, [reconnectEpoch, retryToken]);
 
-  const activeCount = useMemo(() => actions.filter(isActivePrevention).length, [actions]);
+  // Merge REST + live; live ipsActions also includes the full REST history
+  // load — newest state per id wins so a rollback envelope beats the original
+  const actions = useMemo(() => mergeIpsActions(restActions, liveIpsActions), [restActions, liveIpsActions]);
 
-  async function handleRollback(id: number) {
-    setRollbackPending((prev) => new Set(prev).add(id));
-    try {
-      await rollbackIpsAction(id);
-      setRetryToken((n) => n + 1);
-    } catch {
-      // Refetch regardless -- a 409 means it's already inactive, which the
-      // refreshed list will show correctly either way.
-      setRetryToken((n) => n + 1);
-    } finally {
-      setRollbackPending((prev) => {
-        const next = new Set(prev);
-        next.delete(id);
-        return next;
-      });
-    }
-  }
+  const activeCount = useMemo(() => actions.filter(isActivePrevention).length, [actions]);
 
   const protectionLevel = !policy ? "—" : !policy.enabled ? "Disabled" : policy.dry_run ? "Dry-run" : "Enforcing";
   const protectionTone = !policy || !policy.enabled ? "text-text-mute" : policy.dry_run ? "text-sev-warning" : "text-sev-critical";
@@ -156,45 +319,18 @@ function PreventionTab() {
                 <th className="px-3 py-2 font-semibold">Target Asset</th>
                 <th className="px-3 py-2 font-semibold">Action</th>
                 <th className="px-3 py-2 font-semibold">Confidence</th>
-                <th className="px-3 py-2 font-semibold">Status</th>
+                <th className="px-3 py-2 font-semibold">Status / TTL</th>
                 <th className="px-3 py-2 font-semibold" />
               </tr>
             </thead>
             <tbody>
-              {actions.map((a) => {
-                const active = isActivePrevention(a);
-                const pending = rollbackPending.has(a.id);
-                return (
-                  <tr key={a.id} className="border-b border-glass-border/60 last:border-0 hover:bg-glass-raised">
-                    <td className="whitespace-nowrap px-3 py-2 font-mono text-text-mute">{formatTime(a.ts)}</td>
-                    <td className="max-w-[220px] truncate px-3 py-2 font-mono text-text" title={a.target_asset}>
-                      {a.target_asset}
-                    </td>
-                    <td className="px-3 py-2">
-                      <ActionBadge action={a.action} />
-                      {a.dry_run && (
-                        <span className="ml-1.5 rounded-full border border-glass-border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.05em] text-text-mute">
-                          dry-run
-                        </span>
-                      )}
-                    </td>
-                    <td className="px-3 py-2 font-mono tabular-nums text-text-dim">{a.confidence.toFixed(2)}</td>
-                    <td className="px-3 py-2 text-text-dim">{a.status}</td>
-                    <td className="px-3 py-2 text-right">
-                      {active && (
-                        <button
-                          type="button"
-                          disabled={pending}
-                          onClick={() => handleRollback(a.id)}
-                          className="rounded-[var(--radius-dense)] border border-glass-border px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.06em] text-text-dim transition-colors hover:border-accent hover:text-accent disabled:cursor-not-allowed disabled:opacity-50"
-                        >
-                          {pending ? "Rolling back…" : "Roll back"}
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                );
-              })}
+              {actions.map((a) => (
+                <PreventionRow
+                  key={a.id}
+                  a={a}
+                  onRollback={() => setRetryToken((n) => n + 1)}
+                />
+              ))}
             </tbody>
           </table>
         </div>
@@ -202,6 +338,7 @@ function PreventionTab() {
     </div>
   );
 }
+
 
 // ---------------------------------------------------------------------------
 // Tab 2 — Detection (IDS)
@@ -263,7 +400,7 @@ function DetectionTab() {
                 if (e.is_anomaly) detectors.push("isolation_forest");
                 if (e.hybrid) for (const d of e.hybrid.fired_detectors) if (!detectors.includes(d)) detectors.push(d);
                 return (
-                  <tr key={e.id} className="border-b border-glass-border/60 last:border-0 hover:bg-glass-raised">
+                  <tr key={e.id} className="border-b border-glass-border last:border-0 hover:bg-glass-raised">
                     <td className="whitespace-nowrap px-3 py-2 font-mono text-text-mute">{formatTime(e.ts)}</td>
                     <td className="max-w-[260px] truncate px-3 py-2 font-mono text-text" title={`${src} → ${dst}`}>
                       {src} <span aria-hidden="true">&rarr;</span> {dst}

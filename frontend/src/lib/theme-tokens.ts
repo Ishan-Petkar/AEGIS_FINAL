@@ -40,20 +40,20 @@ export interface ThemeColors {
 }
 
 const FALLBACK: ThemeColors = {
-  ground: "black",
-  groundRaised: "black",
-  glassBorder: "gray",
-  glassBorderStrong: "gray",
-  text: "whitesmoke",
-  textDim: "silver",
-  textMute: "dimgray",
-  accent: "orange",
-  accentHi: "orange",
+  ground: "whitesmoke",
+  groundRaised: "white",
+  glassBorder: "lightgray",
+  glassBorderStrong: "darkgray",
+  text: "#101828",
+  textDim: "#475467",
+  textMute: "#667085",
+  accent: "royalblue",
+  accentHi: "cornflowerblue",
   sevCritical: "crimson",
-  sevWarning: "gold",
+  sevWarning: "darkorange",
   sevNormal: "seagreen",
   sevInfo: "steelblue",
-  financial: "goldenrod",
+  financial: "rebeccapurple",
 };
 
 const VAR_NAMES: Record<keyof ThemeColors, string> = {

@@ -102,6 +102,70 @@ function severityOf(e: EventEnvelopeData): Severity {
   return "normal";
 }
 
+// Phase 6: TYPE column — precedence-ordered tag from per-event detection signals.
+// Never surfaces `Event.raw.label` (attack ground truth, must not mislead operators
+// about what AEGIS itself can observe in real time).
+export type TrafficTag =
+  | "TRIPWIRE"
+  | "KNOWN-BAD"
+  | "C2-SHAPED"
+  | "ADMIN-PORT"
+  | "DB-EXPOSED"
+  | "BEACON"
+  | "KNOWN-THREAT"
+  | "ANOMALY"
+  | "NORMAL";
+
+// Signature rule ID → traffic tag. Stable IDs per signature.py:250–253.
+const SIG_TAG: Record<string, TrafficTag> = {
+  "AEGIS-SIG-001": "KNOWN-BAD",
+  "AEGIS-SIG-002": "C2-SHAPED",
+  "AEGIS-SIG-004": "ADMIN-PORT",
+  "AEGIS-SIG-005": "DB-EXPOSED",
+};
+
+function typeTagOf(e: EventEnvelopeData): TrafficTag {
+  if (e.tripwire_fired) return "TRIPWIRE";
+  // Signature-based tags from hybrid.matched_rules (Phase 6.1 backend addition);
+  // fall back gracefully if the backend hasn’t been updated yet.
+  if (e.hybrid?.matched_rules) {
+    for (const ruleId of e.hybrid.matched_rules) {
+      const tag = SIG_TAG[ruleId];
+      if (tag) return tag;
+    }
+  }
+  // Beaconing detector fired.
+  if (e.hybrid?.fired_detectors?.includes("beaconing")) return "BEACON";
+  // Any random-forest/ML verdict.
+  if (e.hybrid?.fired_detectors?.some((d) => d.includes("random_forest") || d.includes("gradient_boost")))
+    return "KNOWN-THREAT";
+  if (e.is_anomaly) return "ANOMALY";
+  return "NORMAL";
+}
+
+const TAG_STYLE: Record<TrafficTag, string> = {
+  TRIPWIRE:   "border-sev-critical text-sev-critical",
+  "KNOWN-BAD":  "border-sev-critical text-sev-critical",
+  "C2-SHAPED":  "border-sev-warning text-sev-warning",
+  "ADMIN-PORT": "border-sev-warning text-sev-warning",
+  "DB-EXPOSED": "border-sev-warning text-sev-warning",
+  BEACON:      "border-sev-warning text-sev-warning",
+  "KNOWN-THREAT": "border-sev-warning text-sev-warning",
+  ANOMALY:     "border-sev-warning text-sev-warning",
+  NORMAL:      "border-glass-border text-text-mute",
+};
+
+function TrafficTypeBadge({ tag }: { tag: TrafficTag }) {
+  return (
+    <span
+      className={`shrink-0 rounded border px-1 text-[9px] font-bold uppercase tracking-[0.06em] ${TAG_STYLE[tag]}`}
+      aria-label={`Traffic type: ${tag}`}
+    >
+      {tag}
+    </span>
+  );
+}
+
 /**
  * TelemetryRail (DESIGN_CONSOLE.md §5, §6) — feed rows, mono, two lines:
  * `time · glyph` then the full `src → dst` address pair (Ticket #19 §A —
@@ -114,6 +178,7 @@ function severityOf(e: EventEnvelopeData): Severity {
  */
 export function TelemetryRail() {
   const { status, events } = useStream();
+  const [typeFilter, setTypeFilter] = useState<TrafficTag | "ALL">("ALL");
 
   // Mirrors `events` on every change without itself causing a re-render —
   // read by the throttled interval below.
@@ -171,7 +236,10 @@ export function TelemetryRail() {
     setDisplayEvents(eventsRef.current);
   }, []);
 
-  const hasRows = displayEvents.length > 0;
+  const filteredEvents =
+    typeFilter === "ALL" ? displayEvents : displayEvents.filter((e) => typeTagOf(e) === typeFilter);
+
+  const hasRows = filteredEvents.length > 0 || displayEvents.length > 0;
 
   let stateMessage: string | null = null;
   if (!hasRows) {
@@ -241,6 +309,24 @@ export function TelemetryRail() {
         onMouseLeave={resume}
         onScroll={freeze}
       >
+        <div className="flex shrink-0 items-center gap-2 border-b border-glass-border px-2 py-1.5">
+          <span className="text-[9px] font-semibold uppercase tracking-[0.07em] text-text-mute">Filter</span>
+          <select
+            value={typeFilter}
+            onChange={(e) => setTypeFilter(e.target.value as TrafficTag | "ALL")}
+            className="ml-auto rounded border border-glass-border bg-glass-raised px-1.5 py-0.5 text-[10px] font-mono text-text-dim focus:outline-none focus:ring-1 focus:ring-accent"
+            aria-label="Filter traffic by type"
+          >
+            <option value="ALL">All Traffic</option>
+            <option value="TRIPWIRE">Tripwire</option>
+            <option value="KNOWN-BAD">Known-Bad</option>
+            <option value="C2-SHAPED">C2-Shaped</option>
+            <option value="BEACON">Beacon</option>
+            <option value="KNOWN-THREAT">Known-Threat</option>
+            <option value="ANOMALY">Anomaly</option>
+            <option value="NORMAL">Normal</option>
+          </select>
+        </div>
         {banner && (
           <p className="px-2 pb-1 text-[10px] uppercase tracking-[0.08em] text-sev-warning">
             {banner}
@@ -248,12 +334,15 @@ export function TelemetryRail() {
         )}
         {stateMessage ? (
           <p className="px-2 py-3 text-xs text-text-mute">{stateMessage}</p>
+        ) : filteredEvents.length === 0 && typeFilter !== "ALL" ? (
+          <p className="px-2 py-3 text-xs text-text-mute">No {typeFilter} events in current view.</p>
         ) : (
           <ul className="flex flex-col">
-            {displayEvents.map((e, i) => {
+            {filteredEvents.map((e, i) => {
               const severity = severityOf(e);
               const isAnomalous = severity !== "normal";
-              const opacity = Math.max(0.35, 1 - i * 0.04);
+              const opacity = Math.max(0.75, 1 - i * 0.04);
+              const tag = typeTagOf(e);
               const { src, dst, elided } = addressPair(
                 e.source_asset,
                 e.source_ip,
@@ -265,7 +354,7 @@ export function TelemetryRail() {
               return (
                 <li
                   key={e.id}
-                  className={`flex flex-col gap-0.5 border-b border-glass-border/50 py-1 pl-2 font-mono text-xs ${
+                  className={`flex flex-col gap-0.5 border-b border-glass-border py-1 pl-2 font-mono text-xs ${
                     isAnomalous ? "border-l-2" : "border-l-2 border-l-transparent"
                   }`}
                   style={{
@@ -281,6 +370,8 @@ export function TelemetryRail() {
                     <span className="shrink-0 tabular-nums text-text-mute">
                       {formatTime(e.ts, e.timing_provenance)}
                     </span>
+                    {/* Phase 6: TYPE tag */}
+                    <TrafficTypeBadge tag={tag} />
                     {/* Ticket #13 what-if scenarios replay REAL captured
                         attack flows re-targeted onto a curated asset. That
                         is an operator hypothesis, not observed telemetry,

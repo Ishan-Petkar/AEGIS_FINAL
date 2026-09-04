@@ -28,7 +28,7 @@
   /* Text */
   --text: #101828;
   --text-dim: #475467;
-  --text-mute: #98a2b3;
+  --text-mute: #667085; /* darkened from #98a2b3 for AA at ≤11px (was ~2.3:1, now ~4.5:1) */
 
   /* Brand vs. severity — kept as separate scales */
   --accent: #3457d1;

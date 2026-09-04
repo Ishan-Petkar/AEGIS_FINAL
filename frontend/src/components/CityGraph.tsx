@@ -784,6 +784,19 @@ interface CascadeState {
   /** Hop assigned to impacted assets the BFS never reached (disconnected from origin in the curated graph) — still revealed, just last and without a lit path. */
   fallbackHop: number;
   startedAt: number;
+  // Phase 4.2 display-layer projection — THE attack-path fix:
+  // `pathEdgeIds` uses real asset IDs (curated:A->B). When the graph is
+  // in default collapsed view, links are keyed by display IDs
+  // (curated:sector:finance->sector:core). These parallel fields hold the
+  // same geometry projected through the current display remap, so the
+  // collapsed view’s links actually light up during a cascade.
+  /** Display-layer link id set (may be null when view is fully expanded). */
+  displayPathEdgeIds: Set<string> | null;
+  displayEdgeHopOf: Map<string, number> | null;
+  /** Display-layer ID of the origin node (sector aggregate if collapsed). */
+  displayOriginId: string | null;
+  /** Display-layer node id -> hop for impacted rings in collapsed view. */
+  displayHopOf: Map<string, number> | null;
 }
 
 /**
@@ -1323,6 +1336,69 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
       impacted,
       topology.edges
     );
+
+    // Phase 4.2 — project cascade geometry through the current display
+    // remap so the collapsed/sector view's link IDs match. The remap
+    // function is recreated from buildSectorByName (same data used in
+    // buildDisplayTopology) so this is a pure in-place projection.
+    const displaySectorByName = buildSectorByName(topology.nodes);
+    const expandedNames = new Set<string>();
+    if (expanded) {
+      // Fully expanded: every real asset is its own display node.
+      for (const n of topology.nodes) expandedNames.add(n.name);
+    } else {
+      // Sector-focused: only nodes in focusedSectors are expanded.
+      for (const [name, sector] of displaySectorByName) {
+        if (focusedSectors.has(sector)) expandedNames.add(name);
+      }
+    }
+    const displayRemap = (name: string): string | null => {
+      if (expandedNames.has(name)) return name;
+      const sector = displaySectorByName.get(name);
+      return sector ? sectorNodeId(sector) : null;
+    };
+
+    const displayOriginId = displayRemap(latestCii.origin_asset);
+    let displayPathEdgeIds: Set<string> | null = null;
+    let displayEdgeHopOf: Map<string, number> | null = null;
+    let displayHopOf: Map<string, number> | null = null;
+
+    if (displayOriginId && displayOriginId !== latestCii.origin_asset) {
+      // Collapsed view: rebuild display-layer edge/hop maps.
+      displayPathEdgeIds = new Set<string>();
+      displayEdgeHopOf = new Map<string, number>();
+      displayHopOf = new Map<string, number>();
+
+      // Re-run BFS path edges from real pathEdgeIds, projected through remap.
+      for (const edgeId of pathEdgeIds) {
+        // edgeId is "curated:real_src->real_tgt"
+        const inner = edgeId.slice("curated:".length);
+        const arrowIdx = inner.indexOf("->");
+        if (arrowIdx < 0) continue;
+        const rs = inner.slice(0, arrowIdx);
+        const rt = inner.slice(arrowIdx + 2);
+        const ds = displayRemap(rs);
+        const dt = displayRemap(rt);
+        if (!ds || !dt || ds === dt) continue;
+        const displayEdgeId = `curated:${ds}->${dt}`;
+        displayPathEdgeIds.add(displayEdgeId);
+        // Use the real hop of the original edge endpoint.
+        const origHop = edgeHopOf.get(edgeId);
+        if (origHop !== undefined && !displayEdgeHopOf.has(displayEdgeId)) {
+          displayEdgeHopOf.set(displayEdgeId, origHop);
+        }
+      }
+      // Also project impacted hops onto display node IDs.
+      for (const [assetName, hop] of hopOf) {
+        const displayId = displayRemap(assetName);
+        if (!displayId) continue;
+        const existing = displayHopOf.get(displayId);
+        if (existing === undefined || hop < existing) {
+          displayHopOf.set(displayId, hop);
+        }
+      }
+    }
+
     setCascade({
       originAsset: latestCii.origin_asset,
       ciiMedian: latestCii.cii_median,
@@ -1335,6 +1411,10 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
       edgeHopOf,
       fallbackHop,
       startedAt: performance.now(),
+      displayPathEdgeIds,
+      displayEdgeHopOf,
+      displayHopOf,
+      displayOriginId,
     });
 
     // D-R2/D-R3 "cascade animation still animates on the real impacted
@@ -1360,7 +1440,7 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
       const originSector = sectorByName.get(latestCii.origin_asset);
       if (originSector) focusSector(originSector);
     }
-  }, [latestCii, topology.edges, expanded, sectorByName, focusSector]);
+  }, [latestCii, topology.edges, topology.nodes, expanded, focusedSectors, sectorByName, focusSector]);
 
   const nodeCanvasObject = useCallback(
     (node: CityNodeDatum, ctx: CanvasRenderingContext2D, globalScale: number) => {
@@ -1472,49 +1552,82 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
           ctx.arc(x, y, ringR, 0, 2 * Math.PI);
           ctx.lineWidth = 2;
           ctx.strokeStyle = pulseColor;
-          ctx.globalAlpha = reducedMotion ? 0.9 : 0.35 + (1 - pulseT) * 0.5;
+          // Phase 1.3: raise pulse floor from 0.35 to 0.55 — 0.35 on white
+          // renders the ring almost invisible.
+          ctx.globalAlpha = reducedMotion ? 0.9 : 0.55 + (1 - pulseT) * 0.4;
           ctx.stroke();
           ctx.globalAlpha = 1;
         }
 
-        // Ticket #14 (D14-2): cascade overlay, strictly from the real
-        // `cii` envelope (`cascade`) — never a scripted path. The origin
-        // pulses critical; impacted assets light up in the order/hop
-        // computed from the real curated edges + the real `impacted`
-        // list (`computeCascadeGeometry`), staggered by
-        // `CASCADE_STAGGER_MS` so the reveal reads as propagation rather
-        // than everything flashing at once. `prefers-reduced-motion`
-        // shows the fully-revealed end state with no motion.
+        // Cascade overlay — origin shows red hexagon + ! badge (Phase 4.5);
+        // impacted nodes get an amber ring staggered by hop (Phase 4.2/4.3).
         if (cascade) {
-          if (node.id === cascade.originAsset) {
+          const displayOrigin = cascade.displayOriginId ?? cascade.originAsset;
+          if (node.id === displayOrigin) {
+            // Phase 4.5: origin-as-compromised — red hexagon marker overlay
+            // drawn OVER the normal shape so it overrides any hub/gateway/
+            // financial rendering for the attack duration. Own glyph still
+            // stroked inside for CVD/greyscale legibility.
+            const hR = markerR + 2;
+            ctx.beginPath();
+            for (let k = 0; k < 6; k++) {
+              const angle = (Math.PI / 3) * k - Math.PI / 6;
+              const px = x + hR * Math.cos(angle);
+              const py = y + hR * Math.sin(angle);
+              if (k === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+            }
+            ctx.closePath();
+            ctx.fillStyle = colors.sevCritical;
+            ctx.globalAlpha = 0.18;
+            ctx.fill();
+            ctx.globalAlpha = 1;
+            ctx.lineWidth = 2.2;
+            ctx.strokeStyle = colors.sevCritical;
+            ctx.stroke();
+
+            // ! badge in top-right of marker
+            const badgeX = x + hR * 0.62;
+            const badgeY = y - hR * 0.62;
+            ctx.beginPath();
+            ctx.arc(badgeX, badgeY, 5 / globalScale, 0, 2 * Math.PI);
+            ctx.fillStyle = colors.sevCritical;
+            ctx.fill();
+            ctx.font = `bold ${6 / globalScale}px ${monoFont}`;
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            ctx.fillStyle = colors.groundRaised;
+            ctx.fillText("!", badgeX, badgeY);
+
+            // Pulsing origin ring
             const ringR = markerR + 7 + (reducedMotion ? 4 : pulseT * 8);
             ctx.beginPath();
             ctx.arc(x, y, ringR, 0, 2 * Math.PI);
             ctx.lineWidth = 2.4;
             ctx.strokeStyle = colors.sevCritical;
-            ctx.globalAlpha = reducedMotion ? 0.95 : 0.45 + (1 - pulseT) * 0.5;
+            ctx.globalAlpha = reducedMotion ? 0.95 : 0.55 + (1 - pulseT) * 0.4;
             ctx.stroke();
             ctx.globalAlpha = 1;
           } else if (
             node.isAggregate
-              ? // A still-aggregated sector can hold a real impacted asset
-                // the default view isn't showing individually right now —
-                // the aggregate node itself lights up so the cascade stays
-                // visible without forcing every sector open (D-R2/D-R3).
+              ? // A still-aggregated sector holds a real impacted asset
+                // not shown individually — light up the aggregate node so
+                // the cascade is visible without forcing every sector open.
                 (sectorMembers.get(node.id.slice("sector:".length)) ?? []).some((m) =>
                   cascade.impactedSet.has(m.name)
                 )
               : cascade.impactedSet.has(node.id)
           ) {
-            const hop = cascade.hopOf.get(node.id) ?? cascade.fallbackHop;
+            const hop = cascade.displayHopOf?.get(node.id) ?? cascade.hopOf.get(node.id) ?? cascade.fallbackHop;
+            const revealMs = hop * CASCADE_STAGGER_MS;
             const elapsed = reducedMotion ? Infinity : performance.now() - cascade.startedAt;
-            if (elapsed >= hop * CASCADE_STAGGER_MS) {
+            if (elapsed >= revealMs) {
               const ringR = markerR + 5;
               ctx.beginPath();
               ctx.arc(x, y, ringR, 0, 2 * Math.PI);
               ctx.lineWidth = 2;
               ctx.strokeStyle = colors.sevWarning;
-              ctx.globalAlpha = 0.85;
+              // Phase 1.3: raise impacted ring alpha from 0.85 to 1.0
+              ctx.globalAlpha = 1.0;
               ctx.stroke();
               ctx.globalAlpha = 1;
             }
@@ -1577,12 +1690,14 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
           const plateHeight = fontSize + 4;
           const plateTop = above ? anchorY - plateHeight : anchorY;
 
+          // Phase 1.2: fully opaque fill (was 0.85 — at 0.85 on a white
+          // background the plate is still white but semi-transparent, which
+          // lets edges bleed through the label area on light displays).
           ctx.fillStyle = colors.groundRaised;
-          ctx.globalAlpha = 0.85;
-          ctx.fillRect(anchorX - textWidth / 2 - platePadX, plateTop, textWidth + platePadX * 2, plateHeight);
           ctx.globalAlpha = 1;
-          ctx.lineWidth = 1;
-          ctx.strokeStyle = isHub ? colors.accentHi : colors.glassBorder;
+          ctx.fillRect(anchorX - textWidth / 2 - platePadX, plateTop, textWidth + platePadX * 2, plateHeight);
+          ctx.lineWidth = 1 / globalScale;
+          ctx.strokeStyle = isHub ? colors.accentHi : colors.glassBorderStrong;
           ctx.strokeRect(anchorX - textWidth / 2 - platePadX, plateTop, textWidth + platePadX * 2, plateHeight);
 
           ctx.textAlign = "center";
@@ -1600,7 +1715,8 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
         ctx.arc(x, y, r, 0, 2 * Math.PI);
         ctx.lineWidth = 1.3;
         ctx.strokeStyle = node.isOther ? colors.textMute : colors.sevInfo;
-        ctx.globalAlpha = 0.8;
+        // Phase 1.3: raise cluster dash alpha from 0.8 to 1.0
+        ctx.globalAlpha = 1.0;
         ctx.stroke();
         ctx.restore();
 
@@ -1610,23 +1726,21 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
           ctx.arc(x, y, ringR, 0, 2 * Math.PI);
           ctx.lineWidth = 2;
           ctx.strokeStyle = pulseColor;
-          ctx.globalAlpha = reducedMotion ? 0.9 : 0.35 + (1 - pulseT) * 0.5;
+          // Phase 1.3: raise cluster pulse floor from 0.35 to 0.55
+          ctx.globalAlpha = reducedMotion ? 0.9 : 0.55 + (1 - pulseT) * 0.4;
           ctx.stroke();
           ctx.globalAlpha = 1;
         }
 
-        // Ticket #14 (D14-1): cluster labels only on hover — always-on
-        // labels for up to 24 arriving `/24`s is exactly what made the
-        // graph illegible. Curated labels use the same hover fallback now
-        // (Ticket #16, D-C5) for the low-criticality periphery only — the
-        // hub, financial assets, gateways and cascade-involved nodes stay
-        // permanently labelled above regardless of hover state.
+        // Cluster labels only on hover — always-on for up to 24 /24s
+        // would be illegible. Use textDim (not textMute) for visibility.
         if (hoveredNodeIdRef.current === node.id) {
           const fontSize = Math.max(10 / globalScale, 3);
           ctx.font = `${fontSize}px ${monoFont}`;
           ctx.textAlign = "center";
           ctx.textBaseline = "top";
-          ctx.fillStyle = colors.textMute;
+          // Phase 1.3: use textDim (not textMute) for hover labels
+          ctx.fillStyle = colors.textDim;
           ctx.fillText(node.label, x, y + r + 3);
         }
       }
@@ -1636,24 +1750,39 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
 
   const linkColor = useCallback(
     (link: CityLinkDatum) => {
-      if (link.layer === "curated" && cascade?.pathEdgeIds.has(link.id)) {
-        const hop = cascade.edgeHopOf.get(link.id) ?? cascade.fallbackHop;
-        const elapsed = reducedMotion ? Infinity : performance.now() - cascade.startedAt;
+      // Phase 4.2: use displayPathEdgeIds (display-layer IDs) so edges
+      // in the collapsed/sector-aggregated view actually light up. The
+      // real pathEdgeIds use real asset IDs (curated:A->B) but collapsed
+      // links are keyed by display IDs (curated:sector:finance->sector:core).
+      const pathIds = cascade?.displayPathEdgeIds ?? cascade?.pathEdgeIds;
+      if (link.layer === "curated" && pathIds?.has(link.id)) {
+        const hop = cascade!.displayEdgeHopOf?.get(link.id) ?? cascade!.edgeHopOf.get(link.id) ?? cascade!.fallbackHop;
+        const elapsed = reducedMotion ? Infinity : performance.now() - cascade!.startedAt;
         if (elapsed >= hop * CASCADE_STAGGER_MS) return colors.sevCritical;
       }
-      return link.layer === "curated" ? (link.isGatewayEdge ? colors.accent : colors.textDim) : colors.textMute;
+      // Phase 1.1: curated non-gateway edges → glassBorderStrong (recedes
+      // vs textDim which is dark #475467 on a light background).
+      return link.layer === "curated"
+        ? link.isGatewayEdge ? colors.accent : colors.glassBorderStrong
+        : colors.textMute;
     },
     [colors, cascade, reducedMotion]
   );
 
   const linkWidth = useCallback(
     (link: CityLinkDatum) => {
-      if (link.layer === "curated" && cascade?.pathEdgeIds.has(link.id)) {
-        const hop = cascade.edgeHopOf.get(link.id) ?? cascade.fallbackHop;
-        const elapsed = reducedMotion ? Infinity : performance.now() - cascade.startedAt;
+      const pathIds = cascade?.displayPathEdgeIds ?? cascade?.pathEdgeIds;
+      if (link.layer === "curated" && pathIds?.has(link.id)) {
+        const hop = cascade!.displayEdgeHopOf?.get(link.id) ?? cascade!.edgeHopOf.get(link.id) ?? cascade!.fallbackHop;
+        const elapsed = reducedMotion ? Infinity : performance.now() - cascade!.startedAt;
         if (elapsed >= hop * CASCADE_STAGGER_MS) return 2.6;
       }
-      return link.layer === "curated" ? 1.4 : Math.min(2.2, 0.4 + Math.log2(link.count + 1) * 0.3);
+      // Phase 1.1: reduce curated default width from 1.4→1.0 so edges
+      // recede relative to cascade highlight (2.6) and gateway edge (1.4).
+      // Gateway edge keeps 1.4; aggregate edges scale by count.
+      return link.layer === "curated"
+        ? link.isGatewayEdge ? 1.4 : (link.isAggregate ? Math.min(2.0, 1.0 + Math.log2(link.count + 1) * 0.2) : 1.0)
+        : Math.min(2.2, 0.4 + Math.log2(link.count + 1) * 0.3);
     },
     [cascade, reducedMotion]
   );

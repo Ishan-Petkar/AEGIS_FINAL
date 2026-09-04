@@ -273,7 +273,7 @@ function AlertCard({
   return (
     <article
       className={`glass-panel border-l-2 p-3 ${SEVERITY_BORDER[severity]} ${
-        alert.acknowledged ? "opacity-55 !border-l-glass-border" : ""
+        alert.acknowledged ? "bg-glass-raised !border-l-glass-border-strong" : ""
       }`}
     >
       <div className="flex items-center gap-2">

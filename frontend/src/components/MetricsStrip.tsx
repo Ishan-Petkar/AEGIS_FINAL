@@ -83,7 +83,7 @@ const TONE_BG: Record<string, string> = {
   critical: "bg-sev-critical/10 text-sev-critical",
   warning: "bg-sev-warning/10 text-sev-warning",
   normal: "bg-sev-normal/10 text-sev-normal",
-  text: "bg-glass-raised text-text-dim",
+  text: "border border-glass-border-strong bg-glass-raised text-text-dim",
 };
 
 const DETAIL_TEXT: Record<string, string> = {
