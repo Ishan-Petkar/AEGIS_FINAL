@@ -12,6 +12,7 @@ import {
   stopReplay,
 } from "@/lib/api";
 import { useStream } from "@/lib/stream-context";
+import { useViewMode } from "@/lib/view-mode-context";
 import type { HelloEnvelopeData } from "@/lib/types";
 
 const SPEED_OPTIONS = [1, 5, 20, 60] as const;
@@ -63,32 +64,67 @@ export function AppHeader() {
   // so a session started after that snapshot is detected via real traffic
   // instead (`liveEmittedSinceHello > 0`), never fabricated or polled.
   const running = (hello?.running ?? false) || liveEmittedSinceHello > 0;
+  const { viewMode, setViewMode } = useViewMode();
 
   return (
-    <header className="glass-panel flex h-16 shrink-0 items-center gap-6 rounded-none border-x-0 border-t-0 px-5">
-      <div className="flex items-center gap-2">
-        <span
-          className="h-2 w-2 rounded-full bg-accent animate-aegis-pulse"
-          aria-hidden="true"
-        />
-        <span className="text-base font-bold tracking-[-0.02em] text-text">
-          AEGIS
+    <header className="glass-panel flex h-20 shrink-0 items-center gap-6 rounded-none border-x-0 border-t-0 px-5">
+      <div className="flex items-center gap-3 h-full">
+        <div className="flex items-center justify-center border-r border-glass-border-strong h-full px-4 overflow-hidden">
+          <img src="/logo1.png" alt="AEGIS" className="h-[150px] w-[150px] shrink-0 object-contain drop-shadow-sm" />
+        </div>
+        <span className="text-sm font-medium text-text-dim pl-1">
+          Smart City Cyber Risk Monitor
         </span>
-        <ConnectionState />
-        <StreamState status={streamStatus} />
-        <RestartStreamButton forceReconnect={forceReconnect} />
+        {viewMode === "technical" && (
+          <>
+            <ConnectionState />
+            <StreamState status={streamStatus} />
+            <RestartStreamButton forceReconnect={forceReconnect} />
+          </>
+        )}
       </div>
 
-      <ReplayProgress hello={hello} liveEmittedSinceHello={liveEmittedSinceHello} lastVirtualPosition={lastVirtualPosition} />
+      {viewMode === "non-technical" ? (
+        <div className="hidden lg:block text-[13px] italic text-text-mute ml-2">
+          Safer Cities. Stronger Tomorrows.
+        </div>
+      ) : (
+        <ReplayProgress hello={hello} liveEmittedSinceHello={liveEmittedSinceHello} lastVirtualPosition={lastVirtualPosition} />
+      )}
 
       <div className="ml-auto flex items-center gap-3">
-        <SpeedControl currentSpeed={hello?.speed ?? null} running={running} />
-        <RestartReplayButton
-          day={hello?.day ?? null}
-          speed={hello?.speed ?? null}
-          forceReconnect={forceReconnect}
-        />
-        <InjectControl running={running} />
+        {/* Toggle Pill */}
+        <div className="flex items-center rounded-full bg-glass-raised p-1 border border-glass-border">
+          <button
+            className={`ntv-toggle-button ${viewMode === "non-technical" ? "ntv-toggle-button-active" : "ntv-toggle-button-inactive"}`}
+            onClick={() => setViewMode("non-technical")}
+          >
+            Non-Technical View
+          </button>
+          <button
+            className={`ntv-toggle-button ${viewMode === "technical" ? "ntv-toggle-button-active" : "ntv-toggle-button-inactive"}`}
+            onClick={() => setViewMode("technical")}
+          >
+            Technical View
+          </button>
+        </div>
+
+        {viewMode === "non-technical" ? (
+          <div className="flex items-center gap-2 pl-2 border-l border-glass-border">
+            <span className="h-2.5 w-2.5 rounded-full bg-sev-normal" aria-hidden="true" />
+            <span className="text-text-mute text-xs">●</span>
+          </div>
+        ) : (
+          <>
+            <SpeedControl currentSpeed={hello?.speed ?? null} running={running} />
+            <RestartReplayButton
+              day={hello?.day ?? null}
+              speed={hello?.speed ?? null}
+              forceReconnect={forceReconnect}
+            />
+            <InjectControl running={running} />
+          </>
+        )}
       </div>
     </header>
   );

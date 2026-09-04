@@ -3,6 +3,9 @@
 # API docs) in the default browser. Does not start anything itself — run
 # scripts/dev-up.sh first if nothing responds.
 #
+# Cross-platform: works on Linux, macOS, and Windows (Git Bash / MSYS2 / WSL).
+# On native Windows PowerShell, you can also use: scripts\dev-open.ps1
+#
 # Usage:
 #   scripts/dev-open.sh          # open the console (http://127.0.0.1:3000)
 #   scripts/dev-open.sh --api    # also open the API docs (.../docs)
@@ -28,12 +31,16 @@ fi
 
 open_url() {
   local url="$1"
-  if command -v open >/dev/null 2>&1; then          # macOS
+  if [[ "${OSTYPE:-}" == "msys" || "${OSTYPE:-}" == "cygwin" || "${OSTYPE:-}" == "win32" ]]; then
+    cmd.exe /c start "" "$url" >/dev/null 2>&1
+  elif command -v cmd.exe >/dev/null 2>&1; then
+    cmd.exe /c start "" "$url" >/dev/null 2>&1
+  elif command -v powershell.exe >/dev/null 2>&1; then
+    powershell.exe -NoProfile -Command "Start-Process '$url'" >/dev/null 2>&1
+  elif command -v open >/dev/null 2>&1; then          # macOS
     open "$url"
   elif command -v xdg-open >/dev/null 2>&1; then     # Linux
     xdg-open "$url" >/dev/null 2>&1 &
-  elif command -v cmd.exe >/dev/null 2>&1; then       # WSL
-    cmd.exe /c start "$url" >/dev/null 2>&1
   else
     echo "Don't know how to open a browser on this system — open it yourself: $url"
     return 1
