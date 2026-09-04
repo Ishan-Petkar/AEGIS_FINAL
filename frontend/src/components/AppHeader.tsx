@@ -4,6 +4,7 @@ import { useState } from "react";
 import { ConnectionState } from "./ConnectionState";
 import { StreamState } from "./StreamState";
 import { InjectControl } from "./InjectControl";
+import { ViewToggle } from "./monitoring/MonitoringHeader";
 import {
   ApiError,
   ApiNetworkError,
@@ -89,6 +90,8 @@ export function AppHeader() {
           forceReconnect={forceReconnect}
         />
         <InjectControl running={running} />
+        <div className="hidden h-4 w-px bg-glass-border sm:block" />
+        <ViewToggle />
       </div>
     </header>
   );
