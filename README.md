@@ -285,3 +285,10 @@ Treat the code as authoritative where a doc disagrees with it. This
 project has been through several phase migrations, and stale docs
 describing superseded designs are a known, actively-tracked failure mode
 here. If you find one, fix it.
+
+---
+
+## Contributors
+
+- **Ishan Petkar** ([@Ishan-Petkar](https://github.com/Ishan-Petkar)) — Lead Developer & Architect
+
