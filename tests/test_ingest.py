@@ -12,6 +12,7 @@ are gated behind AEGIS_TEST_LIVE_DB=1 and skipped by default, matching
 tests/test_backend_models.py.
 """
 
+import dataclasses
 import os
 import uuid
 from contextlib import contextmanager
@@ -1221,3 +1222,98 @@ def test_live_alert_links_to_snapshot_and_event(live_pipeline_session):
         assert isinstance(alert.explanation, dict)
         s.delete(alert)
         s.commit()
+
+
+# ---------------------------------------------------------------------------
+# Injected what-if scenarios always visualize, regardless of detector luck
+# ---------------------------------------------------------------------------
+
+
+def test_injected_batch_computes_and_broadcasts_cii_even_when_no_detector_fired():
+    """POST /api/inject's whole premise is "the operator asserted this is
+    an attack" -- unlike organic replay traffic, there is no
+    false-positive cost to acting on that, and gating the graph's cascade
+    visualization on the SAME weak detectors (volumetric ~0.02 precision,
+    hybrid's own noisy-OR) that miss real quiet traffic like bot_c2
+    silently produced "inject succeeded, graph shows nothing" for most
+    scenario/asset combinations. Only the honeytoken scenario was ever
+    guaranteed to visualize, via the tripwire's CONFIRMED path."""
+    broadcaster = CollectingBroadcaster()
+    pipeline, session = make_pipeline(
+        scorer=FakeScorer(anomaly_flags=[False]),
+        tripwire_signal=lambda f: False,
+        hybrid_enabled=False,
+        broadcaster=broadcaster,
+    )
+    meta = make_meta()
+    meta = dataclasses.replace(meta, origin="injected")
+
+    result = pipeline([make_flow("inj:0")], meta)
+
+    assert result.cii_computed == 1
+    cii_envelopes = broadcaster.of_type(ENVELOPE_CII)
+    assert len(cii_envelopes) == 1
+    assert cii_envelopes[0]["data"]["origin_asset"] == "City_Payment_Gateway"
+
+
+def test_injected_batch_does_not_fabricate_detector_verdicts():
+    """The visualization gate widens; the recorded truth about what each
+    detector actually saw does not. A missed detection stays a missed
+    detection in event_scores, even for an injected batch."""
+    broadcaster = CollectingBroadcaster()
+    pipeline, session = make_pipeline(
+        scorer=FakeScorer(anomaly_flags=[False]),
+        tripwire_signal=lambda f: False,
+        hybrid_enabled=False,
+        broadcaster=broadcaster,
+    )
+    meta = dataclasses.replace(make_meta(), origin="injected")
+
+    result = pipeline([make_flow("inj:0")], meta)
+
+    assert result.cii_computed == 1  # visualization gate: widened
+    rows = rows_of(stmts_for(session, "event_scores")[0])
+    volumetric = [r for r in rows if r["detector"] == "isolation_forest"][0]
+    assert volumetric["is_anomaly"] is False  # ground truth: unchanged
+    assert "tripwire" not in {r["detector"] for r in rows}  # never touched
+
+
+def test_replay_batch_with_no_detector_fire_still_computes_no_cii():
+    """Companion negative case: without `origin="injected"`, the exact
+    same quiet flow is correctly skipped -- confirms the widened gate is
+    keyed on injection, not accidentally now-always-on."""
+    broadcaster = CollectingBroadcaster()
+    pipeline, session = make_pipeline(
+        scorer=FakeScorer(anomaly_flags=[False]),
+        tripwire_signal=lambda f: False,
+        hybrid_enabled=False,
+        broadcaster=broadcaster,
+    )
+    result = pipeline([make_flow("r:0")], make_meta())  # origin="replay"
+
+    assert result.cii_computed == 0
+    assert broadcaster.of_type(ENVELOPE_CII) == []
+
+
+def test_injected_honeytoken_batch_broadcasts_tripwire_fired_true():
+    """End-to-end check for the POST /api/inject 'honeytoken' scenario:
+    the live event envelope an operator's dashboard actually reads must
+    carry tripwire_fired=True, exactly as it would for organic replay
+    traffic touching the honeytoken -- injection must not be a second,
+    subtly-different code path for this field."""
+    broadcaster = CollectingBroadcaster()
+    pipeline, _ = make_pipeline(
+        scorer=FakeScorer(anomaly_flags=[False]),
+        tripwire_signal=lambda f: getattr(f, "is_honeytoken_use", False),
+        broadcaster=broadcaster,
+    )
+    meta = dataclasses.replace(make_meta(), origin="injected")
+    flow = dataclasses.replace(make_flow("inj:honeytoken:0"), is_honeytoken_use=True)
+
+    pipeline([flow], meta)
+
+    env = broadcaster.of_type(ENVELOPE_EVENT)[0]
+    assert env["data"]["tripwire_fired"] is True
+    assert env["data"]["batch_origin"] == "injected"
+    assert len(broadcaster.of_type(ENVELOPE_ALERT)) == 1
+    assert len(broadcaster.of_type(ENVELOPE_CII)) == 1

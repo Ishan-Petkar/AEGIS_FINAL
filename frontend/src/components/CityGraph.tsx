@@ -21,7 +21,7 @@ import {
   sectorLabel,
   sectorNodeId,
 } from "@/lib/sectors";
-import type { TopologyResponse } from "@/lib/types";
+import type { CiiEnvelopeData, TopologyResponse } from "@/lib/types";
 
 // Ticket #11 — the real force-directed graph. Two invariants drive every
 // decision in this file:
@@ -265,14 +265,19 @@ function clamp(v: number, lo: number, hi: number): number {
 
 /**
  * Base radius from criticality alone — Phase 2 widened this from `3 +
- * criticality*7` (3-10px, too small for a legible icon glyph) to
- * `11 + criticality*7` (11-18px). The dynamic range is deliberately
- * compressed: this was never meant to be a precise criticality readout —
- * severity/cascade rings already carry that signal — it just needs to
- * leave room for `asset-icons.ts` glyphs (Phase 3).
+ * criticality*7` (3-10px) to `11 + criticality*7` (11-18px) for a legible
+ * icon glyph. Operator request: markers smaller, labels larger — at ~44
+ * curated nodes the markers were competing with their own labels for
+ * attention when the label IS the primary legible signal (severity/
+ * cascade rings already carry the "how bad" read; the marker itself only
+ * needs to be a clickable anchor point). Scaled down to `8 + criticality*5`
+ * (8-13px, ~30% smaller) alongside the paint/layout font-size increase
+ * below — `CHAR_WIDTH_PX`/`LABEL_HEIGHT_PX` in `computeCuratedLayout` are
+ * updated to match so label collision-avoidance stays accurate at the new
+ * font size (see that constant's own comment).
  */
 function curatedNodeRadius(criticality: number): number {
-  return 11 + criticality * 7;
+  return 8 + criticality * 5;
 }
 
 /**
@@ -287,9 +292,9 @@ function curatedNodeRadius(criticality: number): number {
  */
 function curatedMarkerRadius(node: { id: string; criticality: number; isAggregate: boolean; isGateway: boolean }): number {
   const base = curatedNodeRadius(node.criticality);
-  if (node.id === HUB_ASSET_NAME) return Math.max(base * 1.45, 24);
+  if (node.id === HUB_ASSET_NAME) return Math.max(base * 1.45, 17);
   if (node.isAggregate) return base * 1.2;
-  if (node.isGateway) return Math.max(base, 13);
+  if (node.isGateway) return Math.max(base, 9);
   return base;
 }
 
@@ -640,12 +645,16 @@ function computeCuratedLayout(
   // handful of small angular jitters off the pure radial line, so a
   // label collision with a same-wedge neighbour at an adjacent Purdue
   // level gets resolved by swinging sideways before falling back to a
-  // farther ring. `CHAR_WIDTH_PX` is a monospace estimate at the ~10px
-  // render font — it doesn't need to be exact, only consistent enough
-  // that boxes computed here are a reasonable proxy for what `fitLabel`
-  // + `ctx.measureText` actually draw later.
-  const LABEL_HEIGHT_PX = 14;
-  const CHAR_WIDTH_PX = 6;
+  // farther ring. `CHAR_WIDTH_PX` is a monospace estimate at the ~13px
+  // render font (bumped from ~10px alongside the smaller-marker/
+  // larger-text change in `curatedNodeRadius`/`nodeCanvasObject`) — it
+  // doesn't need to be exact, only consistent enough that boxes computed
+  // here are a reasonable proxy for what `fitLabel` + `ctx.measureText`
+  // actually draw later. Both constants scale with the font size, not
+  // independently, or this estimate silently drifts from what's actually
+  // painted and labels start overlapping again.
+  const LABEL_HEIGHT_PX = 18;
+  const CHAR_WIDTH_PX = 7.5;
   const MIN_GAP_PX = 5;
   const RING_COUNT = 6;
   const ANGLE_JITTERS = [0, 0.32, -0.32, 0.64, -0.64, 1.0, -1.0];
@@ -822,6 +831,33 @@ interface CascadeState {
   /** Hop assigned to impacted assets the BFS never reached (disconnected from origin in the curated graph) — still revealed, just last and without a lit path. */
   fallbackHop: number;
   startedAt: number;
+}
+
+// Module-level, NOT purely component state: `CityGraph` is mounted as two
+// entirely separate component instances — one under the Non-Technical
+// layout, one under the Technical layout (`page.tsx`'s `viewMode`
+// ternary) — so switching views unmounts one and mounts a fresh one. A
+// component-local `useState`/`useRef` for the cascade reveal would then
+// restart the ENTIRE staggered reveal animation from hop 0 on every view
+// switch, even for a cascade that had already fully played out and
+// settled in the other view seconds earlier — the graph would visibly
+// "un-reveal" and redo its animation for no reason other than which tab
+// happened to be open. `sharedCascade`/`sharedCascadeSourceCii` persist
+// across that remount for the life of the page (mirrors
+// `NTVSectorGrid.tsx`'s `sectorActivityTracker` module singleton, fixed
+// for the identical reason), so re-opening either view during or after a
+// cascade shows it in the SAME state the other view was already showing,
+// not a restarted one. The per-instance `lastCiiRef` below is SEEDED from
+// `sharedCascadeSourceCii` at mount (not read from it directly on every
+// effect run): a bare module-variable read as the effect's early-return
+// guard reads as an unconditional `setState` to React's own lint
+// tooling ("calling setState synchronously within an effect can trigger
+// cascading renders"), whereas seeding a real `ref.current` from that
+// same persisted value satisfies it while producing identical behaviour.
+let sharedCascade: CascadeState | null = null;
+let sharedCascadeSourceCii: CiiEnvelopeData | null = null;
+function setSharedCascade(value: CascadeState | null): void {
+  sharedCascade = value;
 }
 
 /**
@@ -1347,11 +1383,12 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
   // effect mirrors that: a second envelope arriving mid-animation simply
   // replaces `cascade` outright, so there is never more than one
   // animation in flight and nothing to interrupt or clean up.
-  const [cascade, setCascade] = useState<CascadeState | null>(null);
-  const lastCiiRef = useRef<typeof latestCii>(null);
+  const [cascade, setCascade] = useState<CascadeState | null>(() => sharedCascade);
+  const lastCiiRef = useRef<CiiEnvelopeData | null>(sharedCascadeSourceCii);
   useEffect(() => {
     if (!latestCii || latestCii === lastCiiRef.current) return;
     lastCiiRef.current = latestCii;
+    sharedCascadeSourceCii = latestCii;
 
     const impacted = Array.isArray(latestCii.impacted)
       ? latestCii.impacted.filter((v): v is string => typeof v === "string")
@@ -1362,7 +1399,7 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
       topology.edges
     );
     const startedAt = performance.now();
-    setCascade({
+    const newCascade: CascadeState = {
       originAsset: latestCii.origin_asset,
       ciiMedian: latestCii.cii_median,
       ciiP5: latestCii.cii_p5,
@@ -1374,15 +1411,24 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
       edgeHopOf,
       fallbackHop,
       startedAt,
-    });
+    };
+    setSharedCascade(newCascade);
+    setCascade(newCascade);
 
     // Auto-clear after the last hop has had time to reveal plus a hold —
     // `startedAt` is the identity guard: if a newer envelope replaced
-    // `cascade` before this fires, `setCascade` here is a same-value
-    // no-op against a functional update keyed on the timer's own
-    // `startedAt`, so a stale timer can never clear a newer cascade.
+    // `cascade` before this fires, this is a no-op against both the
+    // module-level `sharedCascade` and (best-effort, if still mounted)
+    // component state, so a stale timer can never clear a newer cascade.
+    // `sharedCascade` is cleared unconditionally here (not inside the
+    // `setCascade` updater) because a `useState` setter called after this
+    // component instance has unmounted is not a reliable place to run a
+    // side effect the NEXT mount depends on.
     const clearAfterMs = fallbackHop * CASCADE_STAGGER_MS + CASCADE_HOLD_MS;
     const timer = window.setTimeout(() => {
+      if (sharedCascade?.startedAt === startedAt) {
+        setSharedCascade(null);
+      }
       setCascade((current) => (current?.startedAt === startedAt ? null : current));
     }, clearAfterMs);
 
@@ -1622,7 +1668,7 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
           // requires it stay "always-labelled with its full name," and a
           // visually louder label is part of what makes the centre read
           // as the hub rather than just another always-on label.
-          const fontSize = isHub ? Math.max(13 / globalScale, 4) : Math.max(10 / globalScale, 3);
+          const fontSize = isHub ? Math.max(16 / globalScale, 5) : Math.max(13 / globalScale, 4);
           ctx.font = `${fontSize}px ${monoFont}`;
           const label = fitLabel(ctx, shortenLabel(node.label), curatedLabelMaxWidthRef.current);
           const textWidth = ctx.measureText(label).width;
@@ -1686,7 +1732,7 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
         // hub, financial assets, gateways and cascade-involved nodes stay
         // permanently labelled above regardless of hover state.
         if (hoveredNodeIdRef.current === node.id) {
-          const fontSize = Math.max(10 / globalScale, 3);
+          const fontSize = Math.max(13 / globalScale, 4);
           ctx.font = `${fontSize}px ${monoFont}`;
           ctx.textAlign = "center";
           ctx.textBaseline = "top";

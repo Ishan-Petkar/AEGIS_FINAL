@@ -128,6 +128,21 @@ export interface UseEventStreamResult {
   /** Cumulative alert count this session. */
   alertCount: number;
   /**
+   * Whether the honeytoken tripwire has fired at ANY point this session
+   * — monotonic, never resets to `false` while connected (mirrors
+   * `alertCount`'s "cumulative this session" contract, and
+   * `@/lib/sector-activity.ts`'s `SectorActivityTracker`, which documents
+   * the same reasoning for the sector strip). Deliberately NOT derived
+   * by scanning `events.slice(0, N)` for a recent `tripwire_fired` row:
+   * at real replay throughput a fixed-size recent window can roll a
+   * tripwire hit back out within a fraction of a second, so a "was it hit
+   * recently" indicator can flip back to looking quiet faster than an
+   * operator can perceive it — reading as "the tripwire status never
+   * updates" even though the hit was correctly received and briefly
+   * reflected.
+   */
+  tripwireEverFired: boolean;
+  /**
    * The one-time `{"type":"hello"}` snapshot the backend sends immediately
    * on connect (`ReplayStatusResponse`). `null` until the socket has
    * connected at least once. There is no periodic re-broadcast of this —
@@ -178,6 +193,7 @@ export function useEventStream(): UseEventStreamResult {
   const [latestCii, setLatestCii] = useState<CiiEnvelopeData | null>(null);
   const [eventsPerSecond, setEventsPerSecond] = useState(0);
   const [alertCount, setAlertCount] = useState(0);
+  const [tripwireEverFired, setTripwireEverFired] = useState(false);
   const [hello, setHello] = useState<HelloEnvelopeData | null>(null);
   const [liveEmittedSinceHello, setLiveEmittedSinceHello] = useState(0);
   const [lastVirtualPosition, setLastVirtualPosition] = useState<string | null>(null);
@@ -311,6 +327,9 @@ export function useEventStream(): UseEventStreamResult {
             if (lastEventIdRef.current === null || envelope.data.id > lastEventIdRef.current) {
               lastEventIdRef.current = envelope.data.id;
             }
+            if (envelope.data.tripwire_fired) {
+              setTripwireEverFired(true);
+            }
             setEvents((prev) => {
               const next = [envelope.data, ...prev];
               return next.length > MAX_EVENTS_BUFFER
@@ -441,6 +460,7 @@ export function useEventStream(): UseEventStreamResult {
     latestCii,
     eventsPerSecond,
     alertCount,
+    tripwireEverFired,
     hello,
     liveEmittedSinceHello,
     lastVirtualPosition,

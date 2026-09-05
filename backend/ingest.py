@@ -120,7 +120,7 @@ from backend.ips.contracts import (
 from backend.ips.enforcement import SimulatedEnforcementAdapter
 from backend.ips.policy import IPSPolicyEngine
 from backend.models import Alert, CiiSnapshot, Event, EventScore, IpsAction
-from backend.replay_engine import BatchMeta
+from backend.replay_engine import BATCH_ORIGIN_INJECTED, BatchMeta
 from backend.replay_reader import ReplayFlow
 from backend.retention import prune_events
 from backend.seed import compute_seed_rows
@@ -1275,6 +1275,40 @@ class IngestPipeline:
         Flows already covered by `is_anomaly[i]` are completely
         unaffected -- they take the exact branch this method always has.
 
+        `meta.origin == BATCH_ORIGIN_INJECTED` (`backend/inject.py`, the
+        `POST /api/inject` what-if scenarios) is a THIRD way into the same
+        unconditional-CII branch as `is_anomaly[i]`, not a fourth branch.
+        Rationale: an operator who explicitly injects a scenario onto a
+        chosen asset has already asserted "this is an attack" -- unlike
+        organic replay traffic, there is no false-positive cost to acting
+        on that assertion, and the existing detectors' honest opinion is
+        the wrong gate here regardless of which way it comes out. The
+        gap this closes is real: `bot_c2` replays genuinely-quiet real
+        Bot/C2 traffic (docs/DETECTION_STUDY.md: C2 beacons are SMALLER
+        than benign, median 6 bytes), so the volumetric channel's ~0.02
+        precision routinely does not fire on it, and `hybrid_candidate`
+        requires the SAME weak signals to independently clear the ALERT
+        band -- so before this, an operator picking `bot_c2` (or often
+        `ddos`/`port_scan`, depending on the target asset's baseline)
+        could inject real attack traffic onto any of the 45 curated
+        assets and the graph would show nothing, silently, because no
+        detector happened to agree. Only `honeytoken` was ever guaranteed
+        to visualize, via the tripwire's `Certainty.CONFIRMED` path.
+
+        This does NOT fabricate detection: `is_anomaly[i]`,
+        `tripwire_fired[i]`, and every per-detector verdict in
+        `event_scores` are computed and persisted exactly as before --
+        an injected `bot_c2` flow that the volumetric channel genuinely
+        missed is still recorded as missed. Only the CII/cascade
+        VISUALIZATION gate is widened, and only for batches the operator
+        themselves triggered. `_alert_decision`'s own policy (the
+        volumetric calibrated-score floor, tripwire vs. non-tripwire
+        branch) is UNCHANGED and still runs after the CII envelope is
+        published -- an injected non-tripwire scenario that doesn't clear
+        that floor still shows its blast radius on the graph but does
+        not manufacture an alert row, which is the correct honest
+        outcome for a channel that did not actually fire.
+
         IPS (backend/ips/): computed for EVERY flow that reaches this far
         in the loop (both the `is_anomaly[i]` and `hybrid_candidate`
         branches), immediately after `cii_result` -- unlike the alert
@@ -1287,6 +1321,7 @@ class IngestPipeline:
         `_compute_ips_decision`'s docstring for why the IPS layer
         structurally cannot run without the Hybrid IDS layer's output.
         """
+        is_injected = meta.origin == BATCH_ORIGIN_INJECTED
         cii_outcome = _CiiOutcome()
         alert_outcome = _AlertOutcome()
         ips_outcome = _IpsOutcome()
@@ -1297,7 +1332,7 @@ class IngestPipeline:
                 and not is_anomaly[i]
                 and fused_decisions[i].action == ResponseAction.ALERT
             )
-            if not is_anomaly[i] and not hybrid_candidate:
+            if not is_anomaly[i] and not hybrid_candidate and not is_injected:
                 continue
             event_id = inserted_ids[i]
             if event_id is None:
@@ -1327,9 +1362,12 @@ class IngestPipeline:
                 if ips_decision is not None:
                     self._apply_ips_action(session, ips_decision, event_id, meta, ips_outcome)
 
-            if is_anomaly[i]:
+            if is_anomaly[i] or is_injected:
                 # Broadcast the cii envelope BEFORE the alert-suppression
-                # check, not after -- this channel already genuinely fired.
+                # check, not after -- this channel already genuinely fired
+                # (or, for `is_injected`, the operator explicitly asserted
+                # it by choosing to inject this scenario -- see this
+                # method's docstring).
                 # Previously this envelope was appended only alongside a
                 # created alert, so a debounced repeat compromise (same
                 # asset, inside alert_asset_debounce_sec) computed a fresh

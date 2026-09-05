@@ -117,12 +117,16 @@ function Sparkline({ values, color }: { values: number[]; color: string }) {
 }
 
 export function DetectorSignalsCard() {
-  const { events } = useStream();
+  const { events, tripwireEverFired } = useStream();
   const window = events.slice(0, WINDOW);
 
   const volumetricScores = window.map((e) => e.calibrated_score).reverse();
   const fusionScores = window.map((e) => e.hybrid?.threat_score ?? 0).reverse();
-  const tripwireFired = window.some((e) => e.tripwire_fired);
+  // Session-monotonic, NOT derived from `window`: a fixed-size recent
+  // window can roll a tripwire hit back out within a fraction of a
+  // second at real replay throughput, which reads as "the tripwire
+  // status never updates" even though the hit was correctly received.
+  // See useEventStream's `tripwireEverFired` docstring.
 
   const latestVolumetric = volumetricScores[volumetricScores.length - 1];
   const latestFusion = fusionScores[fusionScores.length - 1];
@@ -150,8 +154,8 @@ export function DetectorSignalsCard() {
           <p className="text-[11px] font-medium text-text-dim">Deception Tripwire</p>
           <p className="text-[10px] text-text-mute">Recon / Credential</p>
           <div className="h-8" />
-          <p className={`font-mono text-lg font-semibold ${tripwireFired ? "text-sev-critical" : "text-sev-normal"}`}>
-            {window.length === 0 ? "—" : tripwireFired ? "FIRED" : "Quiet"}
+          <p className={`font-mono text-lg font-semibold ${tripwireEverFired ? "text-sev-critical" : "text-sev-normal"}`}>
+            {tripwireEverFired ? "FIRED" : "Quiet"}
           </p>
         </div>
       </div>

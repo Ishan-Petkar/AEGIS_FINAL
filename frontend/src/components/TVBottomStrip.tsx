@@ -36,7 +36,7 @@ function MiniSparkline({ values, color }: { values: number[]; color: string }) {
 export function TVBottomStrip() {
   const [activeOverlay, setActiveOverlay] = useState<"ips" | "impact" | "detectors" | "risk" | null>(null);
   
-  const { ipsActions, latestCii, events } = useStream();
+  const { ipsActions, latestCii, events, tripwireEverFired } = useStream();
   const { stats } = useConnection();
 
   // 1. IPS/IDS
@@ -46,10 +46,13 @@ export function TVBottomStrip() {
   const impacted = latestCii ? parseImpacted(latestCii.impacted) : { count: 0 };
   const ciiScore = latestCii ? latestCii.cii_median.toFixed(2) : "—";
   
-  // 3. Detectors
+  // 3. Detectors. Tripwire status is session-monotonic (`tripwireEverFired`),
+  // not derived from this recent window: at real replay throughput a
+  // 40-event window can roll a hit back out within a fraction of a
+  // second, which reads as "the tripwire status never updates" even
+  // though it was correctly received. See useEventStream's docstring.
   const window = events.slice(0, 40);
   const fusionScores = window.map((e) => e.hybrid?.threat_score ?? 0).reverse();
-  const tripwireFired = window.some((e) => e.tripwire_fired);
   const latestFusion = fusionScores[fusionScores.length - 1];
 
   // 4. Risk
@@ -116,8 +119,8 @@ export function TVBottomStrip() {
             <div className="flex flex-col justify-end">
                <span className="text-[9px] text-text-mute uppercase tracking-wider">Tripwire</span>
                <div className="flex items-center mt-1">
-                 <span className={`font-mono text-sm ${tripwireFired ? "text-sev-critical font-bold" : "text-sev-normal"}`}>
-                   {window.length === 0 ? "—" : tripwireFired ? "FIRED" : "Quiet"}
+                 <span className={`font-mono text-sm ${tripwireEverFired ? "text-sev-critical font-bold" : "text-sev-normal"}`}>
+                   {tripwireEverFired ? "FIRED" : "Quiet"}
                  </span>
                </div>
             </div>

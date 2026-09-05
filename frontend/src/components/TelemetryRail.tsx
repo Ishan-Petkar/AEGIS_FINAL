@@ -113,7 +113,7 @@ function severityOf(e: EventEnvelopeData): Severity {
  * rationale.
  */
 export function TelemetryRail() {
-  const { status, events } = useStream();
+  const { status, events, eventsPerSecond } = useStream();
   const [isCollapsed, setIsCollapsed] = useState(false);
 
   // Mirrors `events` on every change without itself causing a re-render —
@@ -242,6 +242,12 @@ export function TelemetryRail() {
       className="h-[420px] w-full shrink-0 lg:w-[320px] lg:shrink-0 xl:h-auto"
       action={
         <div className="flex items-center gap-2">
+          <span
+            className="font-mono text-[10px] font-medium text-text-mute tabular-nums"
+            title="Live events received per second, from the same useEventStream() counter MetricsStrip reads"
+          >
+            {eventsPerSecond} ev/s
+          </span>
           {frozen && (
             <button
               type="button"
