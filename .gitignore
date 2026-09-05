@@ -36,3 +36,9 @@ coverage.xml
 
 # Dev scripts (scripts/dev-up.sh / dev-down.sh) — PID files and logs
 .dev/
+
+# Private Dossier & Agent configuration (kept local, ignored from git)
+AEGIS_Judge_Room_Dossier*
+CLAUDE.md
+frontend/CLAUDE.md
+
