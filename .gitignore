@@ -41,4 +41,6 @@ coverage.xml
 AEGIS_Judge_Room_Dossier*
 CLAUDE.md
 frontend/CLAUDE.md
+.claude/
+
 
