@@ -268,4 +268,8 @@ here. If you find one, fix it.
 
 - **Ishan Petkar** ([@Ishan-Petkar](https://github.com/Ishan-Petkar)) — Lead Developer & Architect
 - **Soham Nangare** ([@sohamn06](https://github.com/sohamn06)) — Frontend & Systems Engineer
+- **Parth Kakade** — Research & Detection Engineering
+- **Samrudhi Divekar** — Systems & Data Engineering
+- **Atharva Ambalge** — Infrastructure & Security Operations
+
 
