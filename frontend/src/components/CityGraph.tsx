@@ -928,7 +928,7 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
   // D14-2 constraint: consume the shared `useStream()` context only —
   // never call `useEventStream()` directly (that reintroduces the
   // duplicate-socket defect Ticket #10 fixed).
-  const { status, events, latestCii } = useStream();
+  const { status, events, latestCii, alerts } = useStream();
   const colors = useThemeColors();
   const monoFont = useMonoFontFamily();
   const reducedMotion = usePrefersReducedMotion();
@@ -1014,6 +1014,12 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
   useEffect(() => {
     eventsRef.current = events;
   }, [events]);
+  // Mirror `alerts` into a ref so the ~100ms throttled severity tick can
+  // read the latest list without closing over a stale render capture.
+  const alertsRef = useRef(alerts);
+  useEffect(() => {
+    alertsRef.current = alerts;
+  }, [alerts]);
 
   const [graphData, setGraphData] = useState<{ nodes: CityNodeDatum[]; links: CityLinkDatum[] }>(
     { nodes: [], links: [] }
@@ -1332,20 +1338,58 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
       // stands in for, read from the same `AssetActivityTracker` that
       // already tracks every real curated asset regardless of whether
       // that asset is individually displayed right now.
+      //
+      // Attack-latch fix: build a set of assets that have at least one
+      // unacknowledged alert this session.  A latched asset is pinned to
+      // "critical" (or "warning" for a warning-severity alert) on the
+      // graph regardless of PULSE_WINDOW_MS decay — the node stays visually
+      // highlighted until the operator explicitly acknowledges the alert.
+      // Only the CURRENT alerts buffer is consulted (alertsRef), which is
+      // always the freshest snapshot without any effect dependency on
+      // `alerts` (the interval closure captures the ref, not the value).
+      const unackedCritical = new Set<string>();
+      const unackedWarning = new Set<string>();
+      for (const a of alertsRef.current) {
+        if (!a.acknowledged) {
+          if (a.severity === "critical") unackedCritical.add(a.asset);
+          else if (a.severity === "warning") unackedWarning.add(a.asset);
+        }
+      }
       const SEVERITY_RANK = { normal: 0, warning: 1, critical: 2 } as const;
       for (const node of nodesMap.values()) {
         if (node.layer !== "curated") continue;
         if (node.isAggregate) {
           const sector = node.id.startsWith("sector:") ? node.id.slice("sector:".length) : null;
           const members = sector ? sectorMembers.get(sector) : undefined;
-          let worst: "normal" | "warning" | "critical" = "normal";
-          for (const m of members ?? []) {
-            const s = activity.severityOf(m.name, PULSE_WINDOW_MS);
-            if (SEVERITY_RANK[s] > SEVERITY_RANK[worst]) worst = s;
+          // Sector is pinned critical/warning if ANY member is latched.
+          const memberPinnedCritical = members
+            ? [...members].some((m) => unackedCritical.has(m.name))
+            : false;
+          const memberPinnedWarning = members
+            ? [...members].some((m) => unackedWarning.has(m.name))
+            : false;
+          if (memberPinnedCritical) {
+            node.pulseSeverity = "critical";
+          } else if (memberPinnedWarning) {
+            node.pulseSeverity = "warning";
+          } else {
+            let worst: "normal" | "warning" | "critical" = "normal";
+            for (const m of members ?? []) {
+              const s = activity.severityOf(m.name, PULSE_WINDOW_MS);
+              if (SEVERITY_RANK[s] > SEVERITY_RANK[worst]) worst = s;
+            }
+            node.pulseSeverity = worst;
           }
-          node.pulseSeverity = worst;
         } else {
-          node.pulseSeverity = activity.severityOf(node.id, PULSE_WINDOW_MS);
+          // Individual node: latch to critical/warning while any unacked
+          // alert targets it, otherwise fall back to the pulse window.
+          if (unackedCritical.has(node.id)) {
+            node.pulseSeverity = "critical";
+          } else if (unackedWarning.has(node.id)) {
+            node.pulseSeverity = "warning";
+          } else {
+            node.pulseSeverity = activity.severityOf(node.id, PULSE_WINDOW_MS);
+          }
         }
       }
 
@@ -1424,13 +1468,26 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
     // `setCascade` updater) because a `useState` setter called after this
     // component instance has unmounted is not a reliable place to run a
     // side effect the NEXT mount depends on.
-    const clearAfterMs = fallbackHop * CASCADE_STAGGER_MS + CASCADE_HOLD_MS;
-    const timer = window.setTimeout(() => {
-      if (sharedCascade?.startedAt === startedAt) {
-        setSharedCascade(null);
-      }
-      setCascade((current) => (current?.startedAt === startedAt ? null : current));
-    }, clearAfterMs);
+    //
+    // Attack-latch fix: if the cascade's origin asset currently has an
+    // unacknowledged alert, suppress the timer entirely — the cascade
+    // stays visible until the operator acknowledges (the secondary effect
+    // below watches `alerts` and clears the cascade at that moment).
+    const originHasUnackedAlert = alertsRef.current.some(
+      (a) => !a.acknowledged && a.asset === latestCii.origin_asset
+    );
+    const clearAfterMs = originHasUnackedAlert
+      ? null
+      : fallbackHop * CASCADE_STAGGER_MS + CASCADE_HOLD_MS;
+    const timer =
+      clearAfterMs !== null
+        ? window.setTimeout(() => {
+            if (sharedCascade?.startedAt === startedAt) {
+              setSharedCascade(null);
+            }
+            setCascade((current) => (current?.startedAt === startedAt ? null : current));
+          }, clearAfterMs)
+        : null;
 
     // D-R2/D-R3 "cascade animation still animates on the real impacted
     // payload" must hold in the default sector-aggregated view too, not
@@ -1456,8 +1513,31 @@ export function CityGraph({ topology }: { topology: TopologyResponse }) {
       if (originSector) focusSector(originSector);
     }
 
-    return () => window.clearTimeout(timer);
+    return () => {
+      if (timer !== null) window.clearTimeout(timer);
+    };
   }, [latestCii, topology.edges, expanded, sectorByName, focusSector]);
+
+  // Secondary cascade-clear effect: watches the live `alerts` list so
+  // that the moment the operator acknowledges the last unacked alert for
+  // the cascade's origin asset, the cascade clears immediately — even
+  // though the primary latestCii effect already ran and suppressed its
+  // timer.  Uses `setCascade`'s functional form so the check is always
+  // against the current cascade value, not a stale closure capture.
+  useEffect(() => {
+    setCascade((current) => {
+      if (!current) return current;
+      const stillUnacked = alerts.some(
+        (a) => !a.acknowledged && a.asset === current.originAsset
+      );
+      if (stillUnacked) return current; // keep it
+      // No more unacked alerts for this origin — clear the cascade.
+      if (sharedCascade?.startedAt === current.startedAt) {
+        setSharedCascade(null);
+      }
+      return null;
+    });
+  }, [alerts]);
 
   const nodeCanvasObject = useCallback(
     (node: CityNodeDatum, ctx: CanvasRenderingContext2D, globalScale: number) => {
